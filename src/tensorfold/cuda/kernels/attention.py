@@ -308,6 +308,7 @@ def offsets(caches: Sequence[tuple[torch.Tensor, torch.Tensor]], device) -> list
             if t.dtype != torch.bfloat16 or not t.is_contiguous():
                 raise ValueError("caches: contiguous bf16 tensors")
             delta = t.data_ptr() - origin
+            delta = ((delta + 2**63) % 2**64) - 2**63   # xpu addresses use the full 64-bit space; wrap to signed
             if delta % 16:
                 raise ValueError("caches must be 16-byte aligned")
             out.append(delta // 2)

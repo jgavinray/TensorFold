@@ -58,9 +58,11 @@ def offsets(caches: Sequence[kvcache.KVCache], device) -> list[int]:
                     or scales.dtype != kvcache.SCALE_DTYPE or not scales.is_contiguous():
                 raise ValueError("quantized caches: contiguous uint8/int8 codes and fp16 scales")
             delta = codes.data_ptr() - origin
+            delta = ((delta + 2**63) % 2**64) - 2**63   # xpu addresses use the full 64-bit space; wrap to signed
             if delta % 16:
                 raise ValueError("caches must be 16-byte aligned")
             sdelta = scales.data_ptr() - scales_origin
+            sdelta = ((sdelta + 2**63) % 2**64) - 2**63
             if sdelta % 16:
                 raise ValueError("scale tensors must be 16-byte aligned")
             out += [delta, sdelta // 2]
