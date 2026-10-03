@@ -135,7 +135,12 @@ def estimate_weights(model_dir: str | Path, transform: Callable, *, rank: int | 
         group = match.group(1) if match else name
         layers[group] = layers.get(group, 0) + size
     # CPU expert lists/stack, GPU uploads and tiled outputs can coexist during one layer load.
-    staging = 3 * max([largest, *layers.values()], default=0)
+    # The 3x is per layer-group coexistence; a tensor outside any layer group (lm_head, embed)
+    # loads alone and carries 1x — a 4.7 GiB lm_head at 3x refused a 32 GiB card that provably
+    # fits the model (measured: Qwen3.8-27B spec ckpt allocates 19.24 GiB resident).
+    layer_peak = max((v for k, v in layers.items() if k.isdigit()), default=0)
+    outside_peak = max((v for k, v in layers.items() if not k.isdigit()), default=0)
+    staging = max(3 * layer_peak, outside_peak)
     return Weights(resident, staging, mapped)
 
 
