@@ -29,7 +29,7 @@ class Qwen27Engine:
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
                  vision_urls: bool = False, vision_offload: bool = False, tree_rows: int | None = None,
-                 keep: int | None = None, kv_dtype: str = "bf16"):
+                 keep: int | None = None, kv_dtype: str = "bf16", drafter: str = "dflash2"):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
@@ -129,11 +129,21 @@ class Qwen27Engine:
                   f"{self.context_window:,} tokens ({bf16 * self.context_window / (1 << 30):.2f} GiB bf16), "
                   f"{per} B a token across {n_attn} layers", flush=True)
         self.draft = None
-        if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
-            from .dflash2 import DFlash2
+        if drafter not in ("dflash2", "dspark", "none"):
+            raise ValueError(f"drafter {drafter!r}: dflash2, dspark or none")
+        if draft_dir is not None and drafter != "none" and (rank == 0 or (tp == 2 and tp_draft)):
+            if drafter == "dspark":
+                if tp == 2:
+                    raise ValueError("the DSpark drafter runs on one rank: tp=2 drafts with dflash2")
+                from .dspark import DSpark
 
-            # tp_draft: both ranks hold half the drafter and draft together (rank 1 needs --draft too)
-            self.draft = DFlash2(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft else DFlash2(draft_dir, full)
+                self.draft = DSpark(draft_dir, full, rank=rank, keep=keep)
+            else:
+                from .dflash2 import DFlash2
+
+                # tp_draft: both ranks hold half the drafter and draft together (rank 1 needs --draft too)
+                self.draft = DFlash2(draft_dir, full, rank=rank, world=2) if tp == 2 and tp_draft \
+                    else DFlash2(draft_dir, full)
         del full
         if vision and rank == 0:
             from tensorfold.vision.qwen_cuda import QwenCudaVision
@@ -353,7 +363,8 @@ class Qwen27Engine:
 
 
 def xpu_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
-               master_port: int = 29551, no_drafts: bool = False, kv_dtype: str = "bf16", **options: Any):
+               master_port: int = 29551, no_drafts: bool = False, kv_dtype: str = "bf16",
+               draft_kind: str = "dflash2", **options: Any):
     """The XPU engine for ``tensorfold serve``; tp=2 adds fp32 partials in rank order and needs the drafter on both."""
 
     from tensorfold.families.qwen3_5 import DRAFTER, TITLE
@@ -378,4 +389,4 @@ def xpu_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: i
                         context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
                         vision_urls=bool(options.get("vision_urls", False)),
                         vision_offload=bool(options.get("vision_offload", False)), keep=options.get("checkpoint_slots"),
-                        kv_dtype=kv_dtype)
+                        kv_dtype=kv_dtype, drafter=draft_kind)

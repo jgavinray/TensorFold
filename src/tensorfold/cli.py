@@ -228,18 +228,35 @@ def _note_untested(family: Any, model: str) -> None:
 
 
 def _backend(choice: str, family: Any) -> str:
-    """mlx or cuda: auto picks MLX on macOS and CUDA elsewhere; a family serves only the backends it has."""
+    """mlx, cuda or xpu: auto picks MLX on macOS and CUDA elsewhere (XPU when CUDA is absent and the family
+    has an XPU engine); a family serves only the backends it has."""
 
     backend = choice if choice != "auto" else ("mlx" if sys.platform == "darwin" else "cuda")
     if backend == "cuda" and not hasattr(family.package, "cuda_engine"):
         raise ValueError(f"{family.title} has no CUDA engine yet: serve it on Apple Silicon")
     if backend == "mlx" and not hasattr(family.package, "load"):
         raise ValueError(f"{family.title} runs on NVIDIA GPUs only (see docs/recipes)")
+    if backend == "xpu" and not hasattr(family.package, "xpu_engine"):
+        raise ValueError(f"{family.title} has no XPU engine")
+    if backend == "xpu":
+        import torch
+
+        if not torch.xpu.is_available():
+            raise ValueError("--backend xpu needs torch with Intel GPU support: no XPU device is visible")
+    if choice == "auto" and backend == "cuda":
+        try:
+            import torch
+
+            if not torch.cuda.is_available() and torch.xpu.is_available() and hasattr(family.package, "xpu_engine"):
+                return "xpu"
+        except ImportError:
+            pass                       # torch's absence surfaces at the engine, as before
     return backend
 
 
-def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None) -> int:
-    """Serve with the family's CUDA engine (``cuda_engine``) behind ``tensorfold.cuda.server``."""
+def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None,
+                backend: str = "cuda") -> int:
+    """Serve with the family's CUDA or XPU engine (``cuda_engine``/``xpu_engine``) behind ``tensorfold.cuda.server``."""
 
     from tensorfold import hub
 
@@ -248,7 +265,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if args.tp == 1 and args.rank != 0:
         raise ValueError("--rank 1 needs --tp 2")
     started = time.perf_counter()
-    drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
+    drafter = "" if args.no_drafts else _drafter(family, args.drafter, backend)
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
                                "master_port": int(args.master_port), "no_drafts": bool(args.no_drafts)}
     if getattr(args, "kv_dtype", "bf16") != "bf16":
@@ -267,18 +284,23 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     streams = 1 if str(args.parallel).strip().lower() == "auto" else _parallel(args.parallel)
     if streams > 1:
         options["parallel"] = streams
-    if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
+    if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False) \
+            and backend == "cuda":
         options["checkpoint_slots"] = int(args.checkpoint_slots)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
     where = f", rank {args.rank} of 2" if args.tp == 2 else ""
-    print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
+    print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on {backend.upper()}{where}", flush=True)
     from tensorfold.cuda import precision, prompt_precision
 
     asked = getattr(args, "prefill_fp8", None)
-    prompt_precision.set_fp8(prompt_precision.FP8_BY_DEFAULT if asked is None else asked)   # before any weight loads
-    chosen = getattr(args, "precision", None)
-    precision.set_mode(chosen or precision.CHECKPOINT, asked=chosen is not None)
-    engine = family.package.cuda_engine(model_dir, **options)
+    if backend == "cuda":                              # XPU has no checkpoint-math or FP8 prompt paths yet
+        prompt_precision.set_fp8(prompt_precision.FP8_BY_DEFAULT if asked is None else asked)   # before any weight loads
+        chosen = getattr(args, "precision", None)
+        precision.set_mode(chosen or precision.CHECKPOINT, asked=chosen is not None)
+    else:
+        prompt_precision.set_fp8(False)
+        precision.set_mode(precision.CHECKPOINT, asked=False)
+    engine = getattr(family.package, "cuda_engine" if backend == "cuda" else "xpu_engine")(model_dir, **options)
     weights = getattr(engine, "w", None)
     fp8 = prompt_precision.fp8() and bool(getattr(weights, "fast_prefill", False))
     if asked and not fp8 and getattr(weights, "precision", "full") == precision.CHECKPOINT:
@@ -299,7 +321,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
                        ("min_p", args.min_p)):
         if value is not None:
             sampling[key] = value
-    app_class = getattr(family.package, "CUDA_APP", None) or App
+    app_class = (getattr(family.package, "CUDA_APP", None) if backend == "cuda" else None) or App
     app = app_class(engine, model_dir, served, default_thinking=bool(args.thinking), sampling=sampling,
                     max_tokens=int(args.max_tokens), context_window=context if context is not None else args.context,
                     reasoning_effort=args.reasoning_effort, thinking_budget=int(args.thinking_budget),
@@ -312,7 +334,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     effective_context = app.effective_context_window
     own = getattr(weights, "precision", "") == precision.CHECKPOINT
     prompts = "FP8 activations" if fp8 else "the checkpoint math" if own else "bf16 activations"
-    print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 on CUDA{where} "
+    print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 on {backend.upper()}{where} "
           f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; prompts: {prompts}; "
           f"context: {'unlimited' if effective_context is None else effective_context}; "
           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
@@ -380,8 +402,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         check(model_dir)                         # checks that need the complete index, such as an MTP head
 
     stacks.start()          # `kill -USR1 <pid>` prints every thread's Python stack: where a silent server waits
-    if backend == "cuda":
-        return _serve_cuda(args, family, model_dir, context)
+    if backend in ("cuda", "xpu"):
+        return _serve_cuda(args, family, model_dir, context, backend)
     for key, value in getattr(family.package, "MLX_ENV", {}).items():
         os.environ.setdefault(key, value)       # before MLX starts: it reads them once
     import mlx.core as mx

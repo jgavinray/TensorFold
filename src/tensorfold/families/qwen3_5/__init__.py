@@ -326,3 +326,17 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                         context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
                         vision_urls=bool(options.get("vision_urls", False)),
                         vision_offload=bool(options.get("vision_offload", False)), keep=options.get("checkpoint_slots"))
+
+
+def xpu_engine(model_dir: str | Path, **options: Any):
+    """The XPU engine (Intel GPUs) for ``tensorfold serve --backend xpu``: the CUDA engine's option surface,
+    plus ``kv_dtype`` (bf16 | int8 | int4) and ``draft_kind`` (dflash2 | dspark | none).  Refuses the call
+    here when torch.xpu does not serve this machine."""
+
+    import torch
+
+    if not torch.xpu.is_available():
+        raise RuntimeError("--backend xpu needs torch with Intel GPU support: no XPU device is visible")
+    from .xpu.engine import xpu_engine as engine
+
+    return engine(model_dir, **options)
