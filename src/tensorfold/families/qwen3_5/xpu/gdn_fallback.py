@@ -20,6 +20,70 @@ from tensorfold.cuda.kernels.gdn import Plan, plan_host, schedule
 __all__ = ["Plan", "plan", "plan_host", "schedule", "to_device", "tree", "chain", "replay", "replay_table"]
 
 
+_GRAPH_CHUNKS: dict = {}
+
+
+class _ChunkGraph:
+    """A captured 64-row chain for one (device, Hv, dv, dk, rep, CT) shape key.
+
+    The captured region is the serial step loop itself — identical ops and order as ``_step`` per
+    row — so replay is bit-exact with the eager chain (validated: final + bf16 y ``torch.equal``).
+    Inputs are copied into the static tensors per call; the state and outputs are read back out.
+    """
+
+    CT = 64
+
+    def __init__(self, Hv: int, dv: int, dk: int, Hk: int, rep: int, device):
+        self.Hv, self.dv, self.dk, self.Hk, self.rep = Hv, dv, dk, Hk, rep
+        self.device = device
+        self.qC = torch.zeros(self.CT, Hk, dk, device=device, dtype=torch.bfloat16)
+        self.kC = torch.zeros(self.CT, Hk, dk, device=device, dtype=torch.bfloat16)
+        self.vC = torch.zeros(self.CT, Hv, dv, device=device, dtype=torch.bfloat16)
+        self.gC = torch.zeros(self.CT, Hv, device=device)
+        self.bC = torch.zeros(self.CT, Hv, device=device)
+        self.S = torch.zeros(Hv, dv, dk, device=device)
+        self.Ssnap = torch.zeros(self.CT, Hv, dv, dk, device=device)
+        self.Y = torch.zeros(self.CT, Hv, dv, device=device)
+        self.yrow = torch.zeros(Hv, dv, device=device)
+        self.S_in = torch.zeros_like(self.S)
+        chunk = self._chunk
+        for _ in range(2):
+            chunk()
+        torch.xpu.synchronize()
+        self.graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(self.graph):
+            chunk()
+
+    def _chunk(self) -> None:
+        S, qC, kC, vC, gC, bC, Y, yrow = self.S, self.qC, self.kC, self.vC, self.gC, self.bC, self.Y, self.yrow
+        for t in range(self.CT):
+            qf = qC[t].float().repeat_interleave(self.rep, 0)
+            kf = kC[t].float().repeat_interleave(self.rep, 0)
+            s = S * gC[t].float()[:, None, None]
+            kv_mem = (s * kf[:, None, :]).sum(-1)
+            delta = (vC[t].float() - kv_mem) * bC[t].float()[:, None]
+            S.copy_(s + kf[:, None, :] * delta[:, :, None])
+            self.Ssnap[t].copy_(S)
+            yrow.copy_((S * qf[:, None, :]).sum(-1))
+            Y[t].copy_(yrow)
+
+    def run(self, q, k, v, g, beta, state) -> tuple[torch.Tensor, torch.Tensor]:
+        """(q, k, v, g, beta, state) -> (Y[:T] bf16, state fp32).  T may be < CT: the tail rows keep
+        the capture's stale inputs but are never read; T > CT falls back to the eager path.
+        Stream-ordered: no internal sync, so consecutive chunks pipeline; the caller syncs on read."""
+        T = q.shape[0]
+        if T > self.CT:
+            return None, None
+        self.S.copy_(state)
+        self.qC[:T].copy_(q)
+        self.kC[:T].copy_(k)
+        self.vC[:T].copy_(v)
+        self.gC[:T].copy_(g)
+        self.bC[:T].copy_(beta)
+        self.graph.replay()
+        return self.Y[:T], self.Ssnap[T - 1]
+
+
 def to_device(values: Sequence[int], dtype: torch.dtype, device) -> torch.Tensor:
     """One device copy (the CUDA path's pinned staging is a CUDA-allocator feature; the fallback syncs)."""
 
@@ -120,6 +184,26 @@ def chain(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, be
           state: torch.Tensor, final: torch.Tensor) -> torch.Tensor:
     """Prefill chain from ``state`` (read only) to ``final``: the serial step a row at a time, chunk-invariant."""
 
+    if q.device.type == "xpu" and hasattr(torch.xpu, "XPUGraph") and q.shape[0] > 1 \
+            and _GRAPH_CHUNKS is not None:
+        rep = v.shape[1] // q.shape[1]
+        key = (q.device, v.shape[1], v.shape[2], q.shape[2], q.shape[1], rep)
+        cg = _GRAPH_CHUNKS.get(key)
+        if cg is None:
+            cg = _GRAPH_CHUNKS[key] = _ChunkGraph(v.shape[1], v.shape[2], q.shape[2], q.shape[1],
+                                                  rep, q.device)
+        S = state
+        ys = []
+        for a in range(0, q.shape[0], cg.CT):
+            b = min(a + cg.CT, q.shape[0])
+            y, s = cg.run(q[a:b], k[a:b], v[a:b], g[a:b], beta[a:b], S)
+            if y is None:
+                break
+            ys.append(y.to(v.dtype))
+            S = s
+        if ys:
+            final.copy_(S)
+            return torch.cat(ys)
     rep = v.shape[1] // q.shape[1]
     qf, kf = _expanded(q, rep), _expanded(k, rep)
     vf = v.float()
