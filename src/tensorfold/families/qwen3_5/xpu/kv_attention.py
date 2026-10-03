@@ -25,7 +25,7 @@ from tensorfold.cuda.kernels.attention import CHUNK, MAX_NODES, QUERY_TILE, Plan
 
 from . import kvcache
 
-KEY_TILE = 16           # keys a dequant tile holds (dot's minimum; keeps dequant registers small)
+KEY_TILE = tl.constexpr(16)   # keys a dequant tile holds (dot's minimum; keeps dequant registers small)
 
 
 @lru_cache(maxsize=None)
