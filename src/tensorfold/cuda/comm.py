@@ -75,7 +75,10 @@ class NCCL:
             raw = self.store.get(key)
             ctypes.memmove(ctypes.addressof(uid), raw, 128)
         self.comm = ctypes.c_void_p()
-        torch.cuda.current_device()
+        if not torch.cuda.is_available() and torch.xpu.is_available():
+            torch.xpu.current_device()    # TODO(xpu-verify): nccl itself is CUDA-only; XPU tp=2 needs a oneCCL wrapper
+        else:
+            torch.cuda.current_device()
         self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
 
     def _check(self, code: int) -> None:
@@ -87,7 +90,11 @@ class NCCL:
 
         if recv.numel() != send.numel() * self.world or send.dtype != recv.dtype:
             raise ValueError("all_gather: recv must hold world x send of the same dtype")
-        stream = torch.cuda.current_stream().cuda_stream
+        if send.device.type == "xpu":
+            # TODO(xpu-verify): nccl consumes a CUstream; an XPU tp=2 needs a oneCCL wrapper taking the sycl queue
+            stream = torch.xpu.current_stream(send.device).sycl_queue
+        else:
+            stream = torch.cuda.current_stream().cuda_stream
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))
 
@@ -141,10 +148,12 @@ class NCCL:
             self._check(lib.ncclGroupEnd())
 
     def barrier(self) -> None:
-        x = torch.zeros((1,), dtype=torch.float32, device="cuda")
-        y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
+        xpu = not torch.cuda.is_available() and torch.xpu.is_available()
+        device = "xpu" if xpu else "cuda"
+        x = torch.zeros((1,), dtype=torch.float32, device=device)
+        y = torch.zeros((self.world,), dtype=torch.float32, device=device)
         self.all_gather(x, y)
-        torch.cuda.synchronize()
+        torch.xpu.synchronize() if xpu else torch.cuda.synchronize()
 
 
 def fast_gather(comm: Comm, send: torch.Tensor, recv: torch.Tensor) -> None:

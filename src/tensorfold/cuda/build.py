@@ -23,6 +23,9 @@ def arch_flags(need: tuple[int, int] = MIN_CAPABILITY, arch_specific: bool = Fal
 
     import torch
 
+    if not torch.cuda.is_available() and torch.xpu.is_available():
+        raise RuntimeError("TensorFold's CUDA kernels compile only on CUDA; on XPU the b16 torch fallback is used "
+                           "(there is no .cu build)")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) < need:
         why = "thread-block clusters" if need >= CLUSTERS else "FP8 MMA"
@@ -45,6 +48,8 @@ def refuse_old_gpu(need: tuple[int, int] = MIN_CAPABILITY) -> None:
             arch_flags(need)
         except RuntimeError as exc:
             raise ValueError(str(exc)) from None
+    elif torch.xpu.is_available():
+        pass                    # TODO(xpu-verify): no compute-capability floor on XPU yet (b16 runs as the torch fallback)
 
 
 def refuse_small_gpu(need: tuple[int, int] = FLASHNEXT_FLOOR) -> None:

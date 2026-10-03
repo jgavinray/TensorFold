@@ -43,8 +43,9 @@ def capture(logits, tokens, positions, probabilities, rows=None):
         return
     if rows is not None:
         logits = logits.index_select(0, torch.tensor(rows, dtype=torch.long, device=logits.device))
-    if not logits.is_cuda or logits.ndim != 2 or logits.shape[0] != len(tokens) or logits.stride(1) != 1:
-        raise ValueError("probabilities need CUDA target rows and one accepted token per row")
+    # TODO(xpu-verify): the triton kernels below need an XPU triton backend; the guard alone accepts xpu rows
+    if logits.device.type not in ("cuda", "xpu") or logits.ndim != 2 or logits.shape[0] != len(tokens) or logits.stride(1) != 1:
+        raise ValueError("probabilities need CUDA or XPU target rows and one accepted token per row")
     n, vocab = logits.shape
     tiles = tr.cdiv(vocab, 1024)
     parts = torch.empty((n, tiles, 2), dtype=torch.float32, device=logits.device)

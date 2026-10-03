@@ -37,8 +37,13 @@ def torch_live(torch, available: Callable) -> Callable[[], int]:
     """Reusable allocator bytes plus free memory, capped by the budget left after current allocations."""
 
     def room() -> int:
-        allocated = int(torch.cuda.memory_allocated())
-        free = int(available(torch)) + int(torch.cuda.memory_reserved()) - allocated
+        if not torch.cuda.is_available() and torch.xpu.is_available():
+            allocated = int(torch.xpu.memory_allocated())
+            reserved = int(torch.xpu.memory_reserved())
+        else:
+            allocated = int(torch.cuda.memory_allocated())
+            reserved = int(torch.cuda.memory_reserved())
+        free = int(available(torch)) + reserved - allocated
         limit = cuda_limit_bytes()
         return max(0, min(free, limit - allocated)) if limit is not None else max(0, free)
 

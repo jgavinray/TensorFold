@@ -23,6 +23,18 @@ def _up(x: int) -> int:
     return -(-x // ALIGN) * ALIGN
 
 
+def _current_stream(device: torch.device):
+    """The device's current stream, on whichever accelerator type it sits."""
+
+    return torch.xpu.current_stream(device) if device.type == "xpu" else torch.cuda.current_stream(device)
+
+
+def _event(device_type: str):
+    """The accelerator's Event class for ``device_type`` (records on a stream, synchronizes)."""
+
+    return torch.xpu.Event if device_type == "xpu" else torch.cuda.Event
+
+
 class Reader:
     """Byte ranges of files as uint8 tensors on a device; ``direct`` is False once O_DIRECT has been refused."""
 
@@ -36,20 +48,20 @@ class Reader:
              pinned: bool = False) -> torch.Tensor:
         """Bytes [offset, offset + n) of ``path`` as a new uint8 tensor on ``device`` (``pinned``: page-locked, direct reads only)."""
 
-        cuda = torch.device(device).type == "cuda"
+        gpu = torch.device(device).type in ("cuda", "xpu")
         if n > 0 and self.direct:
             try:
-                return self._to_device(path, offset, n, device) if cuda else self._to_host(path, offset, n, pinned)
+                return self._to_device(path, offset, n, device) if gpu else self._to_host(path, offset, n, pinned)
             except OSError as exc:
                 if exc.errno != errno.EINVAL:
                     raise
                 self.direct = False               # the file system refuses O_DIRECT, on the open or on a read
-        if n > 0 and self.staged and (cuda or pinned):
+        if n > 0 and self.staged and (gpu or pinned):
             # Windows stages here: one page-locked block where that means host RAM, filled by one buffered read
-            raw = self._buffered(path, offset, n, pinned=torch.cuda.is_available())
-            return raw.to(device) if cuda else raw
+            raw = self._buffered(path, offset, n, pinned=torch.cuda.is_available() or torch.xpu.is_available())
+            return raw.to(device) if gpu else raw
         raw = self._buffered(path, offset, n)
-        return raw.to(device) if cuda else raw
+        return raw.to(device) if gpu else raw
 
     def close(self) -> None:
         """Give the pinned staging back to the system, not to the host allocator's cache."""
@@ -124,7 +136,7 @@ class Reader:
                 raise IOError(f"short read of {path}: bytes {offset}-{offset + n} past its end ({size})")
             end = _up(size)
             out = torch.empty((n,), dtype=torch.uint8, device=device)
-            stream = torch.cuda.current_stream(out.device)   # the copies' stream, whichever device is current
+            stream = _current_stream(out.device)   # the copies' stream, whichever device is current
             at = 0
             while at < n:
                 take = min(PIECE, n - at)
@@ -138,7 +150,7 @@ class Reader:
                 skip = offset + at - lo
                 self._fill(fd, memoryview(piece.numpy())[:hi - lo], lo, skip + take, path)
                 out[at:at + take].copy_(piece[skip:skip + take], non_blocking=True)
-                slot[1] = torch.cuda.Event()
+                slot[1] = _event(out.device.type)()
                 slot[1].record(stream)
                 at += take
             return out
@@ -184,7 +196,7 @@ class SafeTensors:
 
 
 class ReadAhead:
-    """Tensors read ahead on threads, neighbours (``gap`` apart, ``run`` at most) in one read; a CUDA device gets one upload a read on a side stream."""
+    """Tensors read ahead on threads, neighbours (``gap`` apart, ``run`` at most) in one read; a GPU device gets one upload a read on a side stream."""
 
     def __init__(self, reader: Reader | None = None, threads: int = 8, run: int = 128 << 20,
                  gap: int = 1 << 20) -> None:
@@ -200,12 +212,13 @@ class ReadAhead:
         from concurrent.futures import ThreadPoolExecutor
 
         cut = cut or (lambda raw, meta: raw.clone())
-        if device is not None and torch.device(device).type != "cuda":
+        if device is not None and torch.device(device).type not in ("cuda", "xpu"):
             device = None
         if self.pool is None:
             self.pool = ThreadPoolExecutor(self.threads, thread_name_prefix="read-ahead")
         if device is not None and self.stream is None:
-            self.stream = torch.cuda.Stream(torch.device(device))
+            dev = torch.device(device)
+            self.stream = torch.xpu.Stream(dev) if dev.type == "xpu" else torch.cuda.Stream(dev)
         by_path: dict[str, list] = {}
         for item in items:
             if item[0] not in self.ahead:
@@ -233,7 +246,7 @@ class ReadAhead:
         uploaded, tensors = future.result()
         out = tensors.pop(key)
         if uploaded is not None:
-            stream = torch.cuda.current_stream(out.device)
+            stream = _current_stream(out.device)
             stream.wait_event(uploaded)
             out.record_stream(stream)
         return out
@@ -263,10 +276,13 @@ class ReadAhead:
             raw = self.reader.read(path, lo, hi - lo)
             return None, {key: cut(raw[b - lo:e - lo], meta) for key, _, b, e, meta in run}
         host = self.reader.read(path, lo, hi - lo, pinned=True)
-        with torch.cuda.device(torch.device(device)), torch.cuda.stream(self.stream):
+        dev = torch.device(device)
+        device_ctx = torch.xpu.device(dev) if dev.type == "xpu" else torch.cuda.device(dev)
+        stream_ctx = torch.xpu.stream(self.stream) if dev.type == "xpu" else torch.cuda.stream(self.stream)
+        with device_ctx, stream_ctx:
             raw = host.to(device, non_blocking=True)
             out = {key: cut(raw[b - lo:e - lo], meta) for key, _, b, e, meta in run}
-            uploaded = torch.cuda.Event()
+            uploaded = _event(dev.type)()
             uploaded.record(self.stream)
         return uploaded, out
 

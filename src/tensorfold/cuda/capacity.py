@@ -149,10 +149,15 @@ def _meminfo() -> dict | None:
 
 
 def unified(torch) -> bool:
-    """A GPU on the host's memory (GB10): its free figure is MemFree, which counts the page cache as used."""
+    """A GPU on the host's memory (GB10 or an iGPU): its free figure is MemFree, which counts the page cache as used."""
 
     try:
-        return bool(torch.cuda.get_device_properties(0).is_integrated)
+        if torch.cuda.is_available():
+            return bool(torch.cuda.get_device_properties(0).is_integrated)
+        if torch.xpu.is_available():
+            # TODO(xpu-verify): torch.xpu properties may not carry is_integrated; treated as discrete until then
+            return bool(getattr(torch.xpu.get_device_properties(0), "is_integrated", False))
+        return False
     except (AttributeError, AssertionError, RuntimeError):
         return False
 
@@ -205,7 +210,10 @@ def cuda_limit_bytes(environ: Mapping[str, str] | None = None) -> int | None:
 def available_bytes(torch) -> int:
     """What admission and the runtime gate read as live: the pool's free memory less its floor, under the explicit cap."""
 
-    free, total = map(int, torch.cuda.mem_get_info())
+    if not torch.cuda.is_available() and torch.xpu.is_available():
+        free, total = map(int, torch.xpu.mem_get_info())
+    else:
+        free, total = map(int, torch.cuda.mem_get_info())
     memory = _meminfo() if unified(torch) else None
     if memory is not None:
         granted = memory["MemAvailable"] - reserve_bytes(memory["MemTotal"])     # one pool: page cache counts as free
@@ -218,6 +226,8 @@ def available_bytes(torch) -> int:
 def total_bytes(torch) -> int:
     """The GPU's memory (a GB10's is the host's): the same on every rank, so what it sizes agrees without a gather."""
 
+    if not torch.cuda.is_available() and torch.xpu.is_available():
+        return int(torch.xpu.mem_get_info()[1])
     return int(torch.cuda.mem_get_info()[1])
 
 
@@ -369,8 +379,20 @@ def tables_note(plan: Plan) -> str | None:
             f"lookups will page them from disk, which slows prompts ({fix})")
 
 
-def gather_ints(torch, gather: Callable, values: list[int], world: int = 2) -> list[list[int]]:
-    send = torch.tensor(values, dtype=torch.int64, device="cuda")
-    receive = torch.empty((world * len(values),), dtype=torch.int64, device="cuda")
+def gather_ints(torch, gather: Callable, values: list[int], world: int = 2,
+                device_type: str | None = None) -> list[list[int]]:
+    """Gather every rank's ints in rank order; ``device_type`` None infers the process group's backend
+    (nccl: cuda, ccl/xccl: xpu) and falls back to cuda."""
+
+    if device_type is None:
+        try:
+            import torch.distributed as dist
+
+            backend = dist.get_backend() if dist.is_initialized() else None
+        except (ImportError, RuntimeError):
+            backend = None
+        device_type = {"nccl": "cuda", "ccl": "xpu", "xccl": "xpu"}.get(backend, "cuda")
+    send = torch.tensor(values, dtype=torch.int64, device=device_type)
+    receive = torch.empty((world * len(values),), dtype=torch.int64, device=device_type)
     gather(send, receive)
     return receive.view(world, -1).tolist()
