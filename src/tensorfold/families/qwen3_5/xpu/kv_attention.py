@@ -26,6 +26,7 @@ from tensorfold.cuda.kernels.attention import CHUNK, MAX_NODES, QUERY_TILE, Plan
 from . import kvcache
 
 KEY_TILE = tl.constexpr(16)   # keys a dequant tile holds (dot's minimum; keeps dequant registers small)
+_MAX_NODES = tl.constexpr(MAX_NODES)   # triton-xpu 3.8: jit bodies need tl.constexpr globals
 
 
 @lru_cache(maxsize=None)
@@ -150,7 +151,7 @@ def _attend(Q, KC, VC, KS, VS, KN, VN, OFF, ROWS, STREAMS, PATHS, DEPTHS, OUT,
         committed = ki < p
         path_slot = ki - p
         on_path = (path_slot >= 0) & (path_slot < depth)
-        path_node = tl.load(PATHS + node * MAX_NODES + path_slot, mask=on_path, other=0)
+        path_node = tl.load(PATHS + node * _MAX_NODES + path_slot, mask=on_path, other=0)
         kk = _dequant_tile(KC, KS, koff, ksoff, ki, hk, d, committed, D, BITS)
         vv = _dequant_tile(VC, VS, voff, vsoff, ki, hk, d, committed, D, BITS)
         kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
