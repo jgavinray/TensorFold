@@ -11,7 +11,14 @@ import torch
 from tensorfold.cuda import moe, prompt_precision
 from tensorfold.cuda.kernels import gdn as deltanet
 from tensorfold.cuda.kernels import qmm as shared
-from tensorfold.cuda.kernels.prefill_attention import attention
+from tensorfold.cuda.kernels import prefill_attention as _pa_mod
+
+
+def _prefill_attention(q, k_cache, v_cache, p0, *, scale):
+    """B70 head_dim (256) has no CUDA ext on XPU: the Triton path is the bits' definition."""
+    if q.device.type == "xpu":
+        return _pa_mod.triton_attention(q, k_cache, v_cache, p0, scale=scale)
+    return _pa_mod.attention(q, k_cache, v_cache, p0, scale=scale)
 
 from . import glue
 from . import kvcache
@@ -166,7 +173,7 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
                 kbuf, vbuf = grown
                 kbuf[p0:p0 + W] = key.view(W, c.kv_heads, c.head_dim)
                 vbuf[p0:p0 + W] = value
-                out = attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
+                out = _prefill_attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
             r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
         if layer.moe is not None:                          # routed experts read bf16 rows (their prefill form)
             x, h, _ = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
@@ -346,7 +353,7 @@ def prefill_rows(w: Weights, items: list[tuple[Sequence[int], State, int]], *, t
                     kbuf, vbuf = grown
                     kbuf[p0:p0 + n] = key[o:o + n]
                     vbuf[p0:p0 + n] = value[o:o + n]
-                    outs.append(attention(q[o:o + n], kbuf, vbuf, p0, scale=c.head_dim ** -0.5))
+                    outs.append(_prefill_attention(q[o:o + n], kbuf, vbuf, p0, scale=c.head_dim ** -0.5))
             r = _row_mm(pg.gate_mul(torch.cat(outs), qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
         x, h = pg.add_rmsnorm(x, r, layer.post_norm, c.eps)
         pending = _mlp(h, layer, pg, tp)
