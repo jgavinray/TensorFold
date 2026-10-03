@@ -284,12 +284,18 @@ def base(device) -> torch.Tensor:
     """A fixed bf16 tensor that cache offsets are measured from (so an empty cache still has a valid offset)."""
 
     device = torch.device(device)
-    return _base(device.index if device.index is not None else torch.cuda.current_device())
+    index = device.index
+    if index is None:
+        if device.type == "xpu":
+            index = torch.xpu.current_device()
+        else:
+            index = torch.cuda.current_device()
+    return _base(device.type, index)
 
 
 @lru_cache(maxsize=None)
-def _base(index: int) -> torch.Tensor:
-    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device("cuda", index))
+def _base(device_type: str, index: int) -> torch.Tensor:
+    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device(device_type, index))
 
 
 def offsets(caches: Sequence[tuple[torch.Tensor, torch.Tensor]], device) -> list[int]:
