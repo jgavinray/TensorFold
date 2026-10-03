@@ -37,6 +37,30 @@ def grouped(device: int) -> bool:
     return torch.cuda.get_device_capability(device)[0] == 12
 
 
+def _grouped_for(x: torch.Tensor) -> bool:
+    """``grouped`` for a tensor's device: the grouped launch is a CUDA sm_12x feature (xpu routes per-tensor)."""
+
+    return x.device.type == "cuda" and grouped(x.device.index)
+
+
+def _xpu_lane_matmul(x: torch.Tensor, q: "Q4", xs: torch.Tensor | None, sk: int | None, f32: bool,
+                     out: torch.Tensor | None, reduce: bool) -> torch.Tensor:
+    """The xpu package's lane matmul on ``q`` unpacked to the stored MLX layout (same packing; the
+    grouped CUDA kernel and its nvcc build are skipped).  ``unpack`` is a lossless pure-torch permute."""
+
+    if f32:
+        raise NotImplementedError("qmm.matmul f32 is CUDA-only on xpu (the lane matmul returns bf16)")
+    if not reduce:
+        raise NotImplementedError("qmm.matmul reduce=False is CUDA-only on xpu")
+    if q.gs != 64:
+        raise NotImplementedError(f"qmm on xpu takes gs=64 packed weights, not gs={q.gs}")
+    from tensorfold.families.qwen3_5.xpu.qmm import lane_matmul
+
+    weight, scales, biases = unpack(q)
+    result = lane_matmul(x, weight, scales, biases, xs=xs, sk=sk)
+    return result if out is None else out.copy_(result)
+
+
 
 @dataclass
 class Q4:
@@ -163,12 +187,14 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
     if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 8) or x.data_ptr() % 16:
         x = x.clone(memory_format=torch.contiguous_format)     # cp.async reads rows in 16-byte pieces
     m = x.shape[0]
+    if x.device.type == "xpu":
+        return _xpu_lane_matmul(x, q, xs, sk, f32, out, reduce)
     if xs is None:
         xs = group_sums(x, q.gs)
     sk = sk or split_k(q.n, q.k, q.gs)
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
-    if q.gs == 64 and reduce and grouped(x.device.index):
+    if q.gs == 64 and reduce and _grouped_for(x):
         _ext().qmm_group(x, xs, [q.weight], [q.scales], [q.biases], [out], [q.n], [sk], f32,
                          group_tile(m, *_chip(x.device.index)), -1)
         return out
@@ -185,7 +211,7 @@ def matmul_group(x: torch.Tensor, qs: list[Q4], xs: torch.Tensor | None = None, 
     if x.dtype != torch.bfloat16 or x.dim() != 2 or any(x.shape[1] != q.k for q in qs):
         raise ValueError("matmul_group: x must be (M, K) bf16 with every weight's K")
     sks = sks or [split_k(q.n, q.k, q.gs) for q in qs]
-    if not (1 <= len(qs) <= 4 and all(q.gs == 64 for q in qs) and grouped(x.device.index)):
+    if not (1 <= len(qs) <= 4 and all(q.gs == 64 for q in qs) and _grouped_for(x)):
         return [matmul(x, q, xs, sk=s, f32=f32) for q, s in zip(qs, sks)]
     if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 8) or x.data_ptr() % 16:
         x = x.clone(memory_format=torch.contiguous_format)
@@ -211,6 +237,8 @@ def prefill_matmul(x: torch.Tensor, q: Q4, *, f32: bool = False, tile: int = 0,
 
     if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != q.k:
         raise ValueError(f"prefill_matmul: x must be (M, {q.k}) bf16")
+    if x.device.type == "xpu":
+        return _xpu_prefill(x, q, f32, out)
     if x.stride(1) != 1 or (x.shape[0] > 1 and x.stride(0) % 8) or x.data_ptr() % 16:
         x = x.clone(memory_format=torch.contiguous_format)
     if out is None:
@@ -255,10 +283,25 @@ def quantize_rows(x: torch.Tensor, gs: int = 64) -> tuple[torch.Tensor, torch.Te
     return x8, xs, a
 
 
+def _xpu_prefill(x: torch.Tensor, q: "Q4", f32: bool, out: torch.Tensor | None) -> torch.Tensor:
+    """The xpu prefill read: unpack, the weights' stored values as bf16 (dequantize), one fp32 chain
+    over K.  Same contract as the CUDA prefill kernel; the bf16 weight materialization is per call."""
+
+    from tensorfold.families.qwen3_5.xpu.qmm import dequantize
+
+    weight, scales, biases = unpack(q)
+    w = dequantize(weight, scales, biases, 4, q.gs)            # (n, k) bf16: the stored weights
+    result = x.float() @ w.float().T
+    result = result if f32 else result.to(torch.bfloat16)
+    return result if out is None else out.copy_(result)
+
+
 def prefill_matmul8(xq: tuple[torch.Tensor, torch.Tensor, torch.Tensor], q: Q4, *, f32: bool = False, tile: int = 0,
                     out: torch.Tensor | None = None) -> torch.Tensor:
     """FP8 prefill matmul on ``quantize_rows`` output, exact e4m3 weights; a row's bits depend only on its inputs."""
 
+    if xq[0].device.type == "xpu":
+        raise NotImplementedError("fp8 prompt prefill is CUDA-only on xpu (serve bf16 prompts there)")
     x8, xs, a = xq
     if x8.dim() != 2 or x8.shape[1] != q.k:
         raise ValueError(f"prefill_matmul8: inputs must be (M, {q.k})")
