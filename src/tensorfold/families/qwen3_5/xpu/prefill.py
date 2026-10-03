@@ -14,6 +14,7 @@ from tensorfold.cuda.kernels import qmm as shared
 from tensorfold.cuda.kernels.prefill_attention import attention
 
 from . import glue
+from . import kvcache
 from . import prefill_bf16, prefill_glue
 from .decode import clone_state
 from .forward import State, grow as _grow

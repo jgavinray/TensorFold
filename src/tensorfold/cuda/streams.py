@@ -180,6 +180,12 @@ class KVRoom:
         seen, total = set(), 0
         for kv in [st.kv, *(e[1].kv for e in self.cache.entries)]:
             for pair in kv:
+                if hasattr(pair, "nbytes"):            # a quantized KVCache (k+codes+codes scales)
+                    for t in (pair.k, pair.v, pair.ks, pair.vs):
+                        if t is not None and t.data_ptr() not in seen:
+                            seen.add(t.data_ptr())
+                            total += t.untyped_storage().nbytes()
+                    continue
                 for t in pair or ():
                     if t.data_ptr() not in seen:
                         seen.add(t.data_ptr())
