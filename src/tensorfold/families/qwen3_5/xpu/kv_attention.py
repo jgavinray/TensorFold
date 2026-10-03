@@ -98,7 +98,7 @@ def _h32(x):
 
 
 @triton.jit
-def _dequant_tile(KC, KS, koff, ksoff, rows, hk, d, committed, D: tl.constexpr, BITS: tl.constexpr):
+def _dequant_tile(KC, KS, koff, ksoff, rows, hk, d, committed, HK: tl.constexpr, D: tl.constexpr, BITS: tl.constexpr):
     """One (KEY_TILE, D) key tile from the caches: dequantized to bf16 and unrotated, garbage rows zeroed."""
 
     if BITS == 8:
@@ -152,8 +152,8 @@ def _attend(Q, KC, VC, KS, VS, KN, VN, OFF, ROWS, STREAMS, PATHS, DEPTHS, OUT,
         path_slot = ki - p
         on_path = (path_slot >= 0) & (path_slot < depth)
         path_node = tl.load(PATHS + node * _MAX_NODES + path_slot, mask=on_path, other=0)
-        kk = _dequant_tile(KC, KS, koff, ksoff, ki, hk, d, committed, D, BITS)
-        vv = _dequant_tile(VC, VS, voff, vsoff, ki, hk, d, committed, D, BITS)
+        kk = _dequant_tile(KC, KS, koff, ksoff, ki, hk, d, committed, HK, D, BITS)
+        vv = _dequant_tile(VC, VS, voff, vsoff, ki, hk, d, committed, HK, D, BITS)
         kn = tl.load(KN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
         vn = tl.load(VN + (path_node[:, None] * HK + hk) * D + d[None, :], mask=on_path[:, None], other=0)
         kk = tl.where(committed[:, None], kk, kn)
