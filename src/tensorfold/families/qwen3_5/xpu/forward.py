@@ -103,7 +103,7 @@ def _cache_offsets(states: Sequence["State"], layers: Sequence[int], device) -> 
         flat: list[int] = []
         for i in layers:
             bits = states[0].kv[i].bits
-            per = kv_attention.offsets([st.kv[i] for st in states])     # k, v, ks, vs offsets a stream
+            per = kv_attention.offsets([st.kv[i] for st in states], device)     # k, v, ks, vs offsets a stream
             for s in range(len(states)):
                 flat += per[4 * s:4 * s + 4] + [bits]
         dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 5)
