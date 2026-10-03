@@ -12,36 +12,6 @@ from tensorfold.cuda import moe
 from tensorfold.cuda.kernels import attention as tree_attention
 
 
-def _attn_base(device) -> torch.Tensor:
-    """Cache offsets measured against a fixed bf16 tensor (kernels.attention.base
-    hardcodes torch.cuda — the xpu package allocates its own base per device)."""
-    device = torch.device(device)
-    return _attn_base_cached(device.type, device.index)
-
-
-from functools import lru_cache
-
-
-@lru_cache(maxsize=None)
-def _attn_base_cached(device_type: str, index: int | None) -> torch.Tensor:
-    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device(device_type, index))
-
-
-def _attn_base_offsets(caches, device) -> list[int]:
-    """kernels.attention.offsets() but measuring against _attn_base(device)."""
-    origin = _attn_base(device).data_ptr()
-    out = []
-    for k, v in caches:
-        for t in (k, v):
-            if t.dtype != torch.bfloat16 or not t.is_contiguous():
-                raise ValueError("caches: contiguous bf16 tensors")
-            delta = t.data_ptr() - origin
-            if delta % 16:
-                raise ValueError("caches must be 16-byte aligned")
-            out.append(delta // 2)
-    return out
-
-
 from tensorfold.cuda.kernels import gdn as deltanet
 
 from . import glue
@@ -138,7 +108,7 @@ def _cache_offsets(states: Sequence["State"], layers: Sequence[int], device) -> 
                 flat += per[4 * s:4 * s + 4] + [bits]
         dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 5)
         return dict(zip(layers, dev))
-    flat = [o for i in layers for o in _attn_base_offsets([st.kv[i] for st in states], device)]
+    flat = [o for i in layers for o in tree_attention.offsets([st.kv[i] for st in states], device)]
     dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 2)
     return dict(zip(layers, dev))
 
