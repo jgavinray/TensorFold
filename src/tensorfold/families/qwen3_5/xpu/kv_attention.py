@@ -86,8 +86,7 @@ def _tile(q, k, v, m, l, o, valid, scale: tl.constexpr):
 
 
 @triton.jit
-def _h32_stage(x, KT: tl.constexpr, G: tl.constexpr, lo: tl.constexpr):
-    hi = 32 // (2 * lo)
+def _h32_stage(x, KT: tl.constexpr, G: tl.constexpr, lo: tl.constexpr, hi: tl.constexpr):
     t = tl.reshape(x, (KT, G, hi, 2, lo))
     a, b = tl.split(tl.permute(t, (0, 1, 2, 4, 3)))
     return tl.reshape(tl.permute(tl.join(a + b, a - b), (0, 1, 2, 4, 3)), (KT, G, 32))
@@ -97,11 +96,11 @@ def _h32_stage(x, KT: tl.constexpr, G: tl.constexpr, lo: tl.constexpr):
 def _h32(x, KT: tl.constexpr, G: tl.constexpr):
     """H32 over the last axis (32) in registers, ``kvcache.h32_ref``'s operations -- its own inverse."""
 
-    x = _h32_stage(x, KT, G, 1)
-    x = _h32_stage(x, KT, G, 2)
-    x = _h32_stage(x, KT, G, 4)
-    x = _h32_stage(x, KT, G, 8)
-    x = _h32_stage(x, KT, G, 16)
+    x = _h32_stage(x, KT, G, 1, 16)
+    x = _h32_stage(x, KT, G, 2, 8)
+    x = _h32_stage(x, KT, G, 4, 4)
+    x = _h32_stage(x, KT, G, 8, 2)
+    x = _h32_stage(x, KT, G, 16, 1)
     return x * 0.17677669529663687            # R32
 
 
