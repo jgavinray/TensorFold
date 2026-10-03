@@ -219,4 +219,6 @@ def prefill_attention(q: torch.Tensor, cache: kvcache.KVCache, p0: int, *, scale
     from tensorfold.cuda.kernels import prefill_attention as bf16_prefill
 
     k, v = dequant_rows(cache, p0 + q.shape[0])
+    if q.device.type == "xpu":
+        return bf16_prefill.triton_attention(q, k, v, p0, scale=scale)
     return bf16_prefill.attention(q, k, v, p0, scale=scale)

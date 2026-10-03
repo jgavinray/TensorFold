@@ -321,7 +321,7 @@ def draft_geometry(t: dict, world: int, reserve: int, *, bounded: bool = False, 
     heads = int(t["num_key_value_heads"]) // world
     hd = int(t["head_dim"])
     block = int((t.get("dflash_config") or {}).get("block_size", 16))
-    window = int(t.get("sliding_window", 0))
+    window = int(t.get("sliding_window") or 0)
     hidden = int(t["hidden_size"])
     fixed = 16 * max(64, streams * block) * (hidden + int(t["intermediate_size"])) * 4
     copies = 2 * streams + kept      # a stream's context and the one its taps replace it with; each kept prompt end
@@ -338,7 +338,7 @@ def dflash2_geometry(t: dict, world: int, reserve: int, *, ring: bool) -> Geomet
     heads = int(t["num_key_value_heads"]) // world
     hd = int(t["head_dim"])
     block = int((t.get("dflash_config") or {}).get("block_size", 16))
-    window = int(t.get("sliding_window", 0))
+    window = int(t.get("sliding_window") or 0)
     fixed = 16 * max(64, block) * (int(t["hidden_size"]) + int(t["intermediate_size"])) * 4
     rows = draft_ring_rows(window - 1, block) if ring and window > 0 else 0
 
