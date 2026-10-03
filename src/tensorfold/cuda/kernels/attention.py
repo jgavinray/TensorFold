@@ -317,8 +317,8 @@ def attention(q: torch.Tensor, k_nodes: torch.Tensor, v_nodes: torch.Tensor, off
     if not (w == p.width and d in (128, 256) and k_nodes.shape == (w, hk, d) and v_nodes.shape == k_nodes.shape
             and h % hk == 0 and h // hk <= QUERY_TILE):
         raise ValueError("unsupported attention shape")
-    if any(x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
-        raise ValueError("q and node keys and values must be contiguous CUDA bf16 tensors")
+    if any(x.dtype != torch.bfloat16 or x.device.type not in ("cuda", "xpu") or not x.is_contiguous() for x in (q, k_nodes, v_nodes)):
+        raise ValueError("q and node keys and values must be contiguous accelerator bf16 tensors")
     origin = base(q.device)
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("scale must be positive and finite")

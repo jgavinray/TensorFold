@@ -43,8 +43,8 @@ def _validate(x, q):
             raise ValueError("affine words must be int32 with floating-point scales and biases")
     if x.ndim != 2 or x.shape[1] != k or x.dtype != torch.bfloat16 or x.shape[0] < 1:
         raise ValueError("affine inputs must be nonempty BF16 rows of the declared input width")
-    if not x.is_cuda or any(t is not None and t.device != x.device for t in (q.weight, q.scales, q.biases)):
-        raise ValueError("affine operands must share a CUDA device")
+    if x.device.type not in ("cuda", "xpu") or any(t is not None and t.device != x.device for t in (q.weight, q.scales, q.biases)):
+        raise ValueError("affine operands must share an accelerator device")
     if any(t is not None and not t.is_contiguous() for t in (q.weight, q.scales, q.biases)):
         raise ValueError("affine weights and group metadata must be contiguous")
     return n, k
@@ -74,7 +74,7 @@ def embed(ids, q):
     from . import affine_kernels as kernels
 
     if ids.ndim != 1 or ids.dtype not in (torch.int32, torch.int64) or ids.device != q.weight.device:
-        raise ValueError("embedding IDs must be a vector on the weights' CUDA device")
+        raise ValueError("embedding IDs must be a vector on the weights' device")
     if q.layout == "dense":
         return q.weight.index_select(0, ids.to(torch.int64)).to(torch.bfloat16)
     if q.layout != "mlx" or q.weight.dtype != torch.int32:
