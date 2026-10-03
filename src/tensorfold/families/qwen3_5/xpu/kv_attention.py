@@ -86,14 +86,14 @@ def _tile(q, k, v, m, l, o, valid, scale: tl.constexpr):
 
 
 @triton.jit
-def _h32(x):
+def _h32(x, KT: tl.constexpr, G: tl.constexpr):
     """H32 over the last axis (32) in registers, ``kvcache.h32_ref``'s operations -- its own inverse."""
 
     for lo in (1, 2, 4, 8, 16):
         hi = 32 // (2 * lo)
-        t = tl.reshape(x, (x.shape[0], x.shape[1], hi, 2, lo))
+        t = tl.reshape(x, (KT, G, hi, 2, lo))
         a, b = tl.split(tl.permute(t, (0, 1, 2, 4, 3)))
-        x = tl.reshape(tl.permute(tl.join(a + b, a - b), (0, 1, 2, 4, 3)), (x.shape[0], x.shape[1], 32))
+        x = tl.reshape(tl.permute(tl.join(a + b, a - b), (0, 1, 2, 4, 3)), (KT, G, 32))
     return x * 0.17677669529663687            # R32
 
 
@@ -117,7 +117,7 @@ def _dequant_tile(KC, KS, koff, ksoff, rows, hk, d, committed, HK: tl.constexpr,
                     mask=committed[:, None], other=0).to(tl.float32)
         x = ((c.to(tl.float32) - 7.5) * s * 0.125).to(tl.bfloat16)
     g = tl.reshape(x.to(tl.float32), (KEY_TILE, D // 32, 32))
-    g = _h32(g)                               # the codes stay rotated; the dot needs the stored value
+    g = _h32(g, KEY_TILE, D // 32)           # the codes stay rotated; the dot needs the stored value
     return tl.reshape(g, (KEY_TILE, D)).to(tl.bfloat16)
 
 
