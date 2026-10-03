@@ -21,6 +21,7 @@ def clone_state(st: State) -> State:
     other = object.__new__(State)
     other.pos, other.limit = st.pos, st.limit
     other.rope_delta, other.room = st.rope_delta, st.room
+    other.kv_dtype = st.kv_dtype
     other.conv = st.conv.copy()
     other.rec = st.rec.copy()
     other.kv = st.kv
@@ -49,14 +50,15 @@ def prefill_stops(w: Weights, prompt: Sequence[int], st: State, draft=None, *, s
 @torch.no_grad()
 def prefill(w: Weights, prompt: Sequence[int], sampling: Sampling | None,
             draft=None, *, state: State | None = None, limit: int = 0, stops: Sequence[int] = (),
-            keep: Callable | None = None, keep_at: int | None = None, vision=None, constraint=None, room=None):
+            keep: Callable | None = None, keep_at: int | None = None, vision=None, constraint=None, room=None,
+            kv_dtype: str | None = None):
     """Commit the prompt and sample the first token; resuming a kept ``state`` gives a fresh prefill's bits (``keep_at`` adds a third item: the state after prompt[:keep_at] and the drafter's snapshot there)."""
 
     from .forward import _mm
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
-    st = clone_state(state) if state is not None else State(w)
+    st = clone_state(state) if state is not None else State(w, kv_dtype)
     if state is None:
         st.limit = limit                    # a fresh state's attention caches stop here; a resumed one keeps its own
     if room is not None:

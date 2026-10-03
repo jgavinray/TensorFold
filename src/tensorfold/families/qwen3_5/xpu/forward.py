@@ -45,6 +45,7 @@ def _attn_base_offsets(caches, device) -> list[int]:
 from tensorfold.cuda.kernels import gdn as deltanet
 
 from . import glue
+from . import kvcache
 from .qmm_fast import matmul, matmul_group
 from .weights import Plain, QLinear, Weights
 
@@ -123,8 +124,20 @@ def _paths(parents: Sequence[int]) -> tuple[list[int], bool]:
 
 
 def _cache_offsets(states: Sequence["State"], layers: Sequence[int], device) -> dict[int, torch.Tensor]:
-    """Each attention layer's (streams, 2) key and value cache offsets, from one pinned copy."""
+    """Each attention layer's (streams, 2) key and value cache offsets, from one pinned copy; quantized
+    caches get (streams, 5): kv_attention's code byte offsets, scale offsets, and the codes' bits."""
 
+    if layers and isinstance(states[0].kv[layers[0]], kvcache.KVCache):
+        from . import kv_attention
+
+        flat: list[int] = []
+        for i in layers:
+            bits = states[0].kv[i].bits
+            per = kv_attention.offsets([st.kv[i] for st in states])     # k, v, ks, vs offsets a stream
+            for s in range(len(states)):
+                flat += per[4 * s:4 * s + 4] + [bits]
+        dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 5)
+        return dict(zip(layers, dev))
     flat = [o for i in layers for o in _attn_base_offsets([st.kv[i] for st in states], device)]
     dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 2)
     return dict(zip(layers, dev))
@@ -165,14 +178,15 @@ class State:
     rope_delta = 0                      # an image prompt's rotary shift past its tokens; text has none
     room = None                         # called (state, bytes) before a grow: one GPU's engine frees kept buffers
 
-    def __init__(self, w: Weights):
+    def __init__(self, w: Weights, kv_dtype: str | None = None):
         c = w.config
         device = w.norm.device
+        self.kv_dtype = kvcache.check(kv_dtype) if kv_dtype is not None else "bf16"
         self.pos = 0
         self.limit = 0                  # attention caches grow to at most this many rows (0: as a commit needs)
         self.conv: list[torch.Tensor | None] = []
         self.rec: list[torch.Tensor | None] = []
-        self.kv: list[tuple[torch.Tensor, torch.Tensor] | None] = []
+        self.kv: list[tuple[torch.Tensor, torch.Tensor] | kvcache.KVCache | None] = []
         for layer in w.layers:
             if layer.linear:
                 cd = 2 * c.k_heads * c.dk + c.v_heads * c.dv
@@ -182,8 +196,11 @@ class State:
             else:
                 self.conv.append(None)
                 self.rec.append(None)
-                self.kv.append((torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=torch.bfloat16),
-                                torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=torch.bfloat16)))
+                if self.kv_dtype == "bf16":
+                    self.kv.append((torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=torch.bfloat16),
+                                    torch.empty((0, c.kv_heads, c.head_dim), device=device, dtype=torch.bfloat16)))
+                else:
+                    self.kv.append(kvcache.KVCache(0, c.kv_heads, c.head_dim, device, self.kv_dtype))
 
 
 @dataclass
@@ -225,10 +242,20 @@ def stage(w: Weights, st: State, width: int, context: int) -> Staged:
                   _cache_offsets([st], softmax, device), _conv_windows(parents, c.conv_kernel - 1).to(device), host, dev)
 
 
-def grow(st: State, i: int, need: int, *, exact: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def grow(st: State, i: int, need: int, *, exact: bool = False) -> tuple[torch.Tensor, torch.Tensor] | kvcache.KVCache:
     """Layer ``i``'s cache at ``need`` rows (doubled to ``st.limit``, or exact): every row moves, the old ones free."""
 
-    k, v = st.kv[i]
+    entry = st.kv[i]
+    if isinstance(entry, kvcache.KVCache):
+        if entry.capacity < need:
+            cap = need if exact else max(need, 2 * entry.capacity, 1024)
+            if st.limit and not exact:
+                cap = max(need, min(cap, st.limit))
+            if st.room is not None:
+                st.room(st, cap * kvcache.row_bytes(entry.kv_heads, entry.head_dim, st.kv_dtype))
+            st.kv[i] = entry.resized(cap, min(entry.capacity, st.pos))   # codes and scales move with the rows
+        return st.kv[i]
+    k, v = entry
     if k.shape[0] < need:
         cap = need if exact else max(need, 2 * k.shape[0], 1024)
         if st.limit and not exact:
@@ -320,7 +347,12 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos,
                                     w.inv_freq, c.eps, heads=c.heads, kv_heads=c.kv_heads,
                                     head_dim=c.head_dim)
-            out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+            if aoffs[i].shape[-1] == 5:                  # quantized caches: kv_attention's offsets + bits
+                from . import kv_attention
+
+                out = kv_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+            else:
+                out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
             gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
             r = _row_mm(gated, attn.o, tp, out_xs)
             record.append(AttentionRecord(key, value))
@@ -430,7 +462,12 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos,
                                     w.inv_freq, c.eps, heads=c.heads, kv_heads=c.kv_heads,
                                     head_dim=c.head_dim)
-            out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+            if aoffs[i].shape[-1] == 5:                  # quantized caches: kv_attention's offsets + bits
+                from . import kv_attention
+
+                out = kv_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+            else:
+                out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
             gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
             r = _row_mm(gated, attn.o, tp, out_xs)
             record.append(AttentionRecord(key, value))
@@ -540,15 +577,28 @@ def _commit(states: Sequence[State], record: Sequence[Record], paths: Sequence[S
                 grow(st, i, need)
         # every stream's accepted key/value rows: one gather a layer, one multi-tensor copy into every cache
         take = takes[0] if len(takes) == 1 else torch.cat(list(takes))
-        dst, src = [], []
-        for i, item in att:
-            keys, values = item.k.index_select(0, take), item.v.index_select(0, take)
-            a0 = 0
-            for st, path in zip(states, paths):
-                n = len(path)
-                dst += [st.kv[i][0][st.pos:st.pos + n], st.kv[i][1][st.pos:st.pos + n]]
-                src += [keys[a0:a0 + n], values[a0:a0 + n]]
-                a0 += n
-        torch._foreach_copy_(dst, src)
+        if isinstance(states[0].kv[att[0][0]], kvcache.KVCache):
+            for i, item in att:                          # quantized caches: quantize the gathered rows on write
+                cache_bits = states[0].kv[i].bits
+                keys, values = item.k.index_select(0, take), item.v.index_select(0, take)
+                a0 = 0
+                for st, path in zip(states, paths):
+                    n = len(path)
+                    kc, ksc, vc, vsc = kvcache.quantize_ref(keys[a0:a0 + n], values[a0:a0 + n], cache_bits)
+                    cache = st.kv[i]
+                    cache.k[st.pos:st.pos + n], cache.ks[st.pos:st.pos + n] = kc, ksc
+                    cache.v[st.pos:st.pos + n], cache.vs[st.pos:st.pos + n] = vc, vsc
+                    a0 += n
+        else:
+            dst, src = [], []
+            for i, item in att:
+                keys, values = item.k.index_select(0, take), item.v.index_select(0, take)
+                a0 = 0
+                for st, path in zip(states, paths):
+                    n = len(path)
+                    dst += [st.kv[i][0][st.pos:st.pos + n], st.kv[i][1][st.pos:st.pos + n]]
+                    src += [keys[a0:a0 + n], values[a0:a0 + n]]
+                    a0 += n
+            torch._foreach_copy_(dst, src)
     for st, path in zip(states, paths):
         st.pos += len(path)

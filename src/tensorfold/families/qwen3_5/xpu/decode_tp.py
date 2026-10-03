@@ -143,12 +143,13 @@ def first_token(w: Weights, normed: torch.Tensor, n: int, sampling: Sampling | N
 @torch.no_grad()
 def prefill_tp(w: Weights, prompt: Sequence[int], sampling: Sampling | None, rank: int,
                draft=None, *, state: State | None = None, limit: int = 0, stops: Sequence[int] = (),
-               keep: Callable | None = None, keep_at: int | None = None, vision=None, constraint=None):
+               keep: Callable | None = None, keep_at: int | None = None, vision=None, constraint=None,
+               kv_dtype: str | None = None):
     """Both ranks prefill, from a kept ``state`` with a fresh prefill's bits; rank 0 shares the first token (``keep_at``: a third item, as ``decode.prefill``'s; the split chains are each rank's own)."""
 
     from .decode import prefill_stops
 
-    st = clone_state(state) if state is not None else State(w)
+    st = clone_state(state) if state is not None else State(w, kv_dtype)
     if state is None:
         st.limit = limit                    # a fresh state's attention caches stop here; a resumed one keeps its own
     taps = draft is not None and (rank == 0 or getattr(draft, "world", 1) == 2)

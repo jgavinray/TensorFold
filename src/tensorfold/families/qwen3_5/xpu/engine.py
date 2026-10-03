@@ -29,10 +29,14 @@ class Qwen27Engine:
                  tp_draft: bool = False, allow_copy: bool = True, streams: int = 1,
                  context: int | None = None, context_explicit: bool | None = None, vision: bool = False,
                  vision_urls: bool = False, vision_offload: bool = False, tree_rows: int | None = None,
-                 keep: int | None = None):
+                 keep: int | None = None, kv_dtype: str = "bf16"):
         import torch
 
         from tensorfold.cuda.nvfp4.format import is_quantized
+
+        from . import kvcache
+
+        self.kv_dtype = kvcache.check(kv_dtype)
 
         from .exl3_load import admission, quant_config
 
@@ -116,6 +120,14 @@ class Qwen27Engine:
             full = load(model_dir, tiled=True)
             self.w = full
         self.w.prompt_rows = chunk
+        if self.kv_dtype != "bf16" and rank == 0:          # the quantized cache's footprint at capacity
+            c = self.w.config
+            n_attn = sum(1 for layer in self.w.layers if not layer.linear)
+            per = kvcache.row_bytes(c.kv_heads, c.head_dim, self.kv_dtype) * n_attn
+            bf16 = 2 * c.kv_heads * c.head_dim * 2 * n_attn
+            print(f"[tensorfold] kv cache {self.kv_dtype}: {per * self.context_window / (1 << 30):.2f} GiB at "
+                  f"{self.context_window:,} tokens ({bf16 * self.context_window / (1 << 30):.2f} GiB bf16), "
+                  f"{per} B a token across {n_attn} layers", flush=True)
         self.draft = None
         if draft_dir is not None and (rank == 0 or (tp == 2 and tp_draft)):
             from .dflash2 import DFlash2
@@ -151,6 +163,7 @@ class Qwen27Engine:
             from .multi import MultiDecoder
 
             self.multi = MultiDecoder(self.w, self.draft, allow_copy=allow_copy, rank=rank, world=tp,
+                                      kv_dtype=self.kv_dtype,
                                       context=self.capacity_plan["cache_slots"], keep=keep, points=self.points,
                                       vision=self.vision)
             self.multi.model_dir = self.model_dir             # rank 1 compiles a request's grammar from it
@@ -238,6 +251,7 @@ class Qwen27Engine:
         stops, keep = self._stops(prompt, hit, draft) if vision is None else ((), None)
         end = entry_end(prompt) if draft and vision is None and self._ends(prompt, stops) else None
         st, pending, *kept = prefill(self.w, prompt, sampling, drafter, state=hit[1] if hit else None, room=self.room,
+                                     kv_dtype=self.kv_dtype,
                                      limit=self.context_window, stops=stops, keep=keep, keep_at=end, vision=encoded,
                                      **grammar)
         if end is not None:
@@ -278,6 +292,7 @@ class Qwen27Engine:
         stops, keep = self._stops(prompt, hit, draft) if vision is None else ((), None)
         end = entry_end(prompt) if draft and vision is None and self._ends(prompt, stops) else None
         st, pending, *kept = prefill_tp(self.w, prompt, sampling, 0, drafter, state=hit[1] if hit else None,
+                                        kv_dtype=self.kv_dtype,
                                         limit=self.context_window, stops=stops, keep=keep, keep_at=end,
                                         vision=vision, **grammar)
         if end is not None:
@@ -328,6 +343,7 @@ class Qwen27Engine:
             # the same entries as rank 0
             end = entry_end(prompt) if draft and vision is None and self._ends(prompt, stops) else None
             st, pending, *kept = prefill_tp(self.w, prompt, sampling, 1, drafter, state=hit[1] if hit else None,
+                                            kv_dtype=self.kv_dtype,
                                             limit=self.context_window, stops=stops, keep=keep, keep_at=end,
                                             vision=vision, **grammar)
             if end is not None:
@@ -337,7 +353,7 @@ class Qwen27Engine:
 
 
 def xpu_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
-               master_port: int = 29551, no_drafts: bool = False, **options: Any):
+               master_port: int = 29551, no_drafts: bool = False, kv_dtype: str = "bf16", **options: Any):
     """The XPU engine for ``tensorfold serve``; tp=2 adds fp32 partials in rank order and needs the drafter on both."""
 
     from tensorfold.families.qwen3_5 import DRAFTER, TITLE
@@ -361,4 +377,5 @@ def xpu_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: i
                         streams=streams, context=options.get("context"),
                         context_explicit=options.get("context_explicit"), vision=bool(options.get("vision", False)),
                         vision_urls=bool(options.get("vision_urls", False)),
-                        vision_offload=bool(options.get("vision_offload", False)), keep=options.get("checkpoint_slots"))
+                        vision_offload=bool(options.get("vision_offload", False)), keep=options.get("checkpoint_slots"),
+                        kv_dtype=kv_dtype)

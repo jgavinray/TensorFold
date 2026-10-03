@@ -18,6 +18,7 @@ from .decode_tp import SAMPLING_WORDS as W, _sample_split, _share, first_token, 
 from .draft_tree import allocate
 from .engine import entry_end
 from .forward import State, _paths, commit_streams, multi_tree_forward, path_indices, reserve
+from . import kvcache
 from .prefill import CHUNK, Piece, prefill_batch, prefill_state
 from .weights import Weights
 
@@ -57,7 +58,8 @@ def own(snap):
 def viewed(st: State) -> State:
     """A kept state whose DeltaNet states are its own already: attention rows below ``pos`` viewed in place."""
 
-    st.kv = [None if kv is None else (kv[0][:st.pos], kv[1][:st.pos]) for kv in st.kv]
+    st.kv = [None if kv is None else (kv[0][:st.pos], kv[1][:st.pos]) if not isinstance(kv, kvcache.KVCache)
+             else kv.resized(st.pos, st.pos) for kv in st.kv]
     return st
 
 
@@ -65,7 +67,8 @@ def kept(st: State) -> State:
     """A cached state: attention rows below ``pos`` viewed in place (commits only write past a stream's ``pos``), DeltaNet states copied (decoding replays them in place)."""
 
     other = clone_state(st)
-    other.kv = [None if kv is None else (kv[0][:st.pos], kv[1][:st.pos]) for kv in st.kv]
+    other.kv = [None if kv is None else (kv[0][:st.pos], kv[1][:st.pos]) if not isinstance(kv, kvcache.KVCache)
+                else kv.resized(st.pos, st.pos) for kv in st.kv]
     other.rec = [None if r is None else r.clone() for r in st.rec]
     other.conv = [None if c is None else c.clone() for c in st.conv]
     return other
@@ -96,10 +99,12 @@ class MultiDecoder:
     last: tuple | None = None                 # (start, streams, rows) of the round before
 
     def __init__(self, w: Weights, draft=None, *, max_rows: int = 16, allow_copy: bool = True, stop_eos: bool = True,
-                 keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None) -> None:
+                 keep: int = 8, rank: int = 0, world: int = 1, context: int = 0, points=None, vision=None,
+                 kv_dtype: str | None = None) -> None:
         if not 1 <= max_rows <= 16:
             raise ValueError("a stream's window is 1 to 16 rows (the multi-stream GDN tree kernel's limit)")
         self.w, self.draft, self.max_rows, self.allow_copy = w, draft, max_rows, allow_copy
+        self.kv_dtype = kv_dtype
         self.vision = vision
         self.context = context                                # prompt plus reply tokens a stream holds (0: no bound)
         self.eos = tuple(w.config.eos) if stop_eos else ()
@@ -171,7 +176,7 @@ class MultiDecoder:
     def _queue(self, s: Stream, hit) -> None:
         drafter = self.draft if s.draft and self.drafts else None
         rows = self._most(s) if self.memory_gate is None else self._first(s)
-        state = private(hit[1] if hit else State(self.w), rows)
+        state = private(hit[1] if hit else State(self.w, self.kv_dtype), rows)
         s.st = state
         s.snap = None if drafter is None else own(hit[2]) if hit and hit[2] is not None else \
             ([None] * drafter.layers, [None] * drafter.layers, 0, 0)
@@ -222,7 +227,8 @@ class MultiDecoder:
         blocked = False
         for s in live:
             rows = min(s.st.pos + self.max_rows + 2, self._most(s))   # a stream never commits past its prompt and reply
-            have = next((kv[0].shape[0] for kv in s.st.kv if kv is not None), rows)
+            have = next(((kv.capacity if isinstance(kv, kvcache.KVCache) else kv[0].shape[0])
+                         for kv in s.st.kv if kv is not None), rows)
             if rows <= have:
                 s.waiting = False
                 continue
@@ -503,7 +509,7 @@ class MultiDecoder:
     def calibrate(self, streams: int, reps: int = 3) -> None:
         """Time the forward at the row counts ``streams`` windows bring; every rank runs the same forwards."""
 
-        st, points = State(self.w), []
+        st, points = State(self.w, self.kv_dtype), []
         for r in calibration_rows(streams, self.depth):
             n = -(-r // 16)
             sizes = [r // n + (i < r % n) for i in range(n)]

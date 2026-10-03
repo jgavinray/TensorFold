@@ -152,10 +152,20 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
                 value = value.reshape(W, c.kv_heads, c.head_dim)
             q, key = glue.attn_prep(qg, key, attn.q_norm, attn.k_norm, pos, w.inv_freq, c.eps, heads=c.heads,
                                     kv_heads=c.kv_heads, head_dim=c.head_dim, mrope_section=c.mrope_section)
-            kbuf, vbuf = _grow(st, i, p0 + W)
-            kbuf[p0:p0 + W] = key.view(W, c.kv_heads, c.head_dim)
-            vbuf[p0:p0 + W] = value
-            out = attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
+            grown = _grow(st, i, p0 + W)
+            if isinstance(grown, kvcache.KVCache):       # quantized: quantize the rows on write
+                from . import kv_attention
+
+                kc, ksc, vc, vsc = kvcache.quantize_ref(key.view(W, c.kv_heads, c.head_dim), value, grown.bits)
+                grown.k[p0:p0 + W], grown.ks[p0:p0 + W] = kc, ksc
+                grown.v[p0:p0 + W], grown.vs[p0:p0 + W] = vc, vsc
+                out = kv_attention.prefill_attention(q.view(W, c.heads, c.head_dim), grown, p0,
+                                                     scale=c.head_dim ** -0.5)
+            else:
+                kbuf, vbuf = grown
+                kbuf[p0:p0 + W] = key.view(W, c.kv_heads, c.head_dim)
+                vbuf[p0:p0 + W] = value
+                out = attention(q.view(W, c.heads, c.head_dim), kbuf, vbuf, p0, scale=c.head_dim ** -0.5)
             r = _row_mm(pg.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
         if layer.moe is not None:                          # routed experts read bf16 rows (their prefill form)
             x, h, _ = glue.add_rmsnorm(x, r, layer.post_norm, c.eps)
@@ -323,10 +333,19 @@ def prefill_rows(w: Weights, items: list[tuple[Sequence[int], State, int]], *, t
             q, key = q.view(W, c.heads, c.head_dim), key.view(W, c.kv_heads, c.head_dim)
             outs = []
             for st, p0, (o, n) in zip(sts, p0s, spans):
-                kbuf, vbuf = _grow(st, i, p0 + n)
-                kbuf[p0:p0 + n] = key[o:o + n]
-                vbuf[p0:p0 + n] = value[o:o + n]
-                outs.append(attention(q[o:o + n], kbuf, vbuf, p0, scale=c.head_dim ** -0.5))
+                grown = _grow(st, i, p0 + n)
+                if isinstance(grown, kvcache.KVCache):   # quantized: quantize the rows on write
+                    from . import kv_attention
+
+                    kc, ksc, vc, vsc = kvcache.quantize_ref(key[o:o + n], value[o:o + n], grown.bits)
+                    grown.k[p0:p0 + n], grown.ks[p0:p0 + n] = kc, ksc
+                    grown.v[p0:p0 + n], grown.vs[p0:p0 + n] = vc, vsc
+                    outs.append(kv_attention.prefill_attention(q[o:o + n], grown, p0, scale=c.head_dim ** -0.5))
+                else:
+                    kbuf, vbuf = grown
+                    kbuf[p0:p0 + n] = key[o:o + n]
+                    vbuf[p0:p0 + n] = value[o:o + n]
+                    outs.append(attention(q[o:o + n], kbuf, vbuf, p0, scale=c.head_dim ** -0.5))
             r = _row_mm(pg.gate_mul(torch.cat(outs), qg, heads=c.heads, head_dim=c.head_dim), attn.o, tp)
         x, h = pg.add_rmsnorm(x, r, layer.post_norm, c.eps)
         pending = _mlp(h, layer, pg, tp)
