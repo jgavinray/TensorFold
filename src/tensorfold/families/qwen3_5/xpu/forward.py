@@ -10,6 +10,37 @@ import torch
 
 from tensorfold.cuda import moe
 from tensorfold.cuda.kernels import attention as tree_attention
+
+
+def _attn_base(device) -> torch.Tensor:
+    """tree_attention.base() with a device-agnostic current-device lookup."""
+    device = torch.device(device)
+    index = device.index
+    if index is None:
+        if device.type == "xpu":
+            index = torch.xpu.current_device()
+        elif device.type == "cuda":
+            index = torch.cuda.current_device()
+        else:
+            index = 0
+    return tree_attention._base(index)
+
+
+def _attn_base_offsets(caches, device) -> list[int]:
+    """kernels.attention.offsets() but measuring against _attn_base(device)."""
+    origin = _attn_base(device).data_ptr()
+    out = []
+    for k, v in caches:
+        for t in (k, v):
+            if t.dtype != torch.bfloat16 or not t.is_contiguous():
+                raise ValueError("caches: contiguous bf16 tensors")
+            delta = t.data_ptr() - origin
+            if delta % 16:
+                raise ValueError("caches must be 16-byte aligned")
+            out.append(delta // 2)
+    return out
+
+
 from tensorfold.cuda.kernels import gdn as deltanet
 
 from . import glue
@@ -93,7 +124,7 @@ def _paths(parents: Sequence[int]) -> tuple[list[int], bool]:
 def _cache_offsets(states: Sequence["State"], layers: Sequence[int], device) -> dict[int, torch.Tensor]:
     """Each attention layer's (streams, 2) key and value cache offsets, from one pinned copy."""
 
-    flat = [o for i in layers for o in tree_attention.offsets([st.kv[i] for st in states], device)]
+    flat = [o for i in layers for o in _attn_base_offsets([st.kv[i] for st in states], device)]
     dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 2)
     return dict(zip(layers, dev))
 
