@@ -20,6 +20,16 @@ from .forward import State, grow as _grow
 from .qmm_fast import matmul, matmul_partial, tile
 from .weights import Plain, QLinear, Weights
 
+
+def _deltanet(device):
+    """GDN kernels for the device: the CUDA extension, or the serial torch fallback on XPU."""
+
+    if torch.device(device).type == "xpu":
+        from . import gdn_fallback
+
+        return gdn_fallback
+    return deltanet
+
 CHUNK = 4096
 TAP_LAYERS = (5, 19, 33, 47, 61)
 
@@ -119,12 +129,13 @@ def prefill_chunk(w: Weights, tokens: torch.Tensor, st: State, *, tp: bool = Fal
             q, k, v, g, beta = glue.gdn_pre(qkv, st.conv[i], gdn.conv, windows, a, b, gdn.A_log, gdn.dt_bias,
                                             kh=c.k_heads, vh=c.v_heads, dk=c.dk)
             final = torch.empty_like(st.rec[i])
+            gd = _deltanet(q.device)
             if part is None:
-                yr = deltanet.chain(q, k, v, g, beta, st.rec[i], final)
+                yr = gd.chain(q, k, v, g, beta, st.rec[i], final)
             else:
                 part.rec[i] = torch.empty_like(st.rec[i])
-                yr = torch.cat([deltanet.chain(q[:cut], k[:cut], v[:cut], g[:cut], beta[:cut], st.rec[i], part.rec[i]),
-                                deltanet.chain(q[cut:], k[cut:], v[cut:], g[cut:], beta[cut:], part.rec[i], final)])
+                yr = torch.cat([gd.chain(q[:cut], k[:cut], v[:cut], g[:cut], beta[:cut], st.rec[i], part.rec[i]),
+                                gd.chain(q[cut:], k[cut:], v[cut:], g[cut:], beta[cut:], part.rec[i], final)])
                 part.conv[i] = torch.cat([st.conv[i], qkv[max(0, cut - keep):cut]])[-keep:].contiguous()
             r = _row_mm(pg.gated_norm(yr, z, gdn.norm, c.eps), gdn.out, tp)
             st.conv[i] = torch.cat([st.conv[i], qkv[-keep:]])[-keep:].contiguous()
@@ -283,15 +294,16 @@ def prefill_rows(w: Weights, items: list[tuple[Sequence[int], State, int]], *, t
                                             gdn.A_log, gdn.dt_bias, kh=c.k_heads, vh=c.v_heads, dk=c.dk,
                                             stream_ids=sids, nkeep=keep)
             ys = []
+            gd = _deltanet(q.device)
             for st, part, (_, _, cut), (o, n) in zip(sts, parts, items, spans):
                 final = torch.empty_like(st.rec[i])
                 rows = lambda lo, hi: (q[lo:hi], k[lo:hi], v[lo:hi], g[lo:hi], beta[lo:hi])  # noqa: E731
                 if part is None:
-                    ys.append(deltanet.chain(*rows(o, o + n), st.rec[i], final))
+                    ys.append(gd.chain(*rows(o, o + n), st.rec[i], final))
                 else:                                      # two launches, one launch's bits: the state at the cut
                     part.rec[i] = torch.empty_like(st.rec[i])
-                    ys.append(deltanet.chain(*rows(o, o + cut), st.rec[i], part.rec[i]))
-                    ys.append(deltanet.chain(*rows(o + cut, o + n), part.rec[i], final))
+                    ys.append(gd.chain(*rows(o, o + cut), st.rec[i], part.rec[i]))
+                    ys.append(gd.chain(*rows(o + cut, o + n), part.rec[i], final))
                     part.conv[i] = torch.cat([st.conv[i], qkv[o + max(0, cut - keep):o + cut]])[-keep:].contiguous()
                 st.conv[i] = torch.cat([st.conv[i], qkv[o + max(0, n - keep):o + n]])[-keep:].contiguous()
                 st.rec[i] = final

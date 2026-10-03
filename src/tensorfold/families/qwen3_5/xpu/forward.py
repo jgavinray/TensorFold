@@ -17,6 +17,16 @@ from .qmm_fast import matmul, matmul_group
 from .weights import Plain, QLinear, Weights
 
 
+def _deltanet(device):
+    """GDN kernels for the device: the CUDA extension, or the serial torch fallback on XPU."""
+
+    if torch.device(device).type == "xpu":
+        from . import gdn_fallback
+
+        return gdn_fallback
+    return deltanet
+
+
 def _mm(x: torch.Tensor, w: QLinear, xs: torch.Tensor | None = None) -> torch.Tensor:
     if not isinstance(w, QLinear):
         return w(x)                                        # an EXL3 pack's weights run their own row-invariant kernels
@@ -84,7 +94,7 @@ def _cache_offsets(states: Sequence["State"], layers: Sequence[int], device) -> 
     """Each attention layer's (streams, 2) key and value cache offsets, from one pinned copy."""
 
     flat = [o for i in layers for o in tree_attention.offsets([st.kv[i] for st in states], device)]
-    dev = deltanet.to_device(flat, torch.int64, device).view(len(layers), len(states), 2)
+    dev = _deltanet(device).to_device(flat, torch.int64, device).view(len(layers), len(states), 2)
     return dict(zip(layers, dev))
 
 
@@ -178,7 +188,7 @@ def stage(w: Weights, st: State, width: int, context: int) -> Staged:
     host = torch.tensor([0] * (2 * width) + flat, dtype=torch.int32).pin_memory()
     dev = host.to(device)
     softmax = [i for i, layer in enumerate(w.layers) if not layer.linear]
-    return Staged(width, dev[:width], dev[width:2 * width], deltanet.plan([parents], device),
+    return Staged(width, dev[:width], dev[width:2 * width], _deltanet(device).plan([parents], device),
                   tree_attention.from_packed(dev[2 * width:], 1, width, items, chunks),
                   _cache_offsets([st], softmax, device), _conv_windows(parents, c.conv_kernel - 1).to(device), host, dev)
 
@@ -231,7 +241,7 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
         ids = tokens.to(torch.int32)
         pos = torch.tensor([st.pos + st.rope_delta + d for d in depths], device=tokens.device,
                            dtype=torch.int32)
-        plan = deltanet.plan([parents], tokens.device)
+        plan = _deltanet(tokens.device).plan([parents], tokens.device)
         softmax = [i for i, layer in enumerate(w.layers) if not layer.linear]
         aplan = tree_attention.plan([parents], [st.pos], c.heads // c.kv_heads, tokens.device)
         aoffs = _cache_offsets([st], softmax, tokens.device)
@@ -261,7 +271,7 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
             q, k, v, g, beta = glue.gdn_pre(qkv, st.conv[i], gdn.conv, windows, a, b,
                                               gdn.A_log, gdn.dt_bias, kh=c.k_heads,
                                               vh=c.v_heads, dk=c.dk)
-            yr = deltanet.tree(q, k, v, g, beta, plan, state=st.rec[i])
+            yr = _deltanet(q.device).tree(q, k, v, g, beta, plan, state=st.rec[i])
             out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
             r = _row_mm(out, gdn.out, tp, out_xs)
             record.append(GDNRecord(q, k, v, g, beta, qkv))
@@ -330,11 +340,15 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
         states.append(st)
         starts.append(base + len(parents))
     W = starts[-1]
-    entries, _, slots, most = deltanet.plan_host(local)
+    gd = _deltanet(device)
+    entries, _, slots, most = gd.plan_host(local)
     linear = [i for i, layer in enumerate(w.layers) if layer.linear]
     softmax = [i for i, layer in enumerate(w.layers) if not layer.linear]
-    ptrs = [p for i in linear for p in deltanet.pointers([st.rec[i] for st in states])]
-    tables = dict(zip(linear, deltanet.to_device(ptrs, torch.int64, device).view(len(linear), len(states))))
+    if device.type == "xpu":
+        tables = {i: [st.rec[i] for st in states] for i in linear}   # the fallback steps the state tensors themselves
+    else:
+        ptrs = [p for i in linear for p in deltanet.pointers([st.rec[i] for st in states])]
+        tables = dict(zip(linear, deltanet.to_device(ptrs, torch.int64, device).view(len(linear), len(states))))
     aoffs = _cache_offsets(states, softmax, device)
     S = len(states)
     attn_flat, attn_items, attn_chunks = tree_attention.plan_host(local, [st.pos for st in states],
@@ -343,7 +357,7 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
                         dtype=torch.int32).pin_memory()
     dev = host.to(device, non_blocking=True)            # one copy, and the host runs on
     pos, sid_t = dev[:W], dev[W:2 * W]
-    plan = deltanet.Plan(dev[2 * W:5 * W].view(W, 3), dev[5 * W:5 * W + S + 1], slots, most)
+    plan = gd.Plan(dev[2 * W:5 * W].view(W, 3), dev[5 * W:5 * W + S + 1], slots, most)
     ids_t = dev[5 * W + S + 1:6 * W + S + 1]
     windows_t = dev[6 * W + S + 1:6 * W + S + 1 + W * (keep + 1)].view(W, keep + 1)
     aplan = tree_attention.from_packed(dev[6 * W + S + 1 + W * (keep + 1):], S, W, attn_items, attn_chunks)
@@ -367,7 +381,7 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
             conv = states[0].conv[i] if S == 1 else torch.cat([st.conv[i] for st in states])
             q, k, v, g, beta = glue.gdn_pre(qkv, conv, gdn.conv, windows_t, a, b, gdn.A_log, gdn.dt_bias,
                                             kh=c.k_heads, vh=c.v_heads, dk=c.dk, stream_ids=sid_t, nkeep=keep)
-            yr = deltanet.tree(q, k, v, g, beta, plan, table=tables[i])
+            yr = gd.tree(q, k, v, g, beta, plan, table=tables[i])
             out, out_xs = glue.gated_norm(yr, z, gdn.norm, c.eps)
             r = _row_mm(out, gdn.out, tp, out_xs)
             record.append(GDNRecord(q, k, v, g, beta, qkv))
@@ -446,11 +460,19 @@ def _commit(states: Sequence[State], record: Sequence[Record], paths: Sequence[S
     replayed = None
     if linear:
         items = [item for _, item in linear]
-        ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
-                                     [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
-        table = deltanet.to_device(ptrs, torch.int64, rows.device)
-        replayed = deltanet.replay(table, len(items), len(states), rows, counts, items[0].k, items[0].v,
-                                   in_place=in_place)
+        if rows.device.type == "xpu":
+            # the fallback steps the state tensors themselves; no pointer table to pack
+            table = _deltanet(rows.device).replay_table([t.k for t in items], [t.v for t in items],
+                                                        [t.g for t in items], [t.beta for t in items],
+                                                        [[st.rec[i] for i, _ in linear] for st in states])
+            replayed = _deltanet(rows.device).replay(table, len(items), len(states), rows, counts,
+                                                     items[0].k, items[0].v, in_place=in_place)
+        else:
+            ptrs = deltanet.replay_table([t.k for t in items], [t.v for t in items], [t.g for t in items],
+                                         [t.beta for t in items], [[st.rec[i] for i, _ in linear] for st in states])
+            table = deltanet.to_device(ptrs, torch.int64, rows.device)
+            replayed = deltanet.replay(table, len(items), len(states), rows, counts, items[0].k, items[0].v,
+                                       in_place=in_place)
     device = rows.device
     if linear:
         # a stream's new conv rows are the last ``keep`` of [its committed rows | its accepted rows]
@@ -460,7 +482,7 @@ def _commit(states: Sequence[State], record: Sequence[Record], paths: Sequence[S
         for s, path in enumerate(paths):
             n = len(path)
             pick += [s * keep + j for j in range(n, keep)] + [width + r for r in path[max(0, n - keep):]]
-        pick_t = deltanet.to_device(pick, torch.int64, device)
+        pick_t = _deltanet(device).to_device(pick, torch.int64, device)
         olds = [states[0].conv[i] if len(states) == 1 else torch.cat([st.conv[i] for st in states]) for i, _ in linear]
         if items[0].qkv.shape[0] <= 32:             # a few rows: every layer in one gather
             src = torch.cat([torch.stack(olds), torch.stack([t.qkv for t in items])], dim=1)
