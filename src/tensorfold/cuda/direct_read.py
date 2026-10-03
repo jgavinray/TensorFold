@@ -53,9 +53,11 @@ class Reader:
             try:
                 return self._to_device(path, offset, n, device) if gpu else self._to_host(path, offset, n, pinned)
             except OSError as exc:
-                if exc.errno != errno.EINVAL:
+                if exc.errno not in (errno.EINVAL, errno.EFAULT):
                     raise
                 self.direct = False               # the file system refuses O_DIRECT, on the open or on a read
+                # EFAULT: a host-pinned staging buffer preadv rejects (xpu host
+                # allocator pages on this kernel) — buffered path is correct.
         if n > 0 and self.staged and (gpu or pinned):
             # Windows stages here: one page-locked block where that means host RAM, filled by one buffered read
             raw = self._buffered(path, offset, n, pinned=torch.cuda.is_available() or torch.xpu.is_available())
