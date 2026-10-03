@@ -13,17 +13,18 @@ from tensorfold.cuda.kernels import attention as tree_attention
 
 
 def _attn_base(device) -> torch.Tensor:
-    """tree_attention.base() with a device-agnostic current-device lookup."""
+    """Cache offsets measured against a fixed bf16 tensor (kernels.attention.base
+    hardcodes torch.cuda — the xpu package allocates its own base per device)."""
     device = torch.device(device)
-    index = device.index
-    if index is None:
-        if device.type == "xpu":
-            index = torch.xpu.current_device()
-        elif device.type == "cuda":
-            index = torch.cuda.current_device()
-        else:
-            index = 0
-    return tree_attention._base(index)
+    return _attn_base_cached(device.type, device.index)
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=None)
+def _attn_base_cached(device_type: str, index: int | None) -> torch.Tensor:
+    return torch.zeros(64, dtype=torch.bfloat16, device=torch.device(device_type, index))
 
 
 def _attn_base_offsets(caches, device) -> list[int]:
