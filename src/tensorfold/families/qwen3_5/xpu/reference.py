@@ -18,7 +18,7 @@ def _linear(x: torch.Tensor, q: QLinear) -> torch.Tensor:
 def _rms(x: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
     xf = x.float()
     y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return y * w.float() if w is not None else y
+    return y * (1.0 + w.float()) if w is not None else y
 
 
 def _rope(x: torch.Tensor, pos: torch.Tensor, inv_freq: torch.Tensor) -> torch.Tensor:

@@ -102,7 +102,7 @@ def _dconv(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int, 
 def _norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     xf = x.float()
     return (xf * torch.rsqrt((xf * xf).mean(dim=-1, keepdim=True) + eps)
-            * weight.float()).to(torch.bfloat16)
+            * (1.0 + weight.float())).to(torch.bfloat16)
 
 
 def _conv(x: torch.Tensor, dynamic: torch.Tensor, base: torch.Tensor,

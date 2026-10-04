@@ -47,7 +47,7 @@ NIBBLE_SHIFTS = (0, 4, 8, 12, 16, 20, 24, 28)
 
 def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     xf = x.float()
-    return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps) * weight.float()).to(x.dtype)
+    return (xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + weight.float())).to(x.dtype)
 
 
 def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

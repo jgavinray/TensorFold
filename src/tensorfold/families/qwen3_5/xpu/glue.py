@@ -21,7 +21,7 @@ def _add_rmsnorm(X, R, W, H, Y, XS, eps, D: tl.constexpr, BLOCK: tl.constexpr, H
     ss = tl.sum(x * x, axis=0)
     inv = 1.0 / tl.sqrt(ss / D + eps)
     w = tl.load(W + offs, mask=ok, other=0.0).to(tl.float32)
-    y = (x * inv * w).to(tl.bfloat16)
+    y = (x * inv * (1.0 + w)).to(tl.bfloat16)
     tl.store(Y + row * D + offs, y, mask=ok)
     yg = tl.reshape(y.to(tl.float32), (BLOCK // 64, 64))
     g = tl.arange(0, BLOCK // 64)
@@ -167,7 +167,7 @@ def _attn_prep(QG, KV, QN, KN, POS, INV, QOUT, KOUT, eps,
     else:
         x = tl.load(KV + (row * HKV + head - H) * D + d).to(tl.float32)
         w = tl.load(KN + d).to(tl.float32)
-    xn = (x * (1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)) * w).to(tl.bfloat16).to(tl.float32)
+    xn = (x * (1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)) * (1.0 + w)).to(tl.bfloat16).to(tl.float32)
     if MROPE:
         i = tl.where(d < HALF, d, tl.where(d < 2 * HALF, d - HALF, 0))
         axis = tl.where((i % 3 == 1) & (i < 3 * HSEC), 1, tl.where((i % 3 == 2) & (i < 3 * WSEC), 2, 0))
