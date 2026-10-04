@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
+import os
 import torch
 
 from tensorfold.cuda import moe
@@ -93,12 +94,40 @@ def _paths(parents: Sequence[int]) -> tuple[list[int], bool]:
     return depths, chain
 
 
+def _serial_int4_attention(q, aoffs, i, key, value, aplan, *, scale):
+    """BISECT reference: identical math to kv_attention.attention but materialized —
+    dequantize each stream's committed rows, place nodes after them, run the bf16 kernel."""
+    from . import kv_attention
+    from tensorfold.cuda.kernels import attention as tree_attention
+    S = aplan.streams.shape[0]
+    caches, newoffs = [], []
+    for s in range(S):
+        # recover the KVCache from the offsets' owning state via the caller's states — not
+        # available here; instead dequant via module-level registry set by tree_forward
+        caches.append(_INT4_BISECT_CACHES[i][s])
+    W, H, D = q.shape
+    tmps = []
+    for s in range(S):
+        kc, vc = kv_attention.dequant_rows(caches[s], int(aplan.streams[s][2]))
+        tmps.append((kc, vc))
+    flat = [o for kc, vc in tmps for o in tree_attention.offsets(tmps, key.device)]
+    offs2 = _deltanet(key.device).to_device(flat, torch.int64, key.device).view(S, 2)
+    return tree_attention.attention(q, key, value, offs2, aplan, scale=scale)
+
+
+_INT4_BISECT_CACHES: dict[int, list] = {}
+
+
 def _cache_offsets(states: Sequence["State"], layers: Sequence[int], device) -> dict[int, torch.Tensor]:
     """Each attention layer's (streams, 2) key and value cache offsets, from one pinned copy; quantized
     caches get (streams, 5): kv_attention's code byte offsets, scale offsets, and the codes' bits."""
 
     if layers and isinstance(states[0].kv[layers[0]], kvcache.KVCache):
         from . import kv_attention
+
+        if os.environ.get("TF_INT4KV_SERIAL_ATTEND") == "1":
+            for i in layers:
+                _INT4_BISECT_CACHES[i] = [st.kv[i] for st in states]
 
         flat: list[int] = []
         for i in layers:
@@ -320,7 +349,10 @@ def tree_forward(w: Weights, tokens: torch.Tensor, parents: Sequence[int], st: S
             if aoffs[i].shape[-1] == 5:                  # quantized caches: kv_attention's offsets + bits
                 from . import kv_attention
 
-                out = kv_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+                if os.environ.get("TF_INT4KV_SERIAL_ATTEND") == "1":
+                    out = _serial_int4_attention(q, aoffs, i, key, value, aplan, scale=c.head_dim ** -0.5)
+                else:
+                    out = kv_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
             else:
                 out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
             gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)
@@ -435,7 +467,10 @@ def multi_tree_forward(w: Weights, streams: Sequence[tuple[Sequence[int], Sequen
             if aoffs[i].shape[-1] == 5:                  # quantized caches: kv_attention's offsets + bits
                 from . import kv_attention
 
-                out = kv_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
+                if os.environ.get("TF_INT4KV_SERIAL_ATTEND") == "1":
+                    out = _serial_int4_attention(q, aoffs, i, key, value, aplan, scale=c.head_dim ** -0.5)
+                else:
+                    out = kv_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
             else:
                 out = tree_attention.attention(q, key, value, aoffs[i], aplan, scale=c.head_dim ** -0.5)
             gated, out_xs = glue.gate_mul(out, qg, heads=c.heads, head_dim=c.head_dim)

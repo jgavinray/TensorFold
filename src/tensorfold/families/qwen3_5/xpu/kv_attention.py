@@ -31,7 +31,14 @@ _MAX_NODES = tl.constexpr(MAX_NODES)   # triton-xpu 3.8: jit bodies need tl.cons
 
 @lru_cache(maxsize=None)
 def _base_u8(index: int) -> torch.Tensor:
-    """The byte origin code offsets are measured from."""
+    """The byte origin code offsets are measured from. MUST be a stable address for the
+    process lifetime: offsets() and the kernel's base() anchor must resolve to the same
+    pointer, else every code offset shifts and the kernel reads outside the caches."""
+    return _base_u8_cached(index)
+
+
+@lru_cache(maxsize=None)
+def _base_u8_cached(index: int) -> torch.Tensor:
     return torch.zeros(64, dtype=torch.uint8, device=torch.device("xpu", index))
 
 
