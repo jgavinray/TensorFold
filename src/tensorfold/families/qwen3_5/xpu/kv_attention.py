@@ -61,6 +61,7 @@ def offsets(caches: Sequence[kvcache.KVCache], device) -> list[int]:
     scales_origin = _base_f16(device.index if device.index is not None else torch.xpu.current_device()).data_ptr()
     out = []
     for cache in caches:
+        deltas = []
         for codes, scales in ((cache.k, cache.ks), (cache.v, cache.vs)):
             if codes.dtype not in (torch.uint8, torch.int8) or not codes.is_contiguous() \
                     or scales.dtype != kvcache.SCALE_DTYPE or not scales.is_contiguous():
@@ -73,7 +74,9 @@ def offsets(caches: Sequence[kvcache.KVCache], device) -> list[int]:
             sdelta = ((sdelta + 2**63) % 2**64) - 2**63
             if sdelta % 16:
                 raise ValueError("scale tensors must be 16-byte aligned")
-            out += [delta, sdelta // 2]
+            deltas.append((delta, sdelta // 2))
+        # kernel OFF layout is [k codes, v codes, k scales, v scales] - grouped, not interleaved
+        out += [deltas[0][0], deltas[1][0], deltas[0][1], deltas[1][1]]
     return out
 
 
