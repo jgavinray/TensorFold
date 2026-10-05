@@ -6,6 +6,7 @@ import math
 import re
 
 from .capacity import Geometry, Weights, headers, itemsize
+from tensorfold.families.qwen3_5.xpu.kvcache import row_bytes
 
 PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
@@ -162,15 +163,16 @@ def prompt_rows(total: int, row_bytes: int, most: int = 4096) -> int:
     return max(512, min(most, total // PROMPT_SHARE // row_bytes // 512 * 512))
 
 
-def live_kv(t: dict, world: int, window: int) -> int:
+def live_kv(t: dict, world: int, window: int, dtype: str = "bf16") -> int:
     """A dense stream's attention caches at ``window`` rows (1,024 at least) and one layer's buffer mid-grow."""
 
     _, attention = layer_counts(t)
-    return (attention + 1) * max(1024, window) * int(t["num_key_value_heads"]) // world * int(t["head_dim"]) * 4
+    kv_heads, head_dim = int(t["num_key_value_heads"]) // world, int(t["head_dim"])
+    return (attention + 1) * max(1024, window) * row_bytes(kv_heads, head_dim, dtype)
 
 
 def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mtp: bool = False,
-                 kv_bits: int = 16, rows: int | None = None, prompt: int = 0, evicts: bool = False,
+                 kv_dtype: str = "bf16", rows: int | None = None, prompt: int = 0, evicts: bool = False,
                  kept: int = 2, prefill_rows: int = PREFILL_ROWS) -> Geometry:
     """``rows``: widest verify; ``prompt``: chunk rows sharing its scratch; ``evicts``: only the live window counts."""
 
@@ -202,7 +204,7 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
         fixed += prefill_rows * _indexed_prefill_row(t, world, h, hk, hd, nv, dv, width, slots, intermediate)
     count = attention + int(mtp)
     budget = int(t.get("indexer_budget", 2048))
-    row = kv_bytes(hd, kv_bits)
+    row = kv_bytes(hd, {"bf16": 16, "int8": 8, "int4": 4}[kv_dtype])
     def bytes_at(capacity: int) -> int:
         if indexed:
             # Separate K/V arrays in both the main state and the lazy serial-reference twin.
@@ -216,7 +218,8 @@ def gdn_geometry(t: dict, world: int, reserve: int, *, indexed: bool = False, mt
         else:
             # Bound two retained prefixes, current KV state and a growth copy; speculative rows use separate workspace.
             rounded = 1 << (max(1024, capacity - reserve) - 1).bit_length()
-            cache = live_kv(t, world, capacity - reserve) if evicts else 4 * attention * rounded * hk * hd * 4
+            cache = live_kv(t, world, capacity - reserve, kv_dtype) if evicts \
+                else 4 * attention * rounded * row_bytes(int(t["num_key_value_heads"]) // world, hd, kv_dtype)
             scratch = rows * h * (hd + 2) * ((capacity + 511) // 512) * 4
         return fixed + cache + scratch
     return Geometry(bytes_at, reserve)

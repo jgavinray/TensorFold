@@ -115,7 +115,7 @@ class FlashNextEngine:
         geometry = ((lambda text: indexed_stream_geometry(text, streams + int(graphs and mtp), each, KEEP, mtp=mtp,
                                                           kv_bits=bits, world=tp, prefill_rows=rows0))
                     if streams > 1 else
-                    (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
+                    (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_dtype=self.kv_dtype,
                                                kept=KEEP_SERIAL + 1, prefill_rows=rows0)))
         if exl3:
             geometry = admission(geometry)
