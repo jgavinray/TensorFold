@@ -4,6 +4,8 @@ The reference is the CUDA side's own bits: ``cuda/nvfp4.dequantize`` is the deco
 function is its op-for-op twin runnable on either side — so the device results must be
 ``torch.equal`` to a CPU run of the same code, and within the tests/cuda fp16-vs-fp64 relative-norm
 tolerance of an independent naive fp32 matmul (whose accumulation order the ordered path cannot match).
+The grouped expert matmul's fused lane (slice 10) is judged against the rank-one oracle instead:
+its bits are fp32 reduction noise around the oracle's, held to the tests/cuda NVFP4 pair gate.
 Fixture dims, plus one real-checkpoint expert stack (layer 0, experts 0-7) moved to the card."""
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ CFG = type("C", (), {"num_experts": E, "num_experts_per_tok": TOPK, "hidden_size
 CKPT = "/storage01/models/Qwen3.8-Flash-Next-NVFP4"
 REL = 1e-2                       # the tests/cuda fp16-vs-fp64 gate
 BUFS = torch.bfloat16            # the CUDA prefill's slot dtype, beside the decode fp32
+REL_FACE = 2e-2                  # tests/cuda/test_nvfp4_experts.py: pair gate, the fused lane's tolerance
 
 
 @pytest.fixture(scope="module")
@@ -156,12 +159,17 @@ def _picked(rows: int, seed: int):
 def _check_grouped(dev, ck, x, pick):
     ex_c = xpu.stacked4_from_experts(ck, "cpu")
     ex_d = xpu.stacked4_from_experts(ck, dev)
-    yd = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev)).cpu()
-    yc = xpu.grouped_moe(x, ex_c, pick)
-    assert torch.equal(yd, yc), "grouped slots differ card vs cpu"
+    yo = xpu.grouped_moe(x, ex_c, pick, fused=False)                      # the rank-one oracle (phase 2's reference)
+    assert torch.equal(xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev), fused=False).cpu(), yo), \
+        "rank-one grouped slots differ card vs cpu"
+    yd = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev)).cpu()              # the fused lane: the engine's default
+    bc = xpu.grouped_moe(x, ex_c, pick, prefill=True, fused=False)
     bd = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev), prefill=True).cpu()
-    bc = xpu.grouped_moe(x, ex_c, pick, prefill=True)
-    assert torch.equal(bd, bc), "prefill slots differ card vs cpu"
+    assert torch.allclose(bd.float(), bc.float(), rtol=REL_FACE, atol=REL_FACE), "prefill fused slots off the oracle"
+    for r in range(x.shape[0]):
+        for s in range(TOPK + 1):                                          # the CUDA pair gate, per tensor
+            rel = float((yd[r, s] - yo[r, s]).abs().max() / yo[r, s].abs().max())
+            assert rel < REL_FACE and torch.allclose(yd[r, s], yo[r, s], rtol=REL_FACE, atol=REL_FACE), (r, s, rel)
     assert torch.equal(bd.float().to(torch.bfloat16).float(), bd), "prefill slots are not bf16 values"
     gf, uf, df = ck["gate"], ck["up"], ck["down"]
     g32, u32, d32 = (xpu.dequantize(*gf), xpu.dequantize(*uf), xpu.dequantize(*df))
@@ -235,8 +243,13 @@ def test_grouped_matmul_real_slice(dev):
     got = xpu.dequantize(*real["gate"]).cpu()
     assert torch.equal(got, xpu.dequantize(real["gate"][0].to(dev), real["gate"][1].to(dev),
                                            real["gate"][2].to(dev)).cpu()), "real table: card decode != cpu"
-    yd = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev)).cpu()
-    assert torch.equal(yd, xpu.grouped_moe(x, ex_c, pick)), "real slots differ card vs cpu"
+    yo = xpu.grouped_moe(x, ex_c, pick, fused=False)                      # rank-one oracle, CPU
+    assert torch.equal(xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev), fused=False).cpu(), yo), \
+        "real slots: rank-one oracle differs card vs cpu"
+    yd = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev)).cpu()              # the fused lane
+    rel = max(float((yd[r, s] - yo[r, s]).abs().max() / yo[r, s].abs().max())
+              for r in range(0, 128, 16) for s in range(TOPK + 1))
+    assert rel < REL_FACE, f"real expert stack fused vs oracle: worst relative max {rel}"
     g32, u32, d32 = (xpu.dequantize(*real["gate"]), xpu.dequantize(*real["up"]), xpu.dequantize(*real["down"]))
     xs = x.float()
     worst = 0.0
@@ -299,10 +312,14 @@ def test_row_invariance(dev, ck):
     assert torch.equal(lit, xpu_moe.router(x, rows)), "router logits differ card vs cpu"
     ex_d = xpu.stacked4_from_experts(ck, dev)
     _, pick = _picked(9, 4)
-    y = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev)).cpu()
+    y = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev), fused=False).cpu()  # oracle: bits independent of the batch
+    for r in range(9):
+        one = xpu.grouped_moe(x[r:r + 1].to(dev), ex_d, pick[r:r + 1].to(dev), fused=False).cpu()
+        assert torch.equal(y[r], one[0]), f"rank-one row {r} changed with the batch size"
+    yf = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev)).cpu()              # fused: the same, to the pair gate
     for r in range(9):
         one = xpu.grouped_moe(x[r:r + 1].to(dev), ex_d, pick[r:r + 1].to(dev)).cpu()
-        assert torch.equal(y[r], one[0]), f"grouped row {r} changed with the batch size"
+        assert float((yf[r] - one[0]).abs().max() / yf[r].abs().max()) < REL_FACE, f"fused row {r} off the oracle"
     b1, b2 = (xpu_moe.MoEBuffers(9, CFG, dev), xpu_moe.MoEBuffers(1, CFG, dev))
     xpu_moe.select_rows(lit.to(dev), b1, TOPK, E)
     for r in range(9):

@@ -91,15 +91,18 @@ def combine(y: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
     return acc.to(torch.bfloat16)
 
 
-def moe(x: torch.Tensor, router_rows: torch.Tensor, ex, buf: MoEBuffers, top_k: int, experts: int) -> MoEBuffers:
-    """Route x [R, D] bf16 and run its experts into buf.y [R, k + 1, D]; slot k is the shared expert."""
+def moe(x: torch.Tensor, router_rows: torch.Tensor, ex, buf: MoEBuffers, top_k: int, experts: int, *,
+        fused: bool = True) -> MoEBuffers:
+    """Route x [R, D] bf16 and run its experts into buf.y [R, k + 1, D]; slot k is the shared expert.
+    ``fused=False`` runs the rank-one oracle faces (phase 2's regression reference)."""
 
     from . import nvfp4 as xpu_nvfp4
 
     rows = x.shape[0]
     router(x, router_rows, buf.logits[:rows])
     select_rows(buf.logits[:rows], buf, top_k, experts)
-    buf.y[:rows] = xpu_nvfp4.grouped_moe(x, ex, buf.pick[:rows], prefill=buf.y.dtype is torch.bfloat16)
+    buf.y[:rows] = xpu_nvfp4.grouped_moe(x, ex, buf.pick[:rows], prefill=buf.y.dtype is torch.bfloat16,
+                                         fused=fused)
     return buf
 
 
@@ -125,7 +128,7 @@ class _Shape:
 _scratch: dict[tuple, MoEBuffers] = {}
 
 
-def run(x: torch.Tensor, m: Routed, *, prefill: bool = False) -> torch.Tensor:
+def run(x: torch.Tensor, m: Routed, *, prefill: bool = False, fused: bool = True) -> torch.Tensor:
     """x [R, D] bf16 -> [R, D] bf16: its top-k experts by renormalized softmax weight plus the shared expert."""
 
     rows = x.shape[0]
@@ -134,5 +137,5 @@ def run(x: torch.Tensor, m: Routed, *, prefill: bool = False) -> torch.Tensor:
     buf = _scratch.get(key)
     if buf is None:
         buf = _scratch[key] = MoEBuffers(size, _Shape(m), x.device, prefill=prefill)
-    moe(x.contiguous(), m.router, m.experts, buf, m.top_k, m.count)
+    moe(x.contiguous(), m.router, m.experts, buf, m.top_k, m.count, fused=fused)
     return combine(buf.y[:rows], buf.wts[:rows])

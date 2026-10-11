@@ -7,17 +7,21 @@ Correctness-first, so every output is the CPU reference's bits rather than an ap
 * matmuls accumulate as ``acc += x[:, k] * w[k]`` for ``k = 0..K-1`` — every op an IEEE-rounded elementwise
   ATen kernel — so a row's bits are its own (no reduction whose order the launch or batch shape picks,
   unlike ``torch.sum``/``bmm``) and the same code on CPU tensors is the reference;
+* the grouped expert matmul's hot faces run ``mm_fused`` — one fp32 card matmul per face instead of ``K``
+  rank-one launches — judged against the rank-one oracle within the ``tests/cuda`` NVFP4 tolerances
+  (phase 2), with ``mm_ordered`` kept in-tree as that oracle and as ``grouped_moe(fused=False)``.
 * ``exp`` is an fp32 Horner polynomial on the exp2 range, built from the same ATen kernels on either side
   (``torch.exp`` differs in ULPs between the CPU and the card, and softmax weights gate bit-equal).
 
 The MoE entry mirrors ``cuda/nvfp4_moe.py``'s ``moe(x, xs, router_rows, ex, buf, cfg)`` so the forward
 port can call it with ``MoEW.experts`` as loaded (slice 1): the FP4 routed stacks dequantize on card and
-the bf16 shared expert rides the same ordered matmul.
+the bf16 shared expert rides the same matmul lane.
 """
 
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -97,6 +101,35 @@ def mm_ordered(x: torch.Tensor, w_t: torch.Tensor, *, out_dtype: torch.dtype | N
     return acc if out_dtype is None else acc.to(out_dtype)
 
 
+@contextmanager
+def _ieee_matmul():
+    """True fp32 matmuls for the block: the down face's CUDA gate is a 1e-4 relative error, which a
+    tf32/bf16 input path (10-bit/8-bit mantissa) cannot hold; restore the lane's own settings after."""
+
+    mm = torch.backends.cuda.matmul
+    tf32, prec = mm.allow_tf32, getattr(mm, "fp32_precision", None)
+    mm.allow_tf32, mm.fp32_precision = False, "ieee"
+    try:
+        yield
+    finally:
+        mm.allow_tf32, mm.fp32_precision = tf32, prec
+
+
+def mm_fused(x: torch.Tensor, w_t: torch.Tensor, *, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+    """x [M, K] (bf16 or fp32) @ ``w_t`` [K, N] fp32 -> fp32 [M, N]: one card matmul, fp32 accumulate.
+
+    The phase-2 lane of the expert faces: ``K`` rank-one launches collapse into one, and the fp32
+    reduction's order is the card's, so the bits are within fp32 reduction noise of ``mm_ordered`` —
+    the CUDA NVFP4 gates (``tests/cuda/test_nvfp4_experts.py``: relative max 2e-2 gate/up, 1e-4 down),
+    not the oracle's bits. Inputs widen to fp32 exactly (bf16 -> fp32 is lossless, the tables are
+    already fp32), so with tf32 held off every product is an exact fp32 multiply and only the
+    accumulation order differs from the oracle's."""
+
+    with _ieee_matmul():
+        acc = torch.matmul(x.to(torch.float32), w_t)
+    return acc if out_dtype is None else acc.to(out_dtype)
+
+
 def swiglu(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """The experts' activation with ``nvfp4_moe.MoE4.shared_act``'s bits: bf16(bf16(silu(g)) * u) on bf16 g and u."""
 
@@ -124,7 +157,8 @@ def _stack_t(triple: torch.Tensor | tuple, device, name: str) -> torch.Tensor:
 @dataclass
 class Stacked4:
     """One layer's experts as fp32 transposes on card: gate/up ``[E, D, NI]``, down ``[E, NI, D]`` (so a
-    pair's matmul is ``mm_ordered(pairs, table[e])``), plus the shared expert's three faces."""
+    pair's matmul is ``mm_fused(pairs, table[e])``, or ``mm_ordered`` for the oracle), plus the shared
+    expert's three faces."""
 
     gate_t: torch.Tensor
     up_t: torch.Tensor
@@ -171,13 +205,18 @@ def stacked4_from_experts(experts: dict, device) -> Stacked4:
 
 # -- the grouped expert matmul --------------------------------------------------------------------------------
 
-def grouped_moe(x: torch.Tensor, ex: Stacked4, pick: torch.Tensor, *, prefill: bool = False) -> torch.Tensor:
+def grouped_moe(x: torch.Tensor, ex: Stacked4, pick: torch.Tensor, *, prefill: bool = False,
+                fused: bool = True) -> torch.Tensor:
     """Run the router's pairs: x [R, D] bf16, pick [R, S] int32 (shared expert id ``routed`` last slot) ->
     y [R, S, D] (fp32, or bf16 for a prompt as the CUDA prefill keeps its slots).
 
-    Pairs sort stably by expert — each segment then runs its expert's table with ``mm_ordered`` and the
-    activation's ``swiglu`` bits, so pairs of different experts never share an accumulator and a pair's
-    bits are its row's and its expert's alone."""
+    Pairs sort stably by expert — each segment then runs its expert's table on the whole segment (one
+    ``mm_fused`` per face by default) and the activation's ``swiglu`` bits, so pairs of different experts
+    never share an accumulator and a pair's output is its row's and its expert's alone. ``fused=False``
+    reruns the faces with ``mm_ordered`` — the rank-one oracle, whose bits the fused path must match
+    within the ``tests/cuda`` NVFP4 tolerances."""
+
+    face = mm_fused if fused else mm_ordered
 
     rows, slots = pick.shape
     dims = ex.dims
@@ -193,24 +232,26 @@ def grouped_moe(x: torch.Tensor, ex: Stacked4, pick: torch.Tensor, *, prefill: b
             continue
         seg = x_rows[at:at + take]
         if e < ex.routed:
-            act = swiglu(mm_ordered(seg, ex.gate_t[e]), mm_ordered(seg, ex.up_t[e]))
-            y = mm_ordered(act, ex.down_t[e])
+            act = swiglu(face(seg, ex.gate_t[e]), face(seg, ex.up_t[e]))
+            y = face(act, ex.down_t[e])
         else:
-            act = swiglu(mm_ordered(seg, ex.shared_gate_t), mm_ordered(seg, ex.shared_up_t))
-            y = mm_ordered(act, ex.shared_down_t)
+            act = swiglu(face(seg, ex.shared_gate_t), face(seg, ex.shared_up_t))
+            y = face(act, ex.shared_down_t)
         out.index_copy_(0, order[at:at + take], y if out.dtype == torch.float32 else y.to(torch.bfloat16))
         at += take
     return out.view(rows, slots, dims)
 
 
-def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: Stacked4, buf, cfg) -> None:
+def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: Stacked4, buf, cfg, *,
+        fused: bool = True) -> None:
     """Route ``x`` [R, D] bf16 and run its experts into ``buf`` — the ``cuda/nvfp4_moe.moe`` contract:
-    ``buf.y`` [R, k + 1, D] and ``buf.wts``; ``xs`` is unused (the FP4 experts have no biases)."""
+    ``buf.y`` [R, k + 1, D] and ``buf.wts``; ``xs`` is unused (the FP4 experts have no biases).
+    ``fused=False`` selects the rank-one oracle faces (phase 2's regression reference)."""
 
     from . import moe as xpu_moe
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
     xpu_moe.router(x, router_rows, buf.logits[:rows])
     xpu_moe.select_rows(buf.logits[:rows], buf, top_k, ex.routed)
-    buf.y[:rows] = grouped_moe(x, ex, buf.pick[:rows], prefill=buf.y.dtype is torch.bfloat16)
+    buf.y[:rows] = grouped_moe(x, ex, buf.pick[:rows], prefill=buf.y.dtype is torch.bfloat16, fused=fused)
     return buf
