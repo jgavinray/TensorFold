@@ -184,8 +184,9 @@ def test_two_layer_decode_step_speed_gate(dev):
     g = torch.Generator().manual_seed(31)
     ex = _moved_tables(e, d, ni, sw, g, dev)
     router_rows = (torch.randn(e + 1, d, generator=g, dtype=torch.float32) * 0.02).to(torch.bfloat16).to(dev)
-    cfg = type("C", (), {"num_experts_per_tok": topk})
-    buf = xpu_moe.MoEBuffers(1, CFG, dev)
+    cfg = type("C", (), {"num_experts_per_tok": topk, "num_experts": e,
+                         "moe_intermediate_size": ni, "hidden_size": d})
+    buf = xpu_moe.MoEBuffers(1, cfg, dev)
     x = torch.randn(1, d, generator=g, dtype=torch.float32).to(torch.bfloat16).to(dev)
 
     def step(fused: bool, reps: int = 3) -> float:

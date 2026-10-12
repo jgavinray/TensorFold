@@ -92,9 +92,10 @@ def combine(y: torch.Tensor, wts: torch.Tensor) -> torch.Tensor:
 
 
 def moe(x: torch.Tensor, router_rows: torch.Tensor, ex, buf: MoEBuffers, top_k: int, experts: int, *,
-        fused: bool = True) -> MoEBuffers:
+        fused: bool | None = None) -> MoEBuffers:
     """Route x [R, D] bf16 and run its experts into buf.y [R, k + 1, D]; slot k is the shared expert.
-    ``fused=False`` runs the rank-one oracle faces (phase 2's regression reference)."""
+    ``fused=False`` runs the rank-one oracle faces (phase 2's regression reference); ``None`` consults
+    ``TENSORFOLD_XPU_MOE_ORDERED``."""
 
     from . import nvfp4 as xpu_nvfp4
 
@@ -128,7 +129,7 @@ class _Shape:
 _scratch: dict[tuple, MoEBuffers] = {}
 
 
-def run(x: torch.Tensor, m: Routed, *, prefill: bool = False, fused: bool = True) -> torch.Tensor:
+def run(x: torch.Tensor, m: Routed, *, prefill: bool = False, fused: bool | None = None) -> torch.Tensor:
     """x [R, D] bf16 -> [R, D] bf16: its top-k experts by renormalized softmax weight plus the shared expert."""
 
     rows = x.shape[0]

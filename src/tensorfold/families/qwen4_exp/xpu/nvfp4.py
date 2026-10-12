@@ -205,8 +205,14 @@ def stacked4_from_experts(experts: dict, device) -> Stacked4:
 
 # -- the grouped expert matmul --------------------------------------------------------------------------------
 
+# the exactness-replay knob: TENSORFOLD_XPU_MOE_ORDERED=1 runs the whole engine on the rank-one oracle,
+# the lane whose bits are layout- and batch-shape-independent; the fused lane (the default) is judged on
+# the tests/cuda NVFP4 pair gates instead.
+_ORDERED_ENV = "TENSORFOLD_XPU_MOE_ORDERED"
+
+
 def grouped_moe(x: torch.Tensor, ex: Stacked4, pick: torch.Tensor, *, prefill: bool = False,
-                fused: bool = True) -> torch.Tensor:
+                fused: bool | None = None) -> torch.Tensor:
     """Run the router's pairs: x [R, D] bf16, pick [R, S] int32 (shared expert id ``routed`` last slot) ->
     y [R, S, D] (fp32, or bf16 for a prompt as the CUDA prefill keeps its slots).
 
@@ -214,8 +220,11 @@ def grouped_moe(x: torch.Tensor, ex: Stacked4, pick: torch.Tensor, *, prefill: b
     ``mm_fused`` per face by default) and the activation's ``swiglu`` bits, so pairs of different experts
     never share an accumulator and a pair's output is its row's and its expert's alone. ``fused=False``
     reruns the faces with ``mm_ordered`` — the rank-one oracle, whose bits the fused path must match
-    within the ``tests/cuda`` NVFP4 tolerances."""
+    within the ``tests/cuda`` NVFP4 tolerances; ``fused=None`` (the default) consults
+    ``TENSORFOLD_XPU_MOE_ORDERED``."""
 
+    if fused is None:
+        fused = os.environ.get(_ORDERED_ENV) != "1"
     face = mm_fused if fused else mm_ordered
 
     rows, slots = pick.shape
@@ -243,10 +252,11 @@ def grouped_moe(x: torch.Tensor, ex: Stacked4, pick: torch.Tensor, *, prefill: b
 
 
 def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: Stacked4, buf, cfg, *,
-        fused: bool = True) -> None:
+        fused: bool | None = None) -> None:
     """Route ``x`` [R, D] bf16 and run its experts into ``buf`` — the ``cuda/nvfp4_moe.moe`` contract:
     ``buf.y`` [R, k + 1, D] and ``buf.wts``; ``xs`` is unused (the FP4 experts have no biases).
-    ``fused=False`` selects the rank-one oracle faces (phase 2's regression reference)."""
+    ``fused=False`` selects the rank-one oracle faces (phase 2's regression reference); ``None`` consults
+    ``TENSORFOLD_XPU_MOE_ORDERED``."""
 
     from . import moe as xpu_moe
 

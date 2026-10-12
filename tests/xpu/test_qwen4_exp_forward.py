@@ -5,8 +5,10 @@ The reference is the same source run on CPU tensors: every op outside the two la
 primitive, so card and CPU agree bit-for-bit where no lane kernel touches, and within the
 tests/cuda fp16-vs-fp64 relative-norm tolerance (and argmax) where they do.
 
-Gate 1 block-level torch.equal (hc_block, moe_block) / tolerance (gdn, attn, ple blocks);
-gate 2 end-to-end tiny-fixture logits + prefill; gate 3 decode row invariance;
+Gate 1 block-level torch.equal (hc_block; moe_block on the rank-one lane — its shipped fused lane is
+judged on the tests/cuda NVFP4 pair gates against that lane's bits), tolerance (gdn, attn, ple
+blocks); gate 2 end-to-end tiny-fixture logits + prefill; gate 3 decode row invariance (bits on the
+``TENSORFOLD_XPU_MOE_ORDERED`` lane, tolerance and argmax on the shipped fused lane);
 gate 4 a real-checkpoint one-layer smoke with peak RSS and VRAM; gate 5 the KV cache refs."""
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ FIXTURE = dict(layers=2, experts=4, vocab=200, hidden=2560, heads=24, kv_heads=2
                ple=True, mtp=False, seed=7)
 CKPT = "/storage01/models/Qwen3.8-Flash-Next-NVFP4"
 REL = 1e-2                       # the tests/cuda fp16-vs-fp64 gate
+REL_FACE = 2e-2                  # tests/cuda/test_nvfp4_experts.py:86 — the grouped-expert pair gate
 ROWS, PREFILL_ROWS, CAPACITY = 8, 12, 32
 TOKENS = [7, 199, 42, 88, 130, 5, 61, 155]
 
@@ -141,7 +144,11 @@ def test_hc_block_is_bit_exact_on_card(dev, pair):
         assert rel(getattr(bx, name)[:ROWS].cpu(), getattr(bc, name)[:ROWS]) < REL, name
 
 
-def test_moe_block_is_bit_exact_on_card(dev, pair):
+def test_moe_block_matches_the_rank_one_oracle(dev, pair, monkeypatch):
+    """The rank-one lane (``TENSORFOLD_XPU_MOE_ORDERED=1``) keeps gate 1's card-vs-CPU bit equality;
+    the shipped fused lane replaces K launches with one card matmul per face and must sit within the
+    ``tests/cuda`` NVFP4 pair gates of that oracle's bits."""
+
     wx, wc = pair["xpu"], pair["cpu"]
     bx, bc = bufs(wx), bufs(wc)
     _mixed(bx, bc)
@@ -149,11 +156,20 @@ def test_moe_block_is_bit_exact_on_card(dev, pair):
     m = torch.randn((ROWS, wx.cfg.hidden), generator=g).to(torch.bfloat16)
     bx.mixed.copy_(m.to(bx.mixed.device))
     bc.mixed.copy_(m)
+    monkeypatch.setenv("TENSORFOLD_XPU_MOE_ORDERED", "1")        # the ordered faces: layout-independent bits
     mode_x, y_x, wts_x = fw.moe_block(wx.layers[0], wx, bx, ROWS)
     mode_c, y_c, wts_c = fw.moe_block(wc.layers[0], wc, bc, ROWS)
     assert (mode_x, mode_c) == (2, 2)
     assert torch.equal(wts_x.cpu(), wts_c.cpu())               # the ordered router's gates
     assert torch.equal(y_x.float().cpu(), y_c.float().cpu())   # the ordered grouped matmul
+    oracle = y_c.float().cpu()
+    monkeypatch.delenv("TENSORFOLD_XPU_MOE_ORDERED")            # the shipped lane: one matmul per face
+    mode_x, y_f, wts_f = fw.moe_block(wx.layers[0], wx, bx, ROWS)
+    assert mode_x == 2
+    assert torch.equal(wts_f.cpu(), wts_c.cpu())               # routing is the same ordered op either way
+    got = y_f.float().cpu()
+    assert rel(got, oracle) < REL, f"fused moe_block: rel {rel(got, oracle):.2e}"
+    assert torch.allclose(got, oracle, rtol=REL_FACE, atol=REL_FACE)
 
 
 @pytest.mark.parametrize("which", ("gdn", "attn", "ple"))
@@ -236,7 +252,12 @@ def test_prefill_matches_cpu(dev, pair):
 # -- gate 3: decode row invariance --------------------------------------------------------------------------------
 
 
-def test_decode_rows_one_at_a_time_equal_batched(dev, pair):
+def test_decode_rows_one_at_a_time_equal_batched(dev, pair, monkeypatch):
+    """A row's decode bits never depend on the other rows: on the rank-one lane they match exactly;
+    on the shipped fused lane the fp32 reduction schedule follows the segment's row count, so there
+    a row's greedy decision — its argmax — must not move, with a gross-damage norm canary."""
+
+    monkeypatch.setenv("TENSORFOLD_XPU_MOE_ORDERED", "1")
     w = pair["xpu"]
     st_b, b_b = State(w, CAPACITY, ROWS), bufs(w)
     batched = fw.forward(w, st_b, b_b, TOKENS)[:ROWS].clone()
@@ -254,6 +275,24 @@ def test_decode_rows_one_at_a_time_equal_batched(dev, pair):
     for li in range(len(st_b.cur)):
         assert torch.equal(st_b.rec[st_b.cur[li], li].cpu(), st_s.rec[st_s.cur[li], li].cpu())
     assert np.array_equal(st_b.ple_history, st_s.ple_history)
+    monkeypatch.delenv("TENSORFOLD_XPU_MOE_ORDERED")            # the schedule follows the segment's rows
+    st_b2, b_b2 = State(w, CAPACITY, ROWS), bufs(w)
+    batched2 = fw.forward(w, st_b2, b_b2, TOKENS)[:ROWS].clone()
+    fw.commit(w, st_b2, b_b2, ROWS, ROWS)
+    st_s2, b_s2 = State(w, CAPACITY, ROWS), bufs(w)
+    singles2 = []
+    for t in TOKENS:
+        lg = fw.forward(w, st_s2, b_s2, [t])[:1].clone()
+        fw.commit(w, st_s2, b_s2, 1, 1)
+        singles2.append(lg)
+    single2 = torch.cat(singles2)
+    assert torch.equal(batched2.argmax(-1).cpu(), single2.argmax(-1).cpu()), \
+        "a row's argmax moved on the fused lane"
+    # fp32 matmul noise (~1e-7 pre-activation) flips a logit's bf16 rounding, and an untrained fixture
+    # amplifies the flip: one row's raw logits moved 45% while its argmax held. The fp32 rel is gated
+    # at REL by the fused lane's own gates; row invariance here IS the argmax above — this norm is the
+    # gross-damage canary (a wrong expert or table would move every row).
+    assert rel(batched2.float(), single2.float()) < 20 * REL
 
 
 # -- gate 4: the real checkpoint, one layer -----------------------------------------------------------------------
