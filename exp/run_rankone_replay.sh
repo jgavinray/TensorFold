@@ -24,5 +24,6 @@ leg build-rankone env TENSORFOLD_XPU_ORDERED=1 $V exp/make_oracle.py --cells gat
 # reproduce them under the tolerance rule (fork caveats allowed); the fixture head printed by
 # the builder is this replay's new sha input.
 leg replay env TENSORFOLD_XPU_ORDERED=1 $V -m pytest tests/xpu/test_qwen4_exp_serving.py -q -s \
-    -k "test_greedy_matches_cpu_walk and gate2" > exp/serve-rankone-gate2.log 2>&1 || { echo "MARK abort-replay"; exit 3; }
+    -k test_greedy_matches_cpu_walk > exp/serve-rankone-gate2.log 2>&1 || { echo "MARK abort-replay"; exit 3; }
+grep -qE '[0-9]+ passed' exp/serve-rankone-gate2.log || { echo "MARK abort-replay-empty-selection"; exit 4; }
 echo "MARK ALLDONE $(date -u +%H:%M:%S)"
