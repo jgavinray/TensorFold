@@ -257,15 +257,21 @@ def oracle_tokens(cell: str, prompt_n: int, new_n: int) -> tuple[list[int], str]
     rule fails loudly, because stale or hand-edited tokens are a real defect."""
 
     if not ORACLE_FILE.exists():
-        pytest.skip(f"{ORACLE_FILE} missing: build it on the card - python exp/make_oracle.py "
-                    f"--on-card gate2,short,med,long --force (the CPU walk's ~49 GB RSS does "
-                    f"not fit this box beside the flash server; see the module docstring)")
+        missing = (f"{ORACLE_FILE} missing: build it on the card - python exp/make_oracle.py "
+                   f"--on-card gate2,short,med,long --force (the CPU walk's ~49 GB RSS does "
+                   f"not fit this box beside the flash server; see the module docstring)")
+        if os.environ.get("TF_SERVE_REQUIRE_FIXTURE") == "1":
+            pytest.fail(f"fixture required but absent: {missing}")
+        pytest.skip(missing)
     with open(ORACLE_FILE) as f:
         data = json.load(f)
     entry = data.get("cells", {}).get(cell)
     if entry is None:
-        pytest.skip(f"oracle fixture has no cell '{cell}': python exp/make_oracle.py "
-                    f"--on-card {cell} --force")
+        missing = (f"oracle fixture has no cell '{cell}': python exp/make_oracle.py "
+                   f"--on-card {cell} --force")
+        if os.environ.get("TF_SERVE_REQUIRE_FIXTURE") == "1":
+            pytest.fail(f"fixture required but absent: {missing}")
+        pytest.skip(missing)
     if (entry.get("prompt"), entry.get("new"), entry.get("seed"),
             entry.get("prompt_sha256")) != (prompt_n, new_n, SEED,
                                             oraclelib.sha256_json(prompt_tokens(prompt_n))):

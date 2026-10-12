@@ -14,16 +14,21 @@ mem_gb=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
 echo "MARK preflight MemAvailable=${mem_gb}G $(date -u +%H:%M:%S)"
 [ "$mem_gb" -ge 24 ] || { echo "MARK abort-low-ram"; exit 2; }
 
-$V tools/probe_prefill_xpu.py > exp/serve-fused-probe.log 2>&1;               echo "MARK probe rc=$? $(date -u +%H:%M:%S)"
-$V -m pytest tests/xpu/test_qwen4_exp_serving.py -q -s \
-   -k test_greedy_matches_cpu_walk > exp/serve-fused-gate2.log 2>&1;           echo "MARK gate2 rc=$? $(date -u +%H:%M:%S)"
+export TF_SERVE_REQUIRE_FIXTURE=1
+leg() { local name=$1 rc; shift; "$@"; rc=$?; echo "MARK $name rc=$rc $(date -u +%H:%M:%S)"; return $rc; }
+
+leg probe $V tools/probe_prefill_xpu.py > exp/serve-fused-probe.log 2>&1
+leg build-gate2 $V exp/make_oracle.py --cells gate2 --on-card gate2 --force \
+    > exp/serve-fused-oracle-gate2.log 2>&1 || { echo "MARK abort-build-gate2"; exit 3; }
+leg gate2 $V -m pytest tests/xpu/test_qwen4_exp_serving.py -q -s \
+    -k test_greedy_matches_cpu_walk > exp/serve-fused-gate2.log 2>&1 || { echo "MARK abort-gate2"; exit 3; }
 
 for cell in short med long; do
     mem_gb=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
     [ "$mem_gb" -ge 24 ] || { echo "MARK abort-low-ram-before-$cell"; exit 2; }
-    $V exp/make_oracle.py --cells "$cell" --on-card "$cell" --steps 65 --force \
-        > "exp/serve-fused-oracle-$cell.log" 2>&1;                              echo "MARK build-$cell rc=$? $(date -u +%H:%M:%S)"
-    TF_SERVE_CELL_BUDGET=21600 $V -m pytest tests/xpu/test_qwen4_exp_serving.py -q -s \
-        -k "test_bench_cell and $cell" > "exp/serve-fused-cell-$cell.log" 2>&1; echo "MARK cell-$cell rc=$? $(date -u +%H:%M:%S)"
+    leg build-$cell $V exp/make_oracle.py --cells "$cell" --on-card "$cell" --steps 65 --force \
+        > "exp/serve-fused-oracle-$cell.log" 2>&1 || { echo "MARK abort-build-$cell"; exit 3; }
+    TF_SERVE_CELL_BUDGET=21600 leg cell-$cell $V -m pytest tests/xpu/test_qwen4_exp_serving.py -q -s \
+        -k "test_bench_cell and $cell" > "exp/serve-fused-cell-$cell.log" 2>&1
 done
 echo "MARK ALLDONE $(date -u +%H:%M:%S)"
