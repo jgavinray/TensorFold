@@ -6,9 +6,10 @@ at all. The slot-pool semantics are ported here on plain torch staging instead: 
 discovery, the same LRU behind ``expert`` ids, the same window slots for prompt chunks, and the same
 ``hits / misses / bytes_read`` bookkeeping, but the pool stacks hold the *dequantized fp32* tables the
 XPU grouped matmul reads (``nvfp4.Stacked4``'s layout, one expert per slot), filled by host ``pread``
-of the checkpoint's packed NVFP4 bytes and the device-free ``nvfp4.dequantize`` on CPU — the same
-elementwise bits the resident loader's on-card dequant produces, so a streamed expert is
-``torch.equal`` to the resident one.
+of the checkpoint's packed NVFP4 bytes, uploaded, and dequantized on card with the resident
+loader's own ``nvfp4.dequantize`` call - only the ~2.8 MB of packed bytes cross the PCIe bus per
+expert (not the 59 MB of fp32), the decode bits are the loader's by construction, and a streamed
+expert is ``torch.equal`` to the resident one.
 
 The CUDA/MLX engine hands the routing to a host thread through graph marks because its expert launch
 reads its plan on the host mid-graph; the XPU engine decodes eagerly, so ``route`` answers on the
@@ -231,7 +232,8 @@ class Streamer:
                                [(proj, e, slot) for e, slot in need for proj in PROJS]))
 
     def _read_project(self, layer: int, proj: str, expert: int, slot: int) -> None:
-        """One expert's packed bytes -> the dequantized fp32 transpose -> its slot (the resident loader's bits)."""
+        """One expert's packed bytes -> uploaded -> the card's dequantized fp32 transpose -> its slot
+        (the resident loader's own ``nvfp4.dequantize``, so its bits)."""
 
         def part(name_part: str) -> torch.Tensor:
             src = self.found[(layer, proj, name_part, expert)]
@@ -250,8 +252,9 @@ class Streamer:
         words = part("weight").view(self.shapes[(proj, "weight")][0])
         scales = part("scales").view(self.shapes[(proj, "scales")][0])
         scale2 = float(part("scales_2").reshape(-1)[0])
+        words, scales = words.to(self.device), scales.to(self.device)
         rows = nvfp4.dequantize(words, scales, scale2)
-        self.pool[proj][slot].copy_(rows.t().contiguous())
+        self.pool[proj][slot].copy_(rows.t())
 
     # -- inspection and teardown ----------------------------------------------------------------------
 
