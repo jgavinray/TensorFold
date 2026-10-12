@@ -7,8 +7,14 @@ head's kernels join the build; until then the engine serves the serial reference
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+
+# the venv may carry both Triton wheels; pin the Intel backend before any module that defines kernels at
+# import time (``..cuda.qmm``/``..cuda.bf16``, which ``forward``/``mtp`` import) is reached, so the family's
+# import order can never decide which backend compiles them.
+os.environ.setdefault("TRITON_DEFAULT_BACKEND", "intel")
 
 from .weights import load    # noqa: F401 (re-exported: the slice-1 entry point)
 
