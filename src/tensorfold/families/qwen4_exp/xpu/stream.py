@@ -228,12 +228,24 @@ class Streamer:
     def _read_all(self, layer: int, need: list[tuple[int, int]]) -> None:
         if not need:
             return
-        list(self._readers.map(lambda item: self._read_project(layer, *item),
-                               [(proj, e, slot) for e, slot in need for proj in PROJS]))
+        # The worker threads only ``pread`` the packed bytes (pure host); every card launch - the
+        # upload, the dequantize, the slot copy - is issued right here, on the engine's own thread.
+        # Launching from pool workers races the main thread's event syncs (a walk can wedge with
+        # the sync spinning while a worker waits for the GIL to enqueue what it waits for).
+        items = [(proj, e, slot) for e, slot in need for proj in PROJS]
+        for (proj, _e, slot), (words, scales, scale2) in zip(
+                items, self._readers.map(lambda item: self._read_project(layer, *item), items)):
+            self._fill_slot(proj, words, scales, scale2, slot)
 
-    def _read_project(self, layer: int, proj: str, expert: int, slot: int) -> None:
-        """One expert's packed bytes -> uploaded -> the card's dequantized fp32 transpose -> its slot
-        (the resident loader's own ``nvfp4.dequantize``, so its bits)."""
+    def _fill_slot(self, proj: str, words: torch.Tensor, scales: torch.Tensor,
+                   scale2: float, slot: int) -> None:
+        rows = nvfp4.dequantize(words.to(self.device), scales.to(self.device), scale2)
+        self.pool[proj][slot].copy_(rows.t())
+
+    def _read_project(self, layer: int, proj: str, expert: int, slot: int) -> tuple:
+        """One expert's packed checkpoint bytes, read on the host: the card's dequantize of them
+        (the resident loader's own ``nvfp4.dequantize``, so the loader's bits) is launched by
+        ``_read_all`` on the engine thread."""
 
         def part(name_part: str) -> torch.Tensor:
             src = self.found[(layer, proj, name_part, expert)]
@@ -252,9 +264,7 @@ class Streamer:
         words = part("weight").view(self.shapes[(proj, "weight")][0])
         scales = part("scales").view(self.shapes[(proj, "scales")][0])
         scale2 = float(part("scales_2").reshape(-1)[0])
-        words, scales = words.to(self.device), scales.to(self.device)
-        rows = nvfp4.dequantize(words, scales, scale2)
-        self.pool[proj][slot].copy_(rows.t())
+        return words, scales, scale2
 
     # -- inspection and teardown ----------------------------------------------------------------------
 
