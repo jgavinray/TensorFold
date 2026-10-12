@@ -11,3 +11,8 @@ venv/
 .DS_Store
 *.swp
 *.log
+exp/gate-*.log
+exp/par-*.log
+exp/*-iso.log
+exp/heavy-suite.log
+exp/suite-iso.log
