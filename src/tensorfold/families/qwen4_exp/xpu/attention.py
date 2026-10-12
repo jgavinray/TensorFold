@@ -44,7 +44,7 @@ def _cos_sin(ang: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         cosr = cosr - pw / f if k % 2 else cosr + pw / f
         pw = pw * r2
     q = n % 4
-    odd = (q == 1) | (q == 2)
+    odd = (q == 1) | (q == 3)
     sneg = (q == 2) | (q == 3)
     cosneg = (q == 1) | (q == 2)
     s = torch.where(odd, cosr, sinr)
@@ -206,7 +206,7 @@ def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, in
 
         def rot(xn: torch.Tensor, xpn: torch.Tensor, width: int) -> torch.Tensor:
             lo = xn[:, :half] * cos[:half] - xpn[:, :half] * sin[:half]
-            hi = xpn[:, half:2 * half] * cos[half:2 * half] + xn[:, half:2 * half] * sin[half:2 * half]
+            hi = xpn[:, half:2 * half] * sin[half:2 * half] + xn[:, half:2 * half] * cos[half:2 * half]
             tail = xn[:, 2 * half:]
             return torch.cat((lo, hi, tail), dim=-1).to(torch.bfloat16)
 
@@ -259,7 +259,7 @@ def attn_prep(p: torch.Tensor, pos0: torch.Tensor, q_scale, k_scale, i_scale, in
             lo = xn[:, :lo_w] * cosv[:lo_w] - xpn[:, :lo_w] * sinv[:lo_w]
             parts = [lo]
             if index_dim > half:
-                parts.append(xpn[:, half:hi_w] * cosv[half:hi_w] + xn[:, half:hi_w] * sinv[half:hi_w])
+                parts.append(xpn[:, half:hi_w] * sinv[half:hi_w] + xn[:, half:hi_w] * cosv[half:hi_w])
             if index_dim > hi_w:
                 parts.append(xn[:, hi_w:])
             out = torch.cat(parts, dim=-1).to(torch.bfloat16)
@@ -397,9 +397,9 @@ def qsa_pool(ikc: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, ik_sca
         xpn = (xp * rinv * w[partner]).to(torch.bfloat16).to(torch.float32)
         axis = _rope_axis(ratio * b, mode, rope=rope, delta=delta, length=length, index=j, s1=sections[1],
                           s2=sections[2], device=dev)
-        cos, sin = _cos_sin(axis * inv_freq)
+        cos, sin = _cos_sin(axis * inv_freq[j].to(torch.float32))
         lo = xn[:half] * cos[:half] - xpn[:half] * sin[:half]
-        hi = xpn[half:2 * half] * cos[half:2 * half] + xn[half:2 * half] * sin[half:2 * half]
+        hi = xpn[half:2 * half] * sin[half:2 * half] + xn[half:2 * half] * cos[half:2 * half]
         rot = torch.cat((lo, hi, xn[2 * half:]), dim=-1)
         pooled[b].copy_(rot.to(torch.bfloat16))
 
@@ -456,7 +456,8 @@ def _select_row(scratch: AttnScratch, r: int, end: int, complete: int, ratio: in
     chosen = above | (equal & (rank <= need))
     place = torch.cumsum(chosen.to(torch.int32), dim=0) - 1
     for k in range(ratio):
-        scratch.ids[r].index_put_((place.long() * ratio + k,), (b * ratio + k)[chosen], accumulate=False)
+            scratch.ids[r].index_put_(((place.long() * ratio + k)[chosen],), (b * ratio + k)[chosen],
+                                       accumulate=False)
     t = torch.arange(ratio, dtype=torch.int32, device=dev)
     tail = ratio * complete + t
     keep = tail < end
