@@ -21,7 +21,7 @@ engine instead; the card/CPU equivalence rests on the merged engine gates at sma
 
 The port's expert matmul runs fused by default (``nvfp4.mm_fused``/``grouped_moe(fused=True)``,
 judged against the ``tests/cuda`` tolerances, not bit-parity); the rank-one ``nvfp4.mm_ordered``
-lane (``TENSORFOLD_XPU_MOE_FUSED=0``) stays the bit-parity oracle, so per-step costs on that
+lane (``TENSORFOLD_XPU_MOE_ORDERED=1``) stays the bit-parity oracle, so per-step costs on that
 lane are launch-bound and its heavy legs take hours. A bench cell times its
 prefill and a 32-step decode window and runs the full token count only when the measured
 projection fits ``TF_SERVE_CELL_BUDGET``; a cell that cannot fit reports its measured rate and
@@ -353,7 +353,7 @@ def test_greedy_matches_cpu_walk(dev):
     _LIVE["chunk_secs"].append(prefill_s)
     _save_measured()
     assert len(r.tokens) == len(want) == DECODED + 1
-    if os.environ.get("TENSORFOLD_XPU_MOE_FUSED", "1") == "0":
+    if os.environ.get("TENSORFOLD_XPU_MOE_ORDERED", "0") == "1":
         assert r.tokens == want, (f"greedy diverged at step "
                                   f"{next(i for i in range(len(want)) if r.tokens[i] != want[i])}: "
                                   f"card {r.tokens} cpu {want}")
@@ -417,7 +417,7 @@ def test_bench_cell(dev, cell, prompt_n, new_n):
         _LIVE["chunk_secs"].append(prefill_s)
         _save_measured()
 
-    fused_lane = os.environ.get("TENSORFOLD_XPU_MOE_FUSED", "1") != "0"
+    fused_lane = os.environ.get("TENSORFOLD_XPU_MOE_ORDERED", "0") != "1"
 
     t = time.perf_counter()
     deadline = t + max(CELL_BUDGET - prefill_s, 0.0)
