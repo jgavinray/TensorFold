@@ -15,7 +15,8 @@ echo "MARK preflight MemAvailable=${mem_gb}G $(date -u +%H:%M:%S)"
 [ "$mem_gb" -ge 24 ] || { echo "MARK abort-low-ram"; exit 2; }
 
 export TF_SERVE_REQUIRE_FIXTURE=1
-leg() { local name=$1 rc; shift; "$@"; rc=$?; echo "MARK $name rc=$rc $(date -u +%H:%M:%S)"; return $rc; }
+exec 3>&1
+leg() { local name=$1 rc; shift; "$@"; rc=$?; echo "MARK $name rc=$rc $(date -u +%H:%M:%S)" >&3; return $rc; }
 
 leg probe $V tools/probe_prefill_xpu.py > exp/serve-fused-probe.log 2>&1
 leg build-gate2 $V exp/make_oracle.py --cells gate2 --on-card gate2 --force \
