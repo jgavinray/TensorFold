@@ -331,7 +331,15 @@ def test_greedy_matches_cpu_walk(dev):
     first = dec.prefill(e, list(prompt), None)
     prefill_s = time.perf_counter() - t0
     t0 = time.perf_counter()
-    r = dec.serial_decode(e, first, DECODED + 1, None)
+    seen = [0]
+
+    def _hear(_new: list[int]) -> bool:
+        seen[0] += 1
+        if seen[0] % 8 == 0:
+            _log(f"gate 2 decode {seen[0]}/{DECODED + 1} +{time.perf_counter() - t0:.0f} s")
+        return False
+
+    r = dec.serial_decode(e, first, DECODED + 1, None, on_tokens=_hear)
     decode_s = time.perf_counter() - t0
     _log(f"card greedy: prefill {PROMPT} rows in {prefill_s:.0f} s "
          f"({PROMPT / max(prefill_s, 1e-9):.2f} tok/s), decode {len(r.tokens) - 1} steps in "
@@ -413,6 +421,8 @@ def test_bench_cell(dev, cell, prompt_n, new_n):
     def budget_spent(_new: list[int]) -> bool:
         nonlocal ticks
         ticks += 1
+        if ticks % 16 == 0:
+            _log(f"{cell}: decode {ticks}/{new_n + 1} +{time.perf_counter() - t:.0f} s")
         return ticks >= RATE_STEPS and time.perf_counter() > deadline
 
     r = dec.serial_decode(e, first, new_n + 1, None, on_tokens=budget_spent)
