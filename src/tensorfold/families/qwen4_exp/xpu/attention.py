@@ -9,6 +9,8 @@ in chunk order and merges partials in chunk order, exactly like ``_chunks``/``_c
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from . import hc, nvfp4
@@ -287,12 +289,22 @@ def attn_gate(o: torch.Tensor, p: torch.Tensor, out: torch.Tensor, xs: torch.Ten
 def attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.Tensor, scratch: AttnScratch,
               rows: int, scale: float, out: torch.Tensor | None = None, *,
               context: int | None = None, ks: torch.Tensor | None = None, vs: torch.Tensor | None = None,
-              bits: int = 0) -> torch.Tensor:
+              bits: int = 0, fused: bool | None = None) -> torch.Tensor:
     """q [R, H, D] against caches holding [0, P0 + R) -> [R, H, D] bf16; sparse rows read ``scratch.ids``;
-    ``bits`` 8 or 4: codes with ``ks``/``vs`` scales, q rotated in, the output equal to the rotated dot."""
+    ``bits`` 8 or 4: codes with ``ks``/``vs`` scales, q rotated in, the output equal to the rotated dot.
+
+    ``fused=False`` keeps the rank-one oracle for the two inner products (``nvfp4.mm_ordered``): the
+    scores and the p-dot accumulate k in order, so a row's bits are its own at any row count.
+    ``fused=True`` (the default, or ``TENSORFOLD_XPU_MOE_ORDERED`` unset) runs one card matmul per
+    inner product — the same tolerance contract as the router and the expert faces. The inner products
+    sit inside the row x kv-head x chunk x tile loops, so the oracle lane costs two K launches per
+    tile, which is what the fused lane removes."""
 
     if bits and (ks is None or vs is None):
         raise ValueError("a quantized KV cache needs its scale tensors")
+    if fused is None:
+        fused = os.environ.get(nvfp4._ORDERED_ENV) != "1"
+    dot = nvfp4.mm_fused if fused else nvfp4.mm_ordered
     if ks is None:
         ks = vs = kc
     _, h, d = q.shape
@@ -346,7 +358,7 @@ def attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.T
                     else:
                         kk = kc[slot].to(torch.float32)
                         vv = vc[slot].to(torch.float32)
-                    scores = nvfp4.mm_ordered(qr, kk.t()) * scale
+                    scores = dot(qr, kk.t()) * scale
                     scores = torch.where(valid[None, :], scores, torch.full_like(scores, neg))
                     tile_m = scores.max(dim=1).values
                     active = tile_m != neg
@@ -356,7 +368,7 @@ def attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.T
                     p = torch.where(valid[None, :] & active[:, None],
                                     nvfp4.exp(scores - next_m[:, None]),
                                     torch.zeros_like(scores))
-                    o = o * alpha[:, None] + nvfp4.mm_ordered(p.to(torch.bfloat16), vv)
+                    o = o * alpha[:, None] + dot(p.to(torch.bfloat16), vv)
                     l = l * alpha + hc.fold(p)
                     m = next_m
             out[r, heads].copy_(hc.div(o, l[:, None]).to(torch.bfloat16))
