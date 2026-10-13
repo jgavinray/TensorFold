@@ -166,7 +166,11 @@ def test_moe_block_matches_the_rank_one_oracle(dev, pair, monkeypatch):
     monkeypatch.delenv("TENSORFOLD_XPU_MOE_ORDERED")            # the shipped lane: one matmul per face
     mode_x, y_f, wts_f = fw.moe_block(wx.layers[0], wx, bx, ROWS)
     assert mode_x == 2
-    assert torch.equal(wts_f.cpu(), wts_c.cpu())               # routing is the same ordered op either way
+    # the shipped lane fuses the router too, so its gates carry the card's fp32 reduction order: they
+    # sit within the pair gate of the oracle's rather than equalling them bit for bit. The picks are the
+    # contract that must not move — a changed top expert would change which experts run at all.
+    assert rel(wts_f.cpu().float(), wts_c.cpu().float()) < REL_FACE, "fused routing weights off the oracle"
+    assert torch.equal(bx.moe.pick[:ROWS].cpu(), bc.moe.pick[:ROWS]), "the fused router moved the picks"
     got = y_f.float().cpu()
     assert rel(got, oracle) < REL, f"fused moe_block: rel {rel(got, oracle):.2e}"
     assert torch.allclose(got, oracle, rtol=REL_FACE, atol=REL_FACE)

@@ -261,7 +261,7 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: Stacke
     from . import moe as xpu_moe
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
-    xpu_moe.router(x, router_rows, buf.logits[:rows])
+    xpu_moe.router(x, router_rows, buf.logits[:rows], fused=fused)
     xpu_moe.select_rows(buf.logits[:rows], buf, top_k, ex.routed)
     buf.y[:rows] = grouped_moe(x, ex, buf.pick[:rows], prefill=buf.y.dtype is torch.bfloat16, fused=fused)
     return buf

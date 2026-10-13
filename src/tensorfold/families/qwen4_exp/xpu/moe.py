@@ -15,6 +15,7 @@ by their weights, sums them in slot order and rounds to bf16 once.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -37,13 +38,28 @@ class MoEBuffers:
                              device=device)
 
 
-def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+def router(x: torch.Tensor, rows: torch.Tensor, out: torch.Tensor | None = None, *,
+           fused: bool | None = None) -> torch.Tensor:
     """x [R, D] bf16, rows [E + 1, D] bf16 (router rows, then the shared expert's gate row) -> [R, E + 1] fp32.
 
-    The fp32 dot products accumulate k in order (``nvfp4.mm_ordered``), so a row's logits are its own
-    bits at any row count — the CUDA kernel's ``tl.dot`` gives the same values to fp32 rounding."""
+    ``fused=False`` keeps the rank-one oracle: the fp32 dot products accumulate k in order
+    (``nvfp4.mm_ordered``), so a row's logits are its own bits at any row count — the CUDA kernel's
+    ``tl.dot`` gives the same values to fp32 rounding. ``fused=True`` runs the one card matmul
+    (``nvfp4.mm_fused``), whose fp32 reduction order is the card's: the logits sit within fp32
+    reduction noise of the oracle, which is the ``tests/cuda`` NVFP4 tolerance contract, not bit
+    equality. ``fused=None`` (the default) consults ``TENSORFOLD_XPU_MOE_ORDERED``.
 
-    got = nvfp4.mm_ordered(x, rows.to(x.dtype).t().contiguous())
+    The router is the decode step's dominant term — D is the full hidden width on every row of every
+    layer — so the oracle's K launches per call are what the fused lane removes."""
+
+    if fused is None:
+        fused = os.environ.get(nvfp4._ORDERED_ENV) != "1"
+    w_t = rows.to(x.dtype).t().contiguous()
+    # ``mm_fused`` takes an fp32 right operand (the dequantized expert tables are already fp32); the
+    # router's rows arrive bf16, so widen them here. bf16 -> fp32 is lossless, and ``mm_ordered``
+    # widens both sides itself, so the two lanes see identical products and differ only in reduction
+    # order — which is the tolerance contract.
+    got = nvfp4.mm_fused(x, w_t.to(torch.float32)) if fused else nvfp4.mm_ordered(x, w_t)
     return got if out is None else out.copy_(got)
 
 

@@ -306,10 +306,13 @@ def test_row_invariance(dev, ck):
     g = torch.Generator().manual_seed(8)
     x = _rows(g, 9, HID, dtype=torch.bfloat16)
     rows = ck["router"]
-    lit = xpu_moe.router(x.to(dev), rows.to(dev)).cpu()
+    # row invariance is the oracle lane's property (fused=False): ``mm_ordered`` accumulates k in order,
+    # so a row's bits are its own at any row count. The fused lane's reduction order is the card's and
+    # is launch-shape dependent by design — its contract is the tolerance test below, not bit equality.
+    lit = xpu_moe.router(x.to(dev), rows.to(dev), fused=False).cpu()
     for r in range(9):
-        assert torch.equal(lit[r], xpu_moe.router(x[r:r + 1].to(dev), rows.to(dev)).cpu()[0]), f"row {r}"
-    assert torch.equal(lit, xpu_moe.router(x, rows)), "router logits differ card vs cpu"
+        assert torch.equal(lit[r], xpu_moe.router(x[r:r + 1].to(dev), rows.to(dev), fused=False).cpu()[0]), f"row {r}"
+    assert torch.equal(lit, xpu_moe.router(x, rows, fused=False)), "router logits differ card vs cpu"
     ex_d = xpu.stacked4_from_experts(ck, dev)
     _, pick = _picked(9, 4)
     y = xpu.grouped_moe(x.to(dev), ex_d, pick.to(dev), fused=False).cpu()  # oracle: bits independent of the batch
@@ -326,3 +329,24 @@ def test_row_invariance(dev, ck):
         xpu_moe.select_rows(lit[r:r + 1].to(dev), b2, TOPK, E)
         assert torch.equal(b1.pick[r:r + 1], b2.pick), f"row {r}: picks changed with the batch size"
         assert torch.equal(b1.wts[r:r + 1], b2.wts), f"row {r}: weights changed with the batch size"
+
+
+def test_router_fused_lane_matches_the_oracle(dev, ck):
+    """The fused router (one card matmul) against the rank-one oracle, on the pair-gate tolerance.
+
+    The router is the decode step's dominant term — D is the full hidden width on every row of every
+    layer — so the default lane runs ``mm_fused``: one matmul per call instead of ``K`` rank-one
+    launches. Its fp32 reduction order is the card's, so the logits are the oracle's within fp32
+    reduction noise (the ``tests/cuda`` NVFP4 pair gate), and the selected experts must not move."""
+
+    g = torch.Generator().manual_seed(8)
+    x = _rows(g, 9, HID, dtype=torch.bfloat16)
+    rows = ck["router"]
+    oracle = xpu_moe.router(x.to(dev), rows.to(dev), fused=False).cpu()
+    fused = xpu_moe.router(x.to(dev), rows.to(dev), fused=True).cpu()
+    assert torch.equal(oracle.argmax(-1), fused.argmax(-1)), "the fused router moved a row's top expert"
+    denom = oracle.abs().max().clamp_min(1e-9)
+    assert float((fused - oracle).abs().max() / denom) < REL_FACE, "fused router off the oracle past the pair gate"
+    for r in range(9):
+        one = xpu_moe.router(x[r:r + 1].to(dev), rows.to(dev), fused=True).cpu()
+        assert float((fused[r] - one[0]).abs().max() / denom) < REL_FACE, f"fused router row {r} off by the batch"
