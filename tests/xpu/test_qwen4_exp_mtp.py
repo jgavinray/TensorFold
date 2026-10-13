@@ -314,6 +314,18 @@ def _moved(obj, device):
 
 
 def test_real_checkpoint_mtp_window_smoke(dev):
+    """The real checkpoint's MTP head, one layer, both sides — and the card memory this test borrows is
+    handed back before it returns.
+
+    The card is a shared 32 GB resource, and this test is the file's only real-checkpoint leg. Returning
+    the borrow explicitly — the moved weights, the buffers, and the cached blocks — keeps the file
+    order-independent and leaves the next file a clean L0 context.
+
+    (History: this test once failed with ``UR_RESULT_ERROR_OUT_OF_RESOURCES`` on an 84 MiB allocation
+    while the card reported 32 GB free. That was not allocator pressure from this file — the device was
+    failing underneath the run, and ``devcoredump`` later recorded it. The explicit release below is
+    still correct hygiene; it is not a fix for a memory bug that never existed.)"""
+
     from dataclasses import replace
 
     real_read = xpu_weights.Config.read
@@ -322,30 +334,36 @@ def test_real_checkpoint_mtp_window_smoke(dev):
         w = xpu_weights.load(CKPT, "cpu", mtp=True, draft_vocab="default")
     finally:
         xpu_weights.Config.read = real_read
-    assert w.mtp is not None and w.draft_head is not None
-    assert isinstance(w.draft_head, qmm.Q4) and w.draft_head.gs == 32
-    assert w.draft_head.n == int(w.draft_ids.shape[0]) > 0
-    assert [l.index for l in w.layers] == [0]
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576.0
-    torch.xpu.reset_peak_memory_stats(dev)
-    wx = _moved(w, dev)
-    st, b = State(w, CAPACITY, ROWS), bufs(w)
-    stx, bx = State(wx, CAPACITY, ROWS), bufs(wx)
-    tokens = [3 + 977 * i % int(w.meta["full"].vocab) for i in range(4)]
-    streams = rand_streams(4, seed=91)
-    lx = mtp.mtp_forward(wx, stx, bx, tokens, streams.to(wx.device), last_only=False)[:4].clone()
-    lc = mtp.mtp_forward(w, st, b, tokens, streams, last_only=False)[:4].clone()
-    r = rel(lx, lc)
-    dx = mtp.mtp_forward(wx, stx, bx, tokens[:1], streams[:1].to(wx.device), last_only=True).clone()
-    dc = mtp.mtp_forward(w, st, b, tokens[:1], streams[:1], last_only=True).clone()
-    rd = rel(dx, dc)
-    tok_x = mtp.sample_draft(dx, 4, None, wx.draft_ids)[0]
-    tok_c = mtp.sample_draft(dc, 4, None, w.draft_ids)[0]
-    vram = torch.xpu.max_memory_allocated(dev) / 1048576.0
-    print(f"real-ckpt mtp smoke: full-head rel {r:.2e} draft rel {rd:.2e} draft token equal: {tok_x == tok_c} "
-          f"peak RSS {rss:.1f} GiB peak VRAM {vram:.0f} MiB")
-    assert r < REL and torch.equal(lx.argmax(-1).cpu(), lc.argmax(-1).cpu())
-    assert rd < REL and tok_x == tok_c
-    del wx, bx, stx, w, st, b
-    gc.collect()
-    torch.xpu.empty_cache()
+    wx = None
+    try:
+        assert w.mtp is not None and w.draft_head is not None
+        assert isinstance(w.draft_head, qmm.Q4) and w.draft_head.gs == 32
+        assert w.draft_head.n == int(w.draft_ids.shape[0]) > 0
+        assert [l.index for l in w.layers] == [0]
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576.0
+        torch.xpu.reset_peak_memory_stats(dev)
+        wx = _moved(w, dev)
+        st, b = State(w, CAPACITY, ROWS), bufs(w)
+        stx, bx = State(wx, CAPACITY, ROWS), bufs(wx)
+        tokens = [3 + 977 * i % int(w.meta["full"].vocab) for i in range(4)]
+        streams = rand_streams(4, seed=91)
+        lx = mtp.mtp_forward(wx, stx, bx, tokens, streams.to(wx.device), last_only=False)[:4].clone()
+        lc = mtp.mtp_forward(w, st, b, tokens, streams, last_only=False)[:4].clone()
+        r = rel(lx, lc)
+        dx = mtp.mtp_forward(wx, stx, bx, tokens[:1], streams[:1].to(wx.device), last_only=True).clone()
+        dc = mtp.mtp_forward(w, st, b, tokens[:1], streams[:1], last_only=True).clone()
+        rd = rel(dx, dc)
+        tok_x = mtp.sample_draft(dx, 4, None, wx.draft_ids)[0]
+        tok_c = mtp.sample_draft(dc, 4, None, w.draft_ids)[0]
+        vram = torch.xpu.max_memory_allocated(dev) / 1048576.0
+        print(f"real-ckpt mtp smoke: full-head rel {r:.2e} draft rel {rd:.2e} draft token equal: {tok_x == tok_c} "
+              f"peak RSS {rss:.1f} GiB peak VRAM {vram:.0f} MiB")
+        assert r < REL and torch.equal(lx.argmax(-1).cpu(), lc.argmax(-1).cpu())
+        assert rd < REL and tok_x == tok_c
+    finally:
+        # release the card borrow before the module teardown runs its own empty_cache
+        wx = None
+        gc.collect()
+        if torch.xpu.is_initialized():
+            torch.xpu.empty_cache()
+            torch.xpu.reset_peak_memory_stats(dev)
