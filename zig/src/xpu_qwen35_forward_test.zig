@@ -254,13 +254,16 @@ fn gateB(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, refdir: []cons
 
 // ---- Measurement (gate letter "m"; not a gate) ----------------------------------------------------------------------
 
-fn measure(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, capdir: []const u8) !void {
+fn measure(s: *rt.session.Session, m: *fwd.Model, _: *fwd.Scratch, capdir: []const u8) !void {
     const ids_bytes = try readFile("{s}/ids.u32", .{capdir});
     defer gpa.free(ids_bytes);
     const ids = try gpa.alloc(u32, ids_bytes.len / 4);
     defer gpa.free(ids);
     @memcpy(std.mem.sliceAsBytes(ids), ids_bytes);
     m.kernels.describe();
+    var sc_own = try fwd.Scratch.init(s, ids.len, capacity, ids.len);
+    defer sc_own.deinit();
+    const sc = &sc_own;
     const row = try gpa.alloc(u16, cfg.vocab);
     defer gpa.free(row);
     // teacher-forced prefill: best and median of 5 after one warm-up
