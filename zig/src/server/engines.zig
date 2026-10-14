@@ -15,6 +15,12 @@ pub const std_options: std.Options = @import("std_options.zig").of(native);
 
 /// What ``capabilities --json`` reports: this release, the chip here, and what the built-in backend serves.
 pub fn capabilities(a: Allocator) cli.Engines {
+    if (@hasDecl(native, "devices")) {
+        const found = native.devices(a);
+        const list = a.alloc(cli.Device, found.len) catch return .{ .version = @import("build_options").version };
+        for (found, list) |d, *o| o.* = .{ .name = d.name, .bdf = d.bdf };
+        return .{ .version = @import("build_options").version, .chip = if (found.len > 0) native.chip(a) else null, .backends = if (found.len > 0) native.backends else &.{}, .families = if (found.len > 0) native.families else &.{}, .devices = list };
+    }
     return .{ .version = @import("build_options").version, .chip = if (native.families.len > 0) native.chip(a) else null, .backends = native.backends, .families = native.families };
 }
 

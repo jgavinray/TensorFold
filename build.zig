@@ -166,7 +166,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_mod })).step);
     }
     hip_build.steps(b, target, test_step);
-    @import("zig/build/xpu.zig").steps(b, target, test_step);
+    @import("zig/build/xpu.zig").steps(b, target, test_step, build_options);
     exlr8_build.hostTests(b, target, test_step);
     const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
     const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{

@@ -21,7 +21,7 @@ pub const Flag = struct {
     native_values: ?[]const []const u8 = null,
 };
 
-const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else if (served("--backend=rocm")) &.{ "auto", "rocm" } else &.{ "auto", "cuda" };
+const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else if (served("--backend=rocm")) &.{ "auto", "rocm" } else if (served("--backend=xpu")) &.{ "auto", "xpu" } else &.{ "auto", "cuda" };
 
 /// The flags past the common ones the binary's backend serves, from its root's `serves` (test roots: none).
 const native_serves: []const []const u8 = if (@hasDecl(@import("root"), "serves")) @import("root").serves else &.{};
@@ -92,7 +92,7 @@ pub const flags = [_]Flag{
     .{ .name = "--ssd-experts" },
     .{ .name = "--ple-on-ssd", .kind = .store_true },
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
-    .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "rocm" }, .native = true, .native_values = backend_values },
+    .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "rocm", "xpu" }, .native = true, .native_values = backend_values },
     .{ .name = "--tp", .choices = &.{ "1", "2", "4", "8" }, .native = served("--tp") },
     .{ .name = "--rank", .native = served("--tp") },
     .{ .name = "--master", .native = served("--tp") },
@@ -377,7 +377,11 @@ pub const Engines = struct {
     backends: []const []const u8 = &.{},
     /// model_type to the weight formats it reads, as gate entries name them.
     families: []const api.Family = &.{},
+    /// The cards the backend can use (name and PCI address); listed when non-empty.
+    devices: []const Device = &.{},
 };
+
+pub const Device = struct { name: []const u8, bdf: []const u8 };
 
 /// The native capabilities document: the table's native flags and the honoured variables.
 pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
@@ -385,7 +389,13 @@ pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
     if (e.chip) |c| try w.print("\"{s}\"", .{c}) else try w.writeAll("null");
     try w.writeAll(", \"backends\": [");
     for (e.backends, 0..) |b, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", b });
-    try w.writeAll("], \"families\": {");
+    try w.writeAll("], ");
+    if (e.devices.len > 0) {
+        try w.writeAll("\"devices\": [");
+        for (e.devices, 0..) |d, i| try w.print("{s}{{\"name\": \"{s}\", \"pci\": \"{s}\"}}", .{ if (i > 0) ", " else "", d.name, d.bdf });
+        try w.writeAll("], ");
+    }
+    try w.writeAll("\"families\": {");
     for (e.families, 0..) |f, i| {
         try w.print("{s}\"{s}\": [", .{ if (i > 0) ", " else "", f.model_type });
         for (f.formats, 0..) |fmt, j| try w.print("{s}\"{s}\"", .{ if (j > 0) ", " else "", fmt });
