@@ -3,6 +3,9 @@
 
 const std = @import("std");
 
+/// Modules with an accepted port under zig/kernels/xpu/qwen3_5/ports/.
+const port_keys = [_][]const u8{ "layout", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_post", "attn_merge" };
+
 /// xpu-host-test (part of `test`), xpu-test (build + run on the card), xpu-gpu-build, xpu-kernel-exact (CLI install).
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step) void {
     const fixtures = b.addOptions();
@@ -70,6 +73,19 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
         const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
         qk.addOptionPath(name, out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
     }
+    // Accepted optimized ports (ports/<key>/<key>.cl): option "<key>_port". Adding one = drop the files, add the key here
+    // and the .port arm in zig/src/families/qwen3_5/xpu_geometry.zig.
+    inline for (port_keys) |name| {
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
+        c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/ports/" ++ name ++ "/" ++ name ++ ".cl"));
+        c.addArg("-out_dir");
+        const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-port-out");
+        qk.addOptionPath(name ++ "_port", out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+    }
+    const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
+    const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
+    test_step.dependOn(&geo_run.step);
+    b.step("xpu-qwen35-geometry-test", "Launch geometry table vs launch.py values (no GPU)").dependOn(&geo_run.step);
     const f_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen35_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
     f_module.addOptions("xpu_qwen35_kernels", qk);
     const f_exe = b.addExecutable(.{ .name = "tf-xpu-qwen35-forward-test", .root_module = f_module });

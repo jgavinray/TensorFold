@@ -252,6 +252,74 @@ fn gateB(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, refdir: []cons
     return all_ok;
 }
 
+// ---- Measurement (gate letter "m"; not a gate) ----------------------------------------------------------------------
+
+fn measure(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, capdir: []const u8) !void {
+    const ids_bytes = try readFile("{s}/ids.u32", .{capdir});
+    defer gpa.free(ids_bytes);
+    const ids = try gpa.alloc(u32, ids_bytes.len / 4);
+    defer gpa.free(ids);
+    @memcpy(std.mem.sliceAsBytes(ids), ids_bytes);
+    m.kernels.describe();
+    const row = try gpa.alloc(u16, cfg.vocab);
+    defer gpa.free(row);
+    // teacher-forced prefill: best and median of 5 after one warm-up
+    var pf: [5]u64 = undefined;
+    for (0..6) |i| {
+        var cache = try xs.Cache.init(s, capacity);
+        defer cache.deinit();
+        const t0 = sys.nowNs();
+        try fwd.run(s, m, sc, &cache, ids, .{ .head = .all });
+        if (i > 0) pf[i - 1] = sys.nowNs() - t0;
+    }
+    std.mem.sort(u64, &pf, {}, std.sort.asc(u64));
+    std.debug.print("MEASURE prefill {d} tokens (teacher-forced, head=all): median {d:.1} ms -> {d:.1} tokens/s (best {d:.1} ms -> {d:.1} tokens/s)\n", .{
+        ids.len, @as(f64, @floatFromInt(pf[2])) / 1e6, @as(f64, @floatFromInt(ids.len)) / secs(pf[2]), @as(f64, @floatFromInt(pf[0])) / 1e6, @as(f64, @floatFromInt(ids.len)) / secs(pf[0]),
+    });
+    // decode: greedy, 3 warm-up + 80 timed steps, then one profiled step
+    var cache = try xs.Cache.init(s, capacity);
+    defer cache.deinit();
+    try fwd.run(s, m, sc, &cache, ids, .{});
+    var steps: std.ArrayList(u64) = .empty;
+    defer steps.deinit(gpa);
+    var next: [1]u32 = undefined;
+    for (0..83) |i| {
+        try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+        next[0] = @intCast(top2(row).first);
+        const t1 = sys.nowNs();
+        try fwd.run(s, m, sc, &cache, &next, .{});
+        if (i >= 3) try steps.append(gpa, sys.nowNs() - t1);
+    }
+    std.mem.sort(u64, steps.items, {}, std.sort.asc(u64));
+    var sum: u64 = 0;
+    for (steps.items) |x| sum += x;
+    std.debug.print("MEASURE decode step (context ~{d}): {d} steps, median {d:.2} ms, mean {d:.2} ms, min {d:.2} ms -> {d:.2} tokens/s (median)\n", .{
+        ids.len, steps.items.len, @as(f64, @floatFromInt(steps.items[steps.items.len / 2])) / 1e6, @as(f64, @floatFromInt(sum)) / 1e6 / @as(f64, @floatFromInt(steps.items.len)), @as(f64, @floatFromInt(steps.items[0])) / 1e6, 1e9 / @as(f64, @floatFromInt(steps.items[steps.items.len / 2])),
+    });
+    // per-kernel device time of one decode step, mean of 5 profiled steps
+    var prof = try fwd.Profile.init(s, gpa, 4096);
+    defer prof.deinit(gpa);
+    sc.prof = prof;
+    defer sc.prof = null;
+    const reps = 5;
+    for (0..reps) |_| {
+        try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+        next[0] = @intCast(top2(row).first);
+        try fwd.run(s, m, sc, &cache, &next, .{});
+        try sc.prof.?.collect();
+    }
+    var total: f64 = 0;
+    for (sc.prof.?.ns) |x| total += x / reps;
+    std.debug.print("MEASURE per-kernel device time, one decode step (mean of {d}), total {d:.3} ms\n", .{ reps, total / 1e6 });
+    for (fwd.kernel_ids) |id| {
+        const i = @intFromEnum(id);
+        if (sc.prof.?.count[i] == 0) continue;
+        std.debug.print("KERNEL {s:<15} {s:<9} launches {d:>4}  {d:>9.1} us  {d:>5.1}%\n", .{
+            @tagName(id), @tagName(m.kernels.variantOf(id)), sc.prof.?.count[i] / reps, sc.prof.?.ns[i] / reps / 1e3, 100.0 * sc.prof.?.ns[i] / reps / total,
+        });
+    }
+}
+
 // ---- Gate C -------------------------------------------------------------------------------------------------------
 
 fn intList(v: std.json.Value, out: *std.ArrayList(u32)) !void {
@@ -378,5 +446,6 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("GATE C greedy 32 tokens: {s}\n", .{if (r) "PASS" else "FAIL"});
         ok = ok and r;
     }
+    if (std.mem.indexOfScalar(u8, gates, 'm') != null) measure(&s, &m, &sc, capdir) catch |e| std.debug.print("measure error: {s}\n", .{@errorName(e)});
     return if (ok) 0 else 1;
 }
