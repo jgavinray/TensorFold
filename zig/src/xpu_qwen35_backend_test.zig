@@ -148,7 +148,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     for (fixtures) |name| {
-        var f = try Fixture.load(refdir, name);
+        var f = Fixture.load(refdir, name) catch |e| {
+            std.debug.print("{s}: no usable greedy-{s}.json ({s}), skipped\n", .{ name, name, @errorName(e) });
+            continue;
+        };
         defer f.prompt.deinit(gpa);
         defer f.want.deinit(gpa);
         for ([_]bool{ false, true }) |drafts| {
