@@ -118,3 +118,10 @@ pub fn nowNs() u64 {
     _ = clock_gettime(1, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
+
+extern "c" fn system(cmd: [*:0]const u8) c_int;
+/// Runs a shell command; returns its exit status (or -1).
+pub fn shell(cmd: [*:0]const u8) c_int {
+    const rc = system(cmd);
+    return if (rc < 0) -1 else (rc >> 8) & 0xff;
+}
