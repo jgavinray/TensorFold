@@ -41,8 +41,11 @@ pub fn gdnPost(v: Variant, rows: u32, heads: u32) Geo {
         .port => .{ .gx = 32, .gy = heads, .gz = rows, .lx = 32 },
     };
 }
-pub fn gdnChain(_: Variant, linear_dim: u32, heads: u32) Geo {
-    return .{ .gx = linear_dim, .gy = heads, .lx = 64 };
+pub fn gdnChain(v: Variant, linear_dim: u32, heads: u32) Geo {
+    return switch (v) {
+        .reference => .{ .gx = linear_dim, .gy = heads, .lx = 64 },
+        .port => .{ .gx = 16 * heads * linear_dim, .lx = 128 },
+    };
 }
 pub fn attnMerge(v: Variant, rows: u32, qheads: u32) Geo {
     return switch (v) {
@@ -81,6 +84,9 @@ test "geometry matches launch.py (reference and ports)" {
     try expect(attnMerge(.reference, 4, 8), 256, 8, 4, 256);
     try expect(attnMerge(.port, 4, 8), 32, 8, 4, 32);
     try expect(gdnPre(.port, 4, 48), 128, 48, 4, 128);
+    // gdn_chain: reference (Dk, Hv)/(64,1); port (16*Hv*Dk)/(128) - one 16-lane sub-group per state row
+    try expect(gdnChain(.reference, 128, 16), 128, 16, 1, 64);
+    try expect(gdnChain(.port, 128, 16), 16 * 16 * 128, 1, 1, 128);
     try expect(normNores(.port, 7), 128, 7, 1, 128);
     try expect(layout(.port, .head_norm, 16), 1024, 1, 1, 64);
     try expect(layout(.port, .keys, 3), 256, 2, 3, 256);

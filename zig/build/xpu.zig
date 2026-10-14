@@ -4,7 +4,7 @@
 const std = @import("std");
 
 /// Modules with an accepted port under zig/kernels/xpu/qwen3_5/ports/.
-const port_keys = [_][]const u8{ "layout", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_post", "attn_merge" };
+const port_keys = [_][]const u8{ "layout", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_merge" };
 
 /// xpu-host-test (part of `test`), xpu-test (build + run on the card), xpu-gpu-build, xpu-kernel-exact (CLI install).
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step) void {
