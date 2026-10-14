@@ -66,7 +66,7 @@ fn rmsFloor(ref: []const f32) f64 {
     return @sqrt(sq / @as(f64, @floatFromInt(ref.len)));
 }
 
-fn compareF32(name: []const u8, got: []const f32, ref: []const f32) f64 {
+fn compareF32(name: []const u8, got: []const f32, ref: []const f32, floor_of: []const f32) f64 {
     var sq: f64 = 0;
     var mx: f64 = 0;
     var rs: f64 = 0;
@@ -78,7 +78,7 @@ fn compareF32(name: []const u8, got: []const f32, ref: []const f32) f64 {
     }
     const n: f64 = @floatFromInt(got.len);
     const rms = @sqrt(sq / n);
-    const floor = rmsFloor(ref);
+    const floor = rmsFloor(floor_of);
     std.debug.print("  {s}: rms diff {d:.6}, max abs diff {d:.4}, ref rms {d:.4}, bf16 floor rms {d:.6}, ratio {d:.2}x\n", .{ name, rms, mx, @sqrt(rs / n), floor, rms / floor });
     return rms / floor;
 }
@@ -116,25 +116,33 @@ fn gateA(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, capdir: []cons
         o.* = rbf(bf(a) + bf(b));
         hh.* = bf(a);
     }
-    const ref_out = try loadF32(capdir, "l0_out", rows * cfg.hidden);
-    defer gpa.free(ref_out);
-    const ref_h = try loadF32(capdir, "l0_h", rows * cfg.hidden);
-    defer gpa.free(ref_h);
     const xr = try downloadBf16(s, &sc.x, rows * cfg.hidden);
     defer gpa.free(xr);
     const xf = try gpa.alloc(f32, rows * cfg.hidden);
     defer gpa.free(xf);
     for (xf, xr) |*o, a| o.* = bf(a);
-    const ref_ln2 = try loadF32(capdir, "l0_ln2", rows * cfg.hidden);
-    defer gpa.free(ref_ln2);
-    _ = compareF32("layer-0 ln2 (post-attention norm output)", xf, ref_ln2);
-    _ = compareF32("layer-0 h (after mixer+residual) vs fp32 capture", hf, ref_h);
-    const ratio = compareF32("layer-0 output vs fp32 capture", out, ref_out);
-    const pre = compareF32("  rows 0..159 only", out[0 .. 160 * cfg.hidden], ref_out[0 .. 160 * cfg.hidden]);
-    const win = compareF32("  rows 160..175 only", out[160 * cfg.hidden ..], ref_out[160 * cfg.hidden ..]);
-    _ = pre;
-    _ = win;
-    return ratio <= 2.0;
+    const stages = [_]struct { name: []const u8, key: []const u8, mirror: []const u8, got: []const f32 }{
+        .{ .name = "ln2", .key = "l0_ln2", .mirror = "mirror_l0_ln2", .got = xf },
+        .{ .name = "h", .key = "l0_h", .mirror = "mirror_l0_h", .got = hf },
+        .{ .name = "layer output", .key = "l0_out", .mirror = "mirror_l0_out", .got = out },
+    };
+    // Three numbers per stage, each as rms diff over the bf16 rounding floor of the reference side:
+    //  (1) XPU vs the fp64 mirror of the Metal arithmetic (zig/tests/qwen35_layer0_mirror.py) - the gate, must be <= 2x; the floor in all three rows is the fp32 capture's
+    //  (2) the mirror vs the MLX fp32 capture - what any kernel chain with Metal's bf16 rounding points can reach
+    //  (3) XPU vs the MLX fp32 capture
+    var gate_ok = true;
+    for (stages) |st| {
+        const cap_ref = try loadF32(capdir, st.key, rows * cfg.hidden);
+        defer gpa.free(cap_ref);
+        const mir = try loadF32(capdir, st.mirror, rows * cfg.hidden);
+        defer gpa.free(mir);
+        std.debug.print("stage {s}:\n", .{st.name});
+        const one = compareF32("(1) XPU vs Metal mirror", st.got, mir, cap_ref);
+        _ = compareF32("(2) Metal mirror vs fp32 capture", mir, cap_ref, cap_ref);
+        _ = compareF32("(3) XPU vs fp32 capture", st.got, cap_ref, cap_ref);
+        if (one > 2.0) gate_ok = false;
+    }
+    return gate_ok;
 }
 
 // ---- Gate B -------------------------------------------------------------------------------------------------------
@@ -346,7 +354,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("gate A error: {s}\n", .{@errorName(e)});
             break :blk false;
         };
-        std.debug.print("GATE A layer-0 vs fp32 capture: {s}\n", .{if (r) "PASS" else "FAIL"});
+        std.debug.print("GATE A layer-0 XPU vs fp64 Metal mirror (<= 2x floor): {s}\n", .{if (r) "PASS" else "FAIL"});
         ok = ok and r;
     }
     if (std.mem.indexOfScalar(u8, gates, 'b') != null) {
