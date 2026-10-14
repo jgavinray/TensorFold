@@ -52,4 +52,12 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const cli = b.addExecutable(.{ .name = "tf-xpu-kernel-exact", .root_module = cli_module });
     const install = b.addInstallArtifact(cli, .{});
     b.step("xpu-kernel-exact", "Build tf-xpu-kernel-exact, the generic on-card kernel gate runner").dependOn(&install.step);
+
+    // Phase 4.1-4.2: Qwen3.5-2B weights and state on the card (opt-in, needs a card and the checkpoint).
+    const q_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen35_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    const q_exe = b.addExecutable(.{ .name = "tf-xpu-qwen35-test", .root_module = q_module });
+    const q_install = b.addInstallArtifact(q_exe, .{});
+    const q_run = b.addRunArtifact(q_exe);
+    q_run.step.dependOn(&q_install.step);
+    b.step("xpu-qwen35-test", "Build and run tf-xpu-qwen35-test: Qwen3.5-2B weights + state gates on a B70 (opt-in)").dependOn(&q_run.step);
 }
