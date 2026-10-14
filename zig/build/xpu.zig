@@ -60,4 +60,21 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const q_run = b.addRunArtifact(q_exe);
     q_run.step.dependOn(&q_install.step);
     b.step("xpu-qwen35-test", "Build and run tf-xpu-qwen35-test: Qwen3.5-2B weights + state gates on a B70 (opt-in)").dependOn(&q_run.step);
+
+    // Phase 4.3: Qwen3.5-2B forward pass (reference OpenCL kernels, ocloc-compiled) with gates A-C (opt-in, needs a card).
+    const qk = b.addOptions();
+    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
+        c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/reference/" ++ name ++ "/" ++ name ++ ".cl"));
+        c.addArg("-out_dir");
+        const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
+        qk.addOptionPath(name, out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+    }
+    const f_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen35_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    f_module.addOptions("xpu_qwen35_kernels", qk);
+    const f_exe = b.addExecutable(.{ .name = "tf-xpu-qwen35-forward-test", .root_module = f_module });
+    const f_install = b.addInstallArtifact(f_exe, .{});
+    const f_run = b.addRunArtifact(f_exe);
+    f_run.step.dependOn(&f_install.step);
+    b.step("xpu-qwen35-forward-test", "Build and run tf-xpu-qwen35-forward-test: Qwen3.5-2B forward gates A-C on a B70 (opt-in)").dependOn(&f_run.step);
 }
