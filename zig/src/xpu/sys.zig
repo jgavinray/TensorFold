@@ -72,3 +72,49 @@ pub fn zfmt(buf: []u8, comptime fmt: []const u8, args: anytype) ?[:0]u8 {
     buf[s.len] = 0;
     return buf[0..s.len :0];
 }
+
+extern "c" fn lseek(fd: c_int, off: c_long, whence: c_int) c_long;
+
+/// Whole file into a fresh allocation (caller frees); null when it cannot be read.
+pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ?[]u8 {
+    const fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return null;
+    defer _ = close(fd);
+    const size = lseek(fd, 0, 2);
+    if (size < 0 or @as(usize, @intCast(size)) > max) return null;
+    _ = lseek(fd, 0, 0);
+    const buf = gpa.alloc(u8, @intCast(size)) catch return null;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got = read(fd, buf.ptr + n, buf.len - n);
+        if (got <= 0) break;
+        n += @intCast(got);
+    }
+    if (n != buf.len) {
+        gpa.free(buf);
+        return null;
+    }
+    return buf;
+}
+
+pub fn writeFile(path: [*:0]const u8, bytes: []const u8) bool {
+    const fd = open(path, O_WRONLY | O_CREAT | 0o1000, @as(c_uint, 0o644)); // O_TRUNC
+    if (fd < 0) return false;
+    defer _ = close(fd);
+    var n: usize = 0;
+    while (n < bytes.len) {
+        const put = write(fd, bytes.ptr + n, bytes.len - n);
+        if (put <= 0) return false;
+        n += @intCast(put);
+    }
+    return true;
+}
+
+const Timespec = extern struct { sec: c_long, nsec: c_long };
+extern "c" fn clock_gettime(clk: c_int, ts: *Timespec) c_int;
+/// CLOCK_MONOTONIC in nanoseconds (host-side wall time for transfer rates; kernel timing uses event timestamps).
+pub fn nowNs() u64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(1, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}

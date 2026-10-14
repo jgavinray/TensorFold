@@ -41,10 +41,11 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
 
     const gpu_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/runtime_tests.zig"), .target = target, .link_libc = true });
     gpu_module.addOptions("xpu_kernels", kernels);
-    const gpu_test = b.addTest(.{ .root_module = gpu_module });
-    b.step("xpu-gpu-build", "Compile the Level Zero on-card tests without running them").dependOn(&gpu_test.step);
-    // The test runner is told which tests to run through the usual `--test-filter`-less default: all of them.
+    const gpu_test = b.addTest(.{ .name = "tf-xpu-test", .root_module = gpu_module });
+    const install_gpu = b.addInstallArtifact(gpu_test, .{});
+    b.step("xpu-gpu-build", "Build zig-out/bin/tf-xpu-test (the on-card tests) without running them").dependOn(&install_gpu.step);
     const run_gpu = b.addRunArtifact(gpu_test);
+    run_gpu.step.dependOn(&install_gpu.step);
     b.step("xpu-test", "Level Zero runtime on the B70s: copies, in-order regression, DPAS probe (opt-in, needs the cards)").dependOn(&run_gpu.step);
 
     const cli_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/kernel_exact.zig"), .target = target, .link_libc = true });

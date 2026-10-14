@@ -39,6 +39,11 @@ pub fn tryCard(dir: []const u8, index: usize) Error!?Held {
 
 /// Takes the first free card (the preferred one first when given), polling every 200 ms until `wait_ms` elapses.
 pub fn acquire(dir: []const u8, prefer: ?usize, wait_ms: u64) Error!Held {
+    return acquireOf(dir, prefer, null, wait_ms);
+}
+
+/// As `acquire`, but when `only` is set that one card is the whole pool.
+pub fn acquireOf(dir: []const u8, prefer: ?usize, only: ?usize, wait_ms: u64) Error!Held {
     var dirz: [256:0]u8 = undefined;
     if (dir.len >= dirz.len) return error.Invalid;
     @memcpy(dirz[0..dir.len], dir);
@@ -50,6 +55,7 @@ pub fn acquire(dir: []const u8, prefer: ?usize, wait_ms: u64) Error!Held {
         for (&order, 0..) |*o, i| o.* = i;
         if (prefer) |p| std.mem.swap(usize, &order[0], &order[p]);
         for (order) |i| {
+            if (only) |o| if (i != o) continue;
             if (try tryCard(dir, i)) |held| {
                 var buf: [32]u8 = undefined;
                 held.file.setContents(std.fmt.bufPrint(&buf, "{d} zig-xpu\n", .{sys.pid()}) catch "");

@@ -11,6 +11,8 @@ pub const Options = struct {
     lock_dir: []const u8 = lock.default_dir,
     /// Index into device.cards, tried first.
     prefer: ?usize = null,
+    /// Index into device.cards: use exactly this card (waits for it) instead of any free one.
+    only: ?usize = null,
     wait_ms: u64 = 3_600_000,
     loader: []const u8 = runtime.loader_name,
     paths: preflight.Paths = .{},
@@ -28,7 +30,7 @@ pub const Session = struct {
 
     pub fn open(self: *Session, opts: Options) OpenError!void {
         self.diag = .{};
-        self.held = try lock.acquire(opts.lock_dir, opts.prefer, opts.wait_ms);
+        self.held = try lock.acquireOf(opts.lock_dir, opts.prefer, opts.only, opts.wait_ms);
         errdefer self.held.release();
         try preflight.check(opts.paths, self.held.bdf(), &self.diag);
         self.rt = try runtime.Runtime.openPath(opts.loader);
