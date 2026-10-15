@@ -143,7 +143,7 @@ pub const Args = struct {
     top_p: ?f64 = null,
     top_k: ?i64 = null,
     min_p: ?f64 = null,
-    thinking: bool = true,
+    thinking: ?bool = null, // --thinking / --no-thinking; null: the backend's default (else the chat template's own)
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
     loop_guard: bool = false,
@@ -428,7 +428,7 @@ test "parse and capabilities share the table" {
     const args = try parse(a, &.{ "/models/x", "--port", "9000", "--api-key=k1", "--api-key", "k2", "--no-thinking", "--reasoning-effort", "low" }, &u);
     try std.testing.expectEqual(@as(u16, 9000), args.port);
     try std.testing.expectEqual(@as(usize, 2), args.api_key.len);
-    try std.testing.expect(!args.thinking);
+    try std.testing.expectEqual(@as(?bool, false), args.thinking);
     try std.testing.expectEqualStrings("x", (try parse(a, &.{ "m", "--drafter", "x" }, &u)).drafter.?);
     try std.testing.expectEqual(@as(u8, 0), (try parse(a, &.{ "m", "--drafter-bits", "0" }, &u)).drafter_bits);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-bits", "8" }, &u));

@@ -4,6 +4,7 @@ const api = @import("engine_api");
 const json = @import("json.zig");
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
+const engines = @import("engines.zig");
 const log = @import("log.zig");
 const live = @import("live.zig");
 const listener_mod = @import("listener.zig");
@@ -109,7 +110,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .model_dir = s.model_dir,
         .model_ids = ids.items,
         .default_max_tokens = args.max_tokens,
-        .enable_thinking = args.thinking,
+        .enable_thinking = args.thinking orelse engines.defaults.enable_thinking orelse true,
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
         .loop_guard = args.loop_guard,
@@ -156,7 +157,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         s.served,                                                   args.host,                                                                                   port,   shownSampling(a, s.sampling),
         if (args.no_drafts or srv.info.plain_only) "off" else "on", if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
-    if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
+    if (config.enable_thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (srv.cortheon) |c| log.line("cortheon on: chat requests get Cortheon's reasoning program, web research before building, and cortheon_search/cortheon_fetch run here ({s}); a request can send \"cortheon\": false", .{c.engine});
     live.columns_env = env(s, "COLUMNS");
