@@ -391,7 +391,7 @@ fn attention(ru: Run, a: xw.Attention, cache: *xs.Attention, len: usize, capacit
     try ru.go(.keys, geo.layout(ru.v(.keys), .keys, T), .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
     const nch: usize = (len + total + 127) / 128;
     const dims = sc.dims([8]i32{ @intCast(len), @intCast(total), @intCast(capacity), @intCast(nch), 0, @intCast(total), 0, 0 });
-    try ru.go(.attn_partial, .{ .gx = 256, .gy = @intCast(nch), .gz = @intCast(c.kv_heads * total), .lx = 256 }, .{
+    try ru.go(.attn_partial, geo.attnPartial(ru.v(.attn_partial), @intCast(nch), T, c.kv_heads), .{
         sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
     });
     try ru.go(.attn_merge, geo.attnMerge(ru.v(.attn_merge), T, c.query_heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, sc.y.ptr });
