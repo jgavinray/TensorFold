@@ -1,7 +1,9 @@
 //! Qwen3.5-2B forward pass on an Intel B70 (Level Zero + OpenCL kernels), mirroring forward.zig's op order and rounding
 //! points (bf16 activations between every op, fp32 recurrence). Kernels are loaded by key from ocloc-compiled modules
-//! (build option `xpu_qwen35_kernels`); a faster port replaces a reference kernel by swapping the module file, either in
-//! zig/kernels/xpu/qwen3_5/ or at run time through the directory named by TF_XPU_QWEN35_KERNELS (<module key>.bin).
+//! (build option `xpu_qwen35_kernels`). Each module has a reference build and, where one was accepted, a port
+//! (<key>_port); a kernel's launch geometry comes with its variant (xpu_geometry.zig). Default: ports where they exist,
+//! reference otherwise; TF_XPU_QWEN35_VARIANT=reference forces all-reference. TF_XPU_QWEN35_KERNELS names a directory of
+//! <module key>.bin files that replaces the built-in modules (the variant still selects the geometry).
 //! One segment per call (prefill rows or a decode row appended to the cache); no snapshot recording (record = false).
 const std = @import("std");
 const rt = @import("../../xpu/runtime.zig");
@@ -10,6 +12,7 @@ const kbins = @import("xpu_qwen35_kernels");
 const xw = @import("xpu_weights.zig");
 const xs = @import("xpu_state.zig");
 const c = @import("config.zig");
+const geo = @import("xpu_geometry.zig");
 
 const Buffer = rt.memory.Buffer;
 const Kernel = rt.module.Kernel;
@@ -20,7 +23,7 @@ extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Module keys (file names under reference/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
-const KernelId = enum {
+pub const KernelId = enum {
     embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
 
     fn module(self: KernelId) Module {
@@ -38,14 +41,30 @@ const KernelId = enum {
 const module_count = std.enums.values(Module).len;
 const kernel_count = std.enums.values(KernelId).len;
 
-fn builtinPath(m: Module) []const u8 {
+pub const Variant = geo.Variant;
+
+/// The module's port exists in this build (zig/build/xpu.zig `port_keys`).
+fn hasPort(comptime m: Module) bool {
+    return @hasDecl(kbins, @tagName(m) ++ "_port");
+}
+
+fn builtinPath(m: Module, v: Variant) []const u8 {
     return switch (m) {
-        inline else => |t| @field(kbins, @tagName(t)),
+        inline else => |t| if (comptime hasPort(t)) (if (v == .port) @field(kbins, @tagName(t) ++ "_port") else @field(kbins, @tagName(t))) else @field(kbins, @tagName(t)),
+    };
+}
+
+/// Variant a module runs as: the port where one is built, unless TF_XPU_QWEN35_VARIANT=reference.
+fn chooseVariant(m: Module, force_reference: bool) Variant {
+    if (force_reference) return .reference;
+    return switch (m) {
+        inline else => |t| if (comptime hasPort(t)) .port else .reference,
     };
 }
 
 pub const Kernels = struct {
     modules: [module_count]rt.module.Module,
+    variant: [module_count]Variant = @splat(.reference),
     loaded: usize = 0,
     list: [kernel_count]Kernel,
     made: usize = 0,
@@ -54,11 +73,13 @@ pub const Kernels = struct {
         self.loaded = 0;
         self.made = 0;
         errdefer self.deinit();
+        const force_ref = if (getenv("TF_XPU_QWEN35_VARIANT")) |v| std.mem.eql(u8, std.mem.span(v), "reference") else false;
         const dir: ?[:0]const u8 = if (getenv("TF_XPU_QWEN35_KERNELS")) |p| std.mem.span(p) else null;
         inline for (std.enums.values(Module), 0..) |mod, i| {
             const fname = @tagName(mod);
+            self.variant[i] = chooseVariant(mod, force_ref);
             var buf: [1024]u8 = undefined;
-            const path = if (dir) |d| sys.zfmt(&buf, "{s}/{s}.bin", .{ d, fname }) else sys.zfmt(&buf, "{s}", .{builtinPath(mod)});
+            const path = if (dir) |d| sys.zfmt(&buf, "{s}/{s}.bin", .{ d, fname }) else sys.zfmt(&buf, "{s}", .{builtinPath(mod, self.variant[i])});
             const bin = sys.readFileAlloc(gpa, path orelse return error.KernelBinaryMissing, 64 << 20) orelse {
                 std.debug.print("cannot read kernel module {s}\n", .{path orelse "?"});
                 return error.KernelBinaryMissing;
@@ -87,10 +108,66 @@ pub const Kernels = struct {
     fn get(self: *Kernels, id: KernelId) *Kernel {
         return &self.list[@intFromEnum(id)];
     }
+    pub fn variantOf(self: *const Kernels, id: KernelId) Variant {
+        return self.variant[@intFromEnum(id.module())];
+    }
+    /// One line per module: which variant is running.
+    pub fn describe(self: *const Kernels) void {
+        std.debug.print("xpu qwen3.5 kernel variants:", .{});
+        inline for (std.enums.values(Module), 0..) |m, i| std.debug.print(" {s}={s}", .{ @tagName(m), @tagName(self.variant[i]) });
+        std.debug.print("\n", .{});
+    }
 };
 
 /// Intermediate buffers (device), plus a small host-visible pool for ids, conv windows and kernel `dims` arrays
 /// (every launch gets its own slot, so the whole forward can be queued before the host waits).
+/// Per-kernel device time of one forward call. Every launch gets its own timestamp event; `collect` reads them after the
+/// call has finished (the queue must be synchronized) and resets them. Copies (conv-state snapshot, logits) are not timed.
+pub const Profile = struct {
+    pool: rt.event.Pool,
+    events: []rt.event.Event,
+    ids: []KernelId,
+    used: usize = 0,
+    ns: [kernel_count]f64 = @splat(0),
+    count: [kernel_count]usize = @splat(0),
+
+    pub fn init(s: *rt.session.Session, gpa: std.mem.Allocator, capacity: u32) !Profile {
+        var pool = try rt.event.Pool.init(&s.ctx, capacity);
+        errdefer pool.deinit();
+        const events = try gpa.alloc(rt.event.Event, capacity);
+        errdefer gpa.free(events);
+        const ids = try gpa.alloc(KernelId, capacity);
+        for (events, 0..) |*e, i| e.* = try pool.event(@intCast(i));
+        return .{ .pool = pool, .events = events, .ids = ids };
+    }
+    pub fn deinit(self: *Profile, gpa: std.mem.Allocator) void {
+        for (self.events) |*e| e.deinit();
+        gpa.free(self.events);
+        gpa.free(self.ids);
+        self.pool.deinit();
+    }
+    fn next(self: *Profile, id: KernelId) ?*const rt.event.Event {
+        if (self.used >= self.events.len) return null;
+        self.ids[self.used] = id;
+        self.used += 1;
+        return &self.events[self.used - 1];
+    }
+    /// Adds the launches since the last call to `ns`/`count` and rearms their events.
+    pub fn collect(self: *Profile) rt.Error!void {
+        for (self.events[0..self.used], self.ids[0..self.used]) |*e, id| {
+            self.ns[@intFromEnum(id)] += try e.kernelNs();
+            self.count[@intFromEnum(id)] += 1;
+            try e.reset();
+        }
+        self.used = 0;
+    }
+    pub fn clear(self: *Profile) void {
+        self.ns = @splat(0);
+        self.count = @splat(0);
+    }
+};
+pub const kernel_ids = std.enums.values(KernelId);
+
 pub const Scratch = struct {
     rows: usize,
     capacity: usize,
@@ -121,6 +198,8 @@ pub const Scratch = struct {
     po: Buffer,
     logits: Buffer,
     conv_snap: Buffer,
+    /// Optional per-kernel device timing (Level Zero event timestamps); see `Profile`.
+    prof: ?Profile = null,
     made: usize = 0,
     dims_used: usize = 0,
 
@@ -135,6 +214,7 @@ pub const Scratch = struct {
         out.logit_rows = logit_rows;
         out.made = 0;
         out.dims_used = 0;
+        out.prof = null;
         errdefer out.deinit();
         const chunks = (capacity + 127) / 128;
         const hid = rows * c.hidden * 2;
@@ -190,24 +270,32 @@ const Run = struct {
     w: *const xw.Weights,
     sc: *Scratch,
 
-    fn go(self: Run, id: KernelId, global: Dim, local: Dim, args: anytype) rt.Error!void {
+    fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
+        const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
+        const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
+        if (self.sc.prof) |*p| {
+            const ev = p.next(id) orelse return error.Invalid;
+            try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, ev);
+            return;
+        }
         try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, null);
+    }
+    fn v(self: Run, id: KernelId) Variant {
+        return self.k.variantOf(id);
     }
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
-        const gx: u32 = @intCast((l.outputs + 63) / 64 * 64);
-        try self.go(.qmm, .{ .x = gx, .y = @intCast(rows) }, .{ .x = 64 }, .{
+        try self.go(.qmm, geo.qmm(self.v(.qmm), @intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
         });
     }
     fn norm(self: Run, h: *anyopaque, residual: ?*anyopaque, weight: xw.Tensor, x: *anyopaque, rows: usize) rt.Error!void {
-        const g: Dim = .{ .x = 128, .y = @intCast(rows) };
         if (residual) |r| {
-            try self.go(.norm, g, .{ .x = 128 }, .{ h, r, self.wp(weight), c.eps, h, x });
+            try self.go(.norm, geo.norm(self.v(.norm), @intCast(rows)), .{ h, r, self.wp(weight), c.eps, h, x });
         } else {
-            try self.go(.norm_nores, g, .{ .x = 128 }, .{ h, self.wp(weight), c.eps, x });
+            try self.go(.norm_nores, geo.normNores(self.v(.norm_nores), @intCast(rows)), .{ h, self.wp(weight), c.eps, x });
         }
     }
 };
@@ -238,7 +326,7 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
     const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc };
     const w = m.weights;
     const T: u32 = @intCast(total);
-    try ru.go(.embed, .{ .x = 1024, .y = T }, .{ .x = 64 }, .{ sc.pool.ptr, w.ptr(w.embedding.weight), w.ptr(w.embedding.scales), w.ptr(w.embedding.biases), sc.h.ptr });
+    try ru.go(.embed, geo.layout(ru.v(.embed), .embed, T), .{ sc.pool.ptr, w.ptr(w.embedding.weight), w.ptr(w.embedding.scales), w.ptr(w.embedding.biases), sc.h.ptr });
     for (w.blocks, 0..) |block, i| {
         try ru.norm(sc.h.ptr.?, if (i == 0) null else sc.r.ptr, block.input_norm, sc.x.ptr.?, total);
         switch (block.mixer) {
@@ -248,7 +336,7 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
         try ru.norm(sc.h.ptr.?, sc.r.ptr, block.post_norm, sc.x.ptr.?, total);
         try ru.projection(block.gate, sc.x.ptr.?, sc.gate.ptr.?, total);
         try ru.projection(block.up, sc.x.ptr.?, sc.up.ptr.?, total);
-        try ru.go(.mlp_act, .{ .x = c.intermediate, .y = T }, .{ .x = 256 }, .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
+        try ru.go(.mlp_act, geo.mlpAct(ru.v(.mlp_act), T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
         try ru.projection(block.down, sc.act.ptr.?, sc.r.ptr.?, total);
         if (o.stop_after) |n| if (i == n) {
             try s.queue.synchronize();
@@ -275,16 +363,16 @@ fn delta(ru: Run, d: xw.Delta, cache: *xs.Delta, total: usize) rt.Error!void {
     try ru.projection(d.a, sc.x.ptr.?, sc.a.ptr.?, total);
     try ru.projection(d.b, sc.x.ptr.?, sc.b.ptr.?, total);
     const w = ru.w;
-    try ru.go(.gdn_pre, .{ .x = 128, .y = 3 * c.linear_heads, .z = T }, .{ .x = 128 }, .{
+    try ru.go(.gdn_pre, geo.gdnPre(ru.v(.gdn_pre), T, 3 * c.linear_heads), .{
         sc.qkv.ptr, cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows().ptr)), sc.a.ptr, sc.b.ptr, w.ptr(d.a_log), w.ptr(d.dt_bias),
         sc.q.ptr, sc.k.ptr, sc.v.ptr, sc.g.ptr, sc.beta.ptr, sc.conv_snap.ptr,
     });
     // The recurrence is read into registers before it is written, one state row per work-item, so state_in == state_out is safe.
-    try ru.go(.gdn_chain, .{ .x = c.linear_dim, .y = c.linear_heads }, .{ .x = 64 }, .{
+    try ru.go(.gdn_chain, geo.gdnChain(ru.v(.gdn_chain), c.linear_dim, c.linear_heads), .{
         sc.q.ptr, sc.k.ptr, sc.v.ptr, sc.g.ptr, sc.beta.ptr, cache.recurrence.ptr, sc.dims([2]i32{ @intCast(total), 0 }), sc.y.ptr, cache.recurrence.ptr,
     });
     try ru.s.queue.copy(cache.conv.ptr, off(sc.conv_snap, (total - 1) * xs.conv_bytes), xs.conv_bytes, null);
-    try ru.go(.gdn_post, .{ .x = 128, .y = c.linear_heads, .z = T }, .{ .x = 128 }, .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });
+    try ru.go(.gdn_post, geo.gdnPost(ru.v(.gdn_post), T, c.linear_heads), .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });
     try ru.projection(d.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }
 
@@ -296,17 +384,17 @@ fn attention(ru: Run, a: xw.Attention, cache: *xs.Attention, len: usize, capacit
     try ru.projection(a.k, sc.x.ptr.?, sc.k.ptr.?, total);
     try ru.projection(a.v, sc.x.ptr.?, sc.v.ptr.?, total);
     const qn = sc.dims([4]u32{ T, c.query_heads, 2 * c.hidden, 2 * c.head_dim });
-    try ru.go(.head_norm, .{ .x = @intCast(64 * total * c.query_heads) }, .{ .x = 64 }, .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
+    try ru.go(.head_norm, geo.layout(ru.v(.head_norm), .head_norm, @intCast(total * c.query_heads)), .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
     const kn = sc.dims([4]u32{ T, c.kv_heads, c.kv_heads * c.head_dim, c.head_dim });
-    try ru.go(.head_norm, .{ .x = @intCast(64 * total * c.kv_heads) }, .{ .x = 64 }, .{ sc.k.ptr, w.ptr(a.k_norm), sc.knorm.ptr, kn });
-    try ru.go(.queries, .{ .x = c.head_dim, .y = c.query_heads, .z = T }, .{ .x = 256 }, .{ sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(len), T, 0, 0 }) });
-    try ru.go(.keys, .{ .x = c.head_dim, .y = c.kv_heads, .z = T }, .{ .x = 256 }, .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
+    try ru.go(.head_norm, geo.layout(ru.v(.head_norm), .head_norm, @intCast(total * c.kv_heads)), .{ sc.k.ptr, w.ptr(a.k_norm), sc.knorm.ptr, kn });
+    try ru.go(.queries, geo.layout(ru.v(.queries), .queries, T), .{ sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(len), T, 0, 0 }) });
+    try ru.go(.keys, geo.layout(ru.v(.keys), .keys, T), .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
     const nch: usize = (len + total + 127) / 128;
     const dims = sc.dims([8]i32{ @intCast(len), @intCast(total), @intCast(capacity), @intCast(nch), 0, @intCast(total), 0, 0 });
-    try ru.go(.attn_partial, .{ .x = 256, .y = @intCast(nch), .z = @intCast(c.kv_heads * total) }, .{ .x = 256 }, .{
+    try ru.go(.attn_partial, geo.attnPartial(ru.v(.attn_partial), @intCast(nch), T, c.kv_heads), .{
         sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
     });
-    try ru.go(.attn_merge, .{ .x = 256, .y = c.query_heads, .z = T }, .{ .x = 256 }, .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, sc.y.ptr });
-    try ru.go(.attention_gate, .{ .x = c.hidden, .y = T }, .{ .x = 256 }, .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
+    try ru.go(.attn_merge, geo.attnMerge(ru.v(.attn_merge), T, c.query_heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, sc.y.ptr });
+    try ru.go(.attention_gate, geo.layout(ru.v(.attention_gate), .attention_gate, T), .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
     try ru.projection(a.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }

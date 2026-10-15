@@ -1,153 +1,134 @@
-// qwen35_qmm: generic int4-affine matmul (group size 64) for the Intel Arc Pro B70.
+// Qwen3.5-2B int4 matmul (all 7 projection shapes, runtime N x K) for Intel Arc Pro B70.
 //
-//   OUT[r][n] = sum over groups g of ( SC[n][g] * sum_{k in g} q[n][k]*x[r][k]
-//                                     + BI[n][g] * sum_{k in g} x[r][k] )
+//   OUT[r][n] = sum_g ( SC[n][g] * sum_{k in g} q[n][k]*x[r][k] + BI[n][g] * sum_{k in g} x[r][k] )
+//   q[n][k] = (W[n*(K/8) + k/8] >> 4*(k%8)) & 0xF        (unsigned nibble, group size 64)
 //
-// Weights are never rounded: q is exact int4 -> float, SC/BI are bf16 -> float.
-// Activations bf16 -> float, fp32 accumulation, a single round to bf16 at the end.
+// fp32 accumulation throughout; the dequantized weight is never materialized, and the only bf16
+// rounding is the final round-to-nearest-even store. int4 values (0..15) and bf16 activations are
+// exact in fp32, so a plain fma chain sits at the bf16 floor.
 //
-// Split-K geometry. A work-group covers a TILE_M x TILE_N tile of OUT. The 16 lanes of a
-// sub-group share one column strip and split K between them: in step m lane L takes the
-// RUN words at L*RUN + m*SPLIT*RUN, so the lanes sweep the row in strides of SPLIT*RUN.
-// Because a group is GWORDS words and RUN is a multiple of GWORDS, every group belongs to
-// exactly one lane in one step, so SC/BI are applied inside the lane on complete groups.
-// The lanes then sum their already-scaled partials, which is exact: each lane contributes
-// a whole-group term and float addition of whole-group terms is what the reference does.
+// Intel design (no Apple simdgroup features, no DPAS - measured slower for R=1): a work-group of
+// 256 work-items covers 64 output columns of one activation row. Columns come in 8 sets of 8;
+// each work-item owns one column set and walks whole 64-element groups (lane l takes groups l,
+// l+32, ...). Per group the work-item converts its 8 bf16 activations to fp32 ONCE, computes the
+// plain x-sum once, and then runs 8 nibble-by-nibble fma chains - one per column - so the 8 X
+// loads and 8 conversions are amortized over 8 columns of W traffic. W is streamed as uint4. The
+// 32 work-items of a set reduce their per-column partials through a local-memory tree; lane 0
+// rounds each of its 8 columns once to bf16. Tail work-groups clamp W/SC/BI row indices to N-1
+// (reads stay in bounds, dead columns are discarded) and guard the store; work-groups with
+// r >= R exit before the barrier is hit by any live set.
 //
-// The payoff is coalescing: in one step the 16 lanes read a contiguous SPLIT*RUN-word span
-// of the row, so the 254 MB weight stream arrives as wide coalesced blocks instead of one
-// cache line per lane.
+// R = 1 is the bandwidth-critical case: the grid is (ceil(N/64), R) work-groups, i.e. thousands
+// of SIMD16 waves for the big shapes, which hides latency with thread parallelism while W streams
+// at full bandwidth with uint4 loads.
+
 #pragma OPENCL EXTENSION cl_intel_bfloat16_conversions : enable
 
-#define TILE_M 64
-#define TILE_N 32
-#define WG_M 8
-#define WG_N 2
-#define TG_M (TILE_M / WG_M)     // output rows per thread
-#define TG_N (TILE_N / WG_N)     // output cols per thread
-#define GROUP 64
-#define GWORDS (GROUP / 8)       // uint32 words per group (8)
-#define RUN 16                   // weight words per lane (2 complete groups)
-#define SPLIT 16                 // lanes that share one column
+inline float bf16_to_f32(ushort b) { return intel_convert_as_bfloat16_float(b); }
 
-static inline float bf16_to_f32(const ushort h) { return intel_convert_as_bfloat16_float(h); }
+__kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
+                         const int R,
+                         __global const uint* W,     // N x (K/8) uint32, 8 int4 per word
+                         __global const ushort* SC,  // bf16 bits, N x (K/64)
+                         __global const ushort* BI,  // bf16 bits, N x (K/64)
+                         __global ushort* OUT,       // bf16 bits, R x N
+                         const int N, const int K) {
+    const int G = K >> 6;     // groups per row (K is 2048 or 6144, both multiples of 64)
 
-static inline ushort f32_to_bf16(const float f) { return intel_convert_bfloat16_as_ushort(f); }
+    const int tid = get_local_id(0);
+    const int s = tid >> 5;               // column set 0..7 (8 columns each)
+    const int l = tid & 31;               // lane within the set's group stride
+    const int n0 = get_group_id(0) * 64 + s * 8;
+    const int r = get_group_id(1);
 
-// One nibble of a packed word, as an exact small integer float.
-static inline float nib(const uint w, const int e) { return (float)((w >> (4 * e)) & 0xFu); }
+    if (n0 >= N || r >= R) return;        // whole set dead: exit (its lanes hit no barrier)
 
-__attribute__((intel_reqd_sub_group_size(16))) __kernel void qwen35_qmm(
-    __global const ushort *X, const int R, __global const uint *W, __global const ushort *SC,
-    __global const ushort *BI, __global ushort *OUT, const int N, const int K) {
-  const int n0 = (int)get_group_id(0) * TILE_N;
-  const int m0 = (int)get_group_id(1) * TILE_M;
-  const int lid = (int)get_local_id(0);
-  const int sg = lid / SPLIT;      // sub-group id: picks the row strip and column strip
-  const int lane = lid % SPLIT;    // lane within the sub-group: picks the k run
+    const int nl = min(8, N - n0);        // live columns in this set
+    const __global uint4* xv = (const __global uint4*)(X + (size_t)r * K);
 
-  const int ng = K / GROUP;     // groups per output row
-  const int kw = K / 8;         // uint32 words per weight row (8 int4 per word)
-  const int xw_stride = K / 2;  // uint32 words per activation row when X is viewed as uint*
+    float acc[8];
+    acc[0] = acc[1] = acc[2] = acc[3] = acc[4] = acc[5] = acc[6] = acc[7] = 0.0f;
 
-  // Each sub-group handles one (column strip, row strip) pair: WG_M strips of TG_M rows
-  // and WG_N strips of TG_N columns, mapped from the sub-group id.
-  const int tm = sg / WG_N;
-  const int tn = sg % WG_N;
-  const int col = n0 + tn * TG_N;
-  const int row = m0 + tm * TG_M;
+    // Lane l owns whole groups: g = l, l+32, l+64, ...  K/8 and K/16 are multiples of 8/16, so
+    // the uint4 indices stay aligned for every K in the shape set.
+    for (int g = l; g < G; g += 32) {
+        const int xb = 8 * g;             // uint4 index of the group's first activation
+        const int wb = 2 * g;             // uint4 index of the group's first W word
+        float sqx[8];
+        sqx[0] = sqx[1] = sqx[2] = sqx[3] = sqx[4] = sqx[5] = sqx[6] = sqx[7] = 0.0f;
+        float sx = 0.0f;
 
-  int xr[TG_M];
-  for (int i = 0; i < TG_M; i++) {
-    const int r = row + i;
-    xr[i] = r < R ? r : R - 1;
-  }
-
-  float acc[TG_M][TG_N];
-  for (int i = 0; i < TG_M; i++)
-    for (int j = 0; j < TG_N; j++) acc[i][j] = 0.0f;
-
-  // Walk this lane's words for every one of its columns. A lane owns the words at
-  // lane*RUN + m*(SPLIT*RUN) for m = 0, 1, 2, ..., so any K is covered: the SPLIT lanes
-  // sweep the row in strides of SPLIT*RUN words. Consecutive lanes read words RUN apart,
-  // so the sub-group's reads stay contiguous.
-  //
-  // Both loops must have a uniform trip count across the sub-group: sub_group_reduce_add
-  // later requires every lane to reach it from the same control-flow point. So the outer
-  // loop is bounded by a value every lane shares and the inner guard skips, not breaks.
-  const int nsteps = (kw + SPLIT * RUN - 1) / (SPLIT * RUN);
-  for (int m = 0; m < nsteps; m++) {
-    const int kbase = lane * RUN + m * (SPLIT * RUN);
-    for (int t = 0; t < RUN; t++) {
-      const int kword = kbase + t;
-      if (kword >= kw) continue;   // uniform guard: no lane leaves the loop early
-      const int g = kword / GWORDS;   // group of this word (entirely inside this lane)
-      const int xword = kword * 4;    // 8 bf16 = four uint32 of the activation row
-
-      float xa[TG_M][8];
-      float xsum[TG_M];
-      for (int i = 0; i < TG_M; i++) {
-        const __global uint *xrow = (const __global uint *)X + (size_t)xr[i] * xw_stride + xword;
-        const uint4 v = *(__global const uint4 *)xrow;
-        xa[i][0] = bf16_to_f32((ushort)(v.x & 0xFFFFu));
-        xa[i][1] = bf16_to_f32((ushort)(v.x >> 16));
-        xa[i][2] = bf16_to_f32((ushort)(v.y & 0xFFFFu));
-        xa[i][3] = bf16_to_f32((ushort)(v.y >> 16));
-        xa[i][4] = bf16_to_f32((ushort)(v.z & 0xFFFFu));
-        xa[i][5] = bf16_to_f32((ushort)(v.z >> 16));
-        xa[i][6] = bf16_to_f32((ushort)(v.w & 0xFFFFu));
-        xa[i][7] = bf16_to_f32((ushort)(v.w >> 16));
-        xsum[i] =
-            xa[i][0] + xa[i][1] + xa[i][2] + xa[i][3] + xa[i][4] + xa[i][5] + xa[i][6] + xa[i][7];
-      }
-
-      for (int j = 0; j < TG_N; j++) {
-        const uint w = W[(size_t)(col + j) * kw + kword];
-        const size_t idx = (size_t)(col + j) * ng + g;
-        const float sc = bf16_to_f32(SC[idx]);
-        const float bi = bf16_to_f32(BI[idx]);
-        float q[8];
-        q[0] = nib(w, 0);
-        q[1] = nib(w, 1);
-        q[2] = nib(w, 2);
-        q[3] = nib(w, 3);
-        q[4] = nib(w, 4);
-        q[5] = nib(w, 5);
-        q[6] = nib(w, 6);
-        q[7] = nib(w, 7);
-        for (int i = 0; i < TG_M; i++) {
-          const float *xa_i = xa[i];
-          float d = 0.0f;
-          d = fma(q[0], xa_i[0], d);
-          d = fma(q[1], xa_i[1], d);
-          d = fma(q[2], xa_i[2], d);
-          d = fma(q[3], xa_i[3], d);
-          d = fma(q[4], xa_i[4], d);
-          d = fma(q[5], xa_i[5], d);
-          d = fma(q[6], xa_i[6], d);
-          d = fma(q[7], xa_i[7], d);
-          acc[i][j] = fma(sc, d, fma(bi, xsum[i], acc[i][j]));
+        // The group's W words for all 8 columns, fetched once (both loops are unrolled, so all
+        // indices are compile-time constants and these stay in registers).
+        uint4 w0[8], w1[8];
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int nc = min(n0 + i, N - 1); // clamp: dead columns read row N-1, results discarded
+            const __global uint4* wv = (const __global uint4*)(W + (size_t)nc * (K >> 3));
+            w0[i] = wv[wb];
+            w1[i] = wv[wb + 1];
         }
-      }
-    }
-  }
 
-  // Reduce the SPLIT lanes that share a column: each lane contributed whole-group terms
-  // already scaled by SC and BI, so a plain sum is exact. sub_group_reduce_add does this
-  // in registers and needs no local memory, so every lane ends up holding the total.
-  for (int j = 0; j < TG_N; j++) {
-    for (int i = 0; i < TG_M; i++) acc[i][j] = sub_group_reduce_add(acc[i][j]);
-  }
+        // Word-outer: convert the word's 8 bf16 activations once, then apply to all 8 columns.
+        // Word j of the group covers k = 64g + 8j .. 64g + 8j + 7, i.e. x uint4 xb + j.
+        #define QMM_STEP(j, comp)                                                  \
+            {                                                                      \
+                uint4 xj = xv[xb + (j)];                                           \
+                float f0 = bf16_to_f32((ushort)xj.x);                              \
+                float f1 = bf16_to_f32((ushort)(xj.x >> 16));                      \
+                float f2 = bf16_to_f32((ushort)xj.y);                              \
+                float f3 = bf16_to_f32((ushort)(xj.y >> 16));                      \
+                float f4 = bf16_to_f32((ushort)xj.z);                              \
+                float f5 = bf16_to_f32((ushort)(xj.z >> 16));                      \
+                float f6 = bf16_to_f32((ushort)xj.w);                              \
+                float f7 = bf16_to_f32((ushort)(xj.w >> 16));                      \
+                sx += ((f0 + f1) + (f2 + f3)) + ((f4 + f5) + (f6 + f7));           \
+                __attribute__((opencl_unroll_hint))                             \
+                for (int i = 0; i < 8; ++i) {                                      \
+                    float t = ((float)(((comp) >> 28) & 0xFu)) * f7;           \
+                    t = fma((float)(((comp) >> 24) & 0xFu), f6, t);            \
+                    t = fma((float)(((comp) >> 20) & 0xFu), f5, t);            \
+                    t = fma((float)(((comp) >> 16) & 0xFu), f4, t);            \
+                    t = fma((float)(((comp) >> 12) & 0xFu), f3, t);            \
+                    t = fma((float)(((comp) >> 8) & 0xFu), f2, t);             \
+                    t = fma((float)(((comp) >> 4) & 0xFu), f1, t);             \
+                    t = fma((float)((comp) & 0xFu), f0, t);                    \
+                    sqx[i] += t;                                                   \
+                }                                                                  \
+            }
+        QMM_STEP(0, w0[i].x)  // k = 64g +  0.. 7
+        QMM_STEP(1, w0[i].y)  // k = 64g +  8..15
+        QMM_STEP(2, w0[i].z)  // k = 64g + 16..23
+        QMM_STEP(3, w0[i].w)  // k = 64g + 24..31
+        QMM_STEP(4, w1[i].x)  // k = 64g + 32..39
+        QMM_STEP(5, w1[i].y)  // k = 64g + 40..47
+        QMM_STEP(6, w1[i].z)  // k = 64g + 48..55
+        QMM_STEP(7, w1[i].w)  // k = 64g + 56..63
+        #undef QMM_STEP
 
-  if (lane == 0) {
-    for (int j = 0; j < TG_N; j++) {
-      const int n = col + j;
-      if (n >= N) continue;
-      for (int i = 0; i < TG_M; i++) {
-        const int r = row + i;
-        if (r >= R) continue;
-        OUT[(size_t)r * N + n] = f32_to_bf16(acc[i][j]);
-      }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int nc = min(n0 + i, N - 1);
+            const float sc = bf16_to_f32(SC[(size_t)nc * G + g]);
+            const float bi = bf16_to_f32(BI[(size_t)nc * G + g]);
+            acc[i] = fma(bi, sx, fma(sc, sqx[i], acc[i]));
+        }
     }
-  }
+
+    __local float red[8][8][32];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) red[s][i][l] = acc[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    #pragma unroll
+    for (int st = 16; st > 0; st >>= 1) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+            if (l < st) red[s][i][l] += red[s][i][l + st];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (l == 0) {
+        #pragma unroll
+        for (int i = 0; i < nl; ++i)
+            OUT[(size_t)r * N + n0 + i] = intel_convert_bfloat16_as_ushort(red[s][i][0]);
+    }
 }

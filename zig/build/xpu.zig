@@ -4,6 +4,9 @@
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 
+/// Modules with an accepted port under zig/kernels/xpu/qwen3_5/ports/.
+const port_keys = [_][]const u8{ "layout", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" };
+
 /// xpu-host-test (part of `test`), xpu-test (build + run on the card), xpu-gpu-build, xpu-kernel-exact (CLI install).
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step, build_options: *std.Build.Step.Options) void {
     const fixtures = b.addOptions();
@@ -75,6 +78,19 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
         const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
         qk.addOptionPath(name, out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
     }
+    // Accepted optimized ports (ports/<key>/<key>.cl): option "<key>_port". Adding one = drop the files, add the key here
+    // and the .port arm in zig/src/families/qwen3_5/xpu_geometry.zig.
+    inline for (port_keys) |name| {
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
+        c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/ports/" ++ name ++ "/" ++ name ++ ".cl"));
+        c.addArg("-out_dir");
+        const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-port-out");
+        qk.addOptionPath(name ++ "_port", out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+    }
+    const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
+    const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
+    test_step.dependOn(&geo_run.step);
+    b.step("xpu-qwen35-geometry-test", "Launch geometry table vs launch.py values (no GPU)").dependOn(&geo_run.step);
     const f_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen35_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
     f_module.addOptions("xpu_qwen35_kernels", qk);
     f_module.addImport("core", core);
@@ -113,4 +129,19 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     server.root_module.addOptions("build_options", build_options);
     const server_install = b.addInstallArtifact(server, .{ .dest_dir = .{ .override = .{ .custom = "xpu/bin" } } });
     b.step("xpu-native", "tensorfold-native with the Intel XPU engine into zig-out/xpu/bin (serve --backend xpu)").dependOn(&server_install.step);
+    // Phase 6.4: Qwen 3.8 27B weights and state on the card (opt-in, needs a card and the multi-shard checkpoint).
+    const q27_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    const q27_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-test", .root_module = q27_module });
+    const q27_install = b.addInstallArtifact(q27_exe, .{});
+    const q27_run = b.addRunArtifact(q27_exe);
+    q27_run.step.dependOn(&q27_install.step);
+    b.step("xpu-qwen27-test", "Build and run tf-xpu-qwen27-test: Qwen 3.8 27B weights + state gates on a B70 (opt-in)").dependOn(&q27_run.step);
+    b.step("xpu-qwen27-build", "Build zig-out/bin/tf-xpu-qwen27-test without running it").dependOn(&q27_install.step);
+
+    // The 27B pieces' host-side tests (arena packing, state sizes): no card, part of `test`.
+    const q27_host = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_tests.zig"), .target = b.graph.host, .link_libc = true });
+    const q27_tests = b.addTest(.{ .root_module = q27_host });
+    const q27_host_run = b.addRunArtifact(q27_tests);
+    test_step.dependOn(&q27_host_run.step);
+    b.step("xpu-qwen27-host-test", "Host-side tests for the 27B XPU weights and state modules").dependOn(&q27_host_run.step);
 }
