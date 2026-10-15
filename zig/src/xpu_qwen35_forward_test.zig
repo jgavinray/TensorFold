@@ -241,12 +241,17 @@ fn gateB(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, refdir: []cons
         nll /= @floatFromInt(n - 1);
         ref_bf_nll /= @floatFromInt(n - 1);
         const rms = @sqrt(sq / @as(f64, @floatFromInt(n * cfg.vocab)));
-        const nd = @abs(nll - ref_nll);
+        // The XPU head emits bf16 logits, so the like-for-like baseline is MLX's logits rounded to bf16, not its fp32
+        // logits: on the shortest fixture (fibonacci-raw, 13 tokens) MLX's own bf16-rounded logits sit 0.0134 from its
+        // fp32 NLL, i.e. the bf16 rounding floor is already above the 0.01 bar. Comparing bf16 to bf16 isolates the
+        // kernel error (both variants measure <= 0.0073 here); comparing bf16 to fp32 measures the rounding, not the port.
+        const nd = @abs(nll - ref_bf_nll);
+        const nd_fp32 = @abs(nll - ref_nll);
         const ok = agree + ties == n and nd < 0.01;
         all_ok = all_ok and ok;
         std.debug.print("gate B {s}: {d} tokens, forward {d:.3} s ({d:.1} tokens/s teacher-forced)\n", .{ name, n, secs(dt), @as(f64, @floatFromInt(n)) / secs(dt) });
-        std.debug.print("  bf16 ties accepted {d}; top-1 agreement {d}/{d} ({d:.1}%), NLL xpu {d:.6} vs mlx fp32 {d:.6} (mlx logits rounded to bf16: {d:.6}), |NLL diff| {d:.6}, logit rms diff {d:.4}, max abs diff {d:.4}  -> {s}\n", .{
-            ties, agree, n, 100.0 * @as(f64, @floatFromInt(agree)) / @as(f64, @floatFromInt(n)), nll, ref_nll, ref_bf_nll, nd, rms, mx, if (ok) "ok" else "below target",
+        std.debug.print("  bf16 ties accepted {d}; top-1 agreement {d}/{d} ({d:.1}%), NLL xpu {d:.6} vs mlx bf16 {d:.6} (mlx fp32 {d:.6}), |NLL diff| {d:.6} vs bf16 / {d:.6} vs fp32, logit rms diff {d:.4}, max abs diff {d:.4}  -> {s}\n", .{
+            ties, agree, n, 100.0 * @as(f64, @floatFromInt(agree)) / @as(f64, @floatFromInt(n)), nll, ref_bf_nll, ref_nll, nd, nd_fp32, rms, mx, if (ok) "ok" else "below target",
         });
     }
     return all_ok;
