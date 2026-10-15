@@ -241,15 +241,91 @@ fn gateB(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, refdir: []cons
         nll /= @floatFromInt(n - 1);
         ref_bf_nll /= @floatFromInt(n - 1);
         const rms = @sqrt(sq / @as(f64, @floatFromInt(n * cfg.vocab)));
-        const nd = @abs(nll - ref_nll);
+        // The XPU head emits bf16 logits, so the like-for-like baseline is MLX's logits rounded to bf16, not its fp32
+        // logits: on the shortest fixture (fibonacci-raw, 13 tokens) MLX's own bf16-rounded logits sit 0.0134 from its
+        // fp32 NLL, i.e. the bf16 rounding floor is already above the 0.01 bar. Comparing bf16 to bf16 isolates the
+        // kernel error (both variants measure <= 0.0073 here); comparing bf16 to fp32 measures the rounding, not the port.
+        const nd = @abs(nll - ref_bf_nll);
+        const nd_fp32 = @abs(nll - ref_nll);
         const ok = agree + ties == n and nd < 0.01;
         all_ok = all_ok and ok;
         std.debug.print("gate B {s}: {d} tokens, forward {d:.3} s ({d:.1} tokens/s teacher-forced)\n", .{ name, n, secs(dt), @as(f64, @floatFromInt(n)) / secs(dt) });
-        std.debug.print("  bf16 ties accepted {d}; top-1 agreement {d}/{d} ({d:.1}%), NLL xpu {d:.6} vs mlx fp32 {d:.6} (mlx logits rounded to bf16: {d:.6}), |NLL diff| {d:.6}, logit rms diff {d:.4}, max abs diff {d:.4}  -> {s}\n", .{
-            ties, agree, n, 100.0 * @as(f64, @floatFromInt(agree)) / @as(f64, @floatFromInt(n)), nll, ref_nll, ref_bf_nll, nd, rms, mx, if (ok) "ok" else "below target",
+        std.debug.print("  bf16 ties accepted {d}; top-1 agreement {d}/{d} ({d:.1}%), NLL xpu {d:.6} vs mlx bf16 {d:.6} (mlx fp32 {d:.6}), |NLL diff| {d:.6} vs bf16 / {d:.6} vs fp32, logit rms diff {d:.4}, max abs diff {d:.4}  -> {s}\n", .{
+            ties, agree, n, 100.0 * @as(f64, @floatFromInt(agree)) / @as(f64, @floatFromInt(n)), nll, ref_bf_nll, ref_nll, nd, nd_fp32, rms, mx, if (ok) "ok" else "below target",
         });
     }
     return all_ok;
+}
+
+// ---- Measurement (gate letter "m"; not a gate) ----------------------------------------------------------------------
+
+fn measure(s: *rt.session.Session, m: *fwd.Model, _: *fwd.Scratch, capdir: []const u8) !void {
+    const ids_bytes = try readFile("{s}/ids.u32", .{capdir});
+    defer gpa.free(ids_bytes);
+    const ids = try gpa.alloc(u32, ids_bytes.len / 4);
+    defer gpa.free(ids);
+    @memcpy(std.mem.sliceAsBytes(ids), ids_bytes);
+    m.kernels.describe();
+    var sc_own = try fwd.Scratch.init(s, ids.len, capacity, ids.len);
+    defer sc_own.deinit();
+    const sc = &sc_own;
+    const row = try gpa.alloc(u16, cfg.vocab);
+    defer gpa.free(row);
+    // teacher-forced prefill: best and median of 5 after one warm-up
+    var pf: [5]u64 = undefined;
+    for (0..6) |i| {
+        var cache = try xs.Cache.init(s, capacity);
+        defer cache.deinit();
+        const t0 = sys.nowNs();
+        try fwd.run(s, m, sc, &cache, ids, .{ .head = .all });
+        if (i > 0) pf[i - 1] = sys.nowNs() - t0;
+    }
+    std.mem.sort(u64, &pf, {}, std.sort.asc(u64));
+    std.debug.print("MEASURE prefill {d} tokens (teacher-forced, head=all): median {d:.1} ms -> {d:.1} tokens/s (best {d:.1} ms -> {d:.1} tokens/s)\n", .{
+        ids.len, @as(f64, @floatFromInt(pf[2])) / 1e6, @as(f64, @floatFromInt(ids.len)) / secs(pf[2]), @as(f64, @floatFromInt(pf[0])) / 1e6, @as(f64, @floatFromInt(ids.len)) / secs(pf[0]),
+    });
+    // decode: greedy, 3 warm-up + 80 timed steps, then one profiled step
+    var cache = try xs.Cache.init(s, capacity);
+    defer cache.deinit();
+    try fwd.run(s, m, sc, &cache, ids, .{});
+    var steps: std.ArrayList(u64) = .empty;
+    defer steps.deinit(gpa);
+    var next: [1]u32 = undefined;
+    for (0..83) |i| {
+        try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+        next[0] = @intCast(top2(row).first);
+        const t1 = sys.nowNs();
+        try fwd.run(s, m, sc, &cache, &next, .{});
+        if (i >= 3) try steps.append(gpa, sys.nowNs() - t1);
+    }
+    std.mem.sort(u64, steps.items, {}, std.sort.asc(u64));
+    var sum: u64 = 0;
+    for (steps.items) |x| sum += x;
+    std.debug.print("MEASURE decode step (context ~{d}): {d} steps, median {d:.2} ms, mean {d:.2} ms, min {d:.2} ms -> {d:.2} tokens/s (median)\n", .{
+        ids.len, steps.items.len, @as(f64, @floatFromInt(steps.items[steps.items.len / 2])) / 1e6, @as(f64, @floatFromInt(sum)) / 1e6 / @as(f64, @floatFromInt(steps.items.len)), @as(f64, @floatFromInt(steps.items[0])) / 1e6, 1e9 / @as(f64, @floatFromInt(steps.items[steps.items.len / 2])),
+    });
+    // per-kernel device time of one decode step, mean of 5 profiled steps
+    var prof = try fwd.Profile.init(s, gpa, 4096);
+    defer prof.deinit(gpa);
+    sc.prof = prof;
+    defer sc.prof = null;
+    const reps = 5;
+    for (0..reps) |_| {
+        try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+        next[0] = @intCast(top2(row).first);
+        try fwd.run(s, m, sc, &cache, &next, .{});
+        try sc.prof.?.collect();
+    }
+    var total: f64 = 0;
+    for (sc.prof.?.ns) |x| total += x / reps;
+    std.debug.print("MEASURE per-kernel device time, one decode step (mean of {d}), total {d:.3} ms\n", .{ reps, total / 1e6 });
+    for (fwd.kernel_ids) |id| {
+        const i = @intFromEnum(id);
+        if (sc.prof.?.count[i] == 0) continue;
+        std.debug.print("KERNEL {s:<15} {s:<9} launches {d:>4}  {d:>9.1} us  {d:>5.1}%\n", .{
+            @tagName(id), @tagName(m.kernels.variantOf(id)), sc.prof.?.count[i] / reps, sc.prof.?.ns[i] / reps / 1e3, 100.0 * sc.prof.?.ns[i] / reps / total,
+        });
+    }
 }
 
 // ---- Gate C -------------------------------------------------------------------------------------------------------
@@ -378,5 +454,6 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("GATE C greedy 32 tokens: {s}\n", .{if (r) "PASS" else "FAIL"});
         ok = ok and r;
     }
+    if (std.mem.indexOfScalar(u8, gates, 'm') != null) measure(&s, &m, &sc, capdir) catch |e| std.debug.print("measure error: {s}\n", .{@errorName(e)});
     return if (ok) 0 else 1;
 }
