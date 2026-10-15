@@ -70,29 +70,37 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     b.step("xpu-qwen35-test", "Build and run tf-xpu-qwen35-test: Qwen3.5-2B weights + state gates on a B70 (opt-in)").dependOn(&q_run.step);
 
     // Phase 4.3: Qwen3.5-2B forward pass (reference OpenCL kernels, ocloc-compiled) with gates A-C (opt-in, needs a card).
-    const qk = b.addOptions();
+    // The binaries are @embedFile'd into the module (like upstream's metallibs and hip.zig's probe.hsaco), so the
+    // executable carries its own kernels and works from any working directory - no cwd-relative .zig-cache paths.
+    const qk_files = b.addWriteFiles();
+    var qk_src: []const u8 = "//! Compiled Qwen3.5-2B kernel binaries, embedded (see zig/build/xpu.zig).\n";
     inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
         c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/reference/" ++ name ++ "/" ++ name ++ ".cl"));
         c.addArg("-out_dir");
         const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
-        qk.addOptionPath(name, out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
+        _ = qk_files.addCopyFile(out.path(b, file), file);
+        qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
     }
-    // Accepted optimized ports (ports/<key>/<key>.cl): option "<key>_port". Adding one = drop the files, add the key here
+    // Accepted optimized ports (ports/<key>/<key>.cl): const "<key>_port". Adding one = drop the files, add the key here
     // and the .port arm in zig/src/families/qwen3_5/xpu_geometry.zig.
     inline for (port_keys) |name| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
         c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/ports/" ++ name ++ "/" ++ name ++ ".cl"));
         c.addArg("-out_dir");
         const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-port-out");
-        qk.addOptionPath(name ++ "_port", out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
+        _ = qk_files.addCopyFile(out.path(b, file), file);
+        qk_src = b.fmt("{s}pub const {s}_port align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
     }
+    const qk = b.createModule(.{ .root_source_file = qk_files.add("xpu_qwen35_kernels.zig", qk_src) });
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
     const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
     test_step.dependOn(&geo_run.step);
     b.step("xpu-qwen35-geometry-test", "Launch geometry table vs launch.py values (no GPU)").dependOn(&geo_run.step);
     const f_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen35_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
-    f_module.addOptions("xpu_qwen35_kernels", qk);
+    f_module.addImport("xpu_qwen35_kernels", qk);
     f_module.addImport("core", core);
     const f_exe = b.addExecutable(.{ .name = "tf-xpu-qwen35-forward-test", .root_module = f_module });
     const f_install = b.addInstallArtifact(f_exe, .{});
@@ -103,7 +111,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // Phase 4.4-4.5: `Xpu` behind the lane engine's backend interface + qualify, on card (opt-in, needs a card).
     const lanes_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
     const bk_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen35_backend_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
-    bk_module.addOptions("xpu_qwen35_kernels", qk);
+    bk_module.addImport("xpu_qwen35_kernels", qk);
     bk_module.addImport("lanes", lanes_mod);
     bk_module.addImport("core", core);
     const bk_exe = b.addExecutable(.{ .name = "tf-xpu-qwen35-backend-test", .root_module = bk_module });
@@ -116,7 +124,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // Phase 5: `zig build xpu-native` -> zig-out/xpu/bin/tensorfold-native: the HTTP server over `Xpu` (serve --backend xpu).
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native_xpu.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes_mod }, .{ .name = "core", .module = core } } });
-    engines.addOptions("xpu_qwen35_kernels", qk);
+    engines.addImport("xpu_qwen35_kernels", qk);
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const checkpoint = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "native_engines", .module = engines }, exlr8_build.cliImport(b, target, .ReleaseSafe, core) } });
     const server = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
