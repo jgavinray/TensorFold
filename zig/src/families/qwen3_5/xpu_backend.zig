@@ -190,6 +190,9 @@ pub const Xpu = struct {
             if (o.sampled.len != n or o.drafts.len != w.tokens.len) return error.InvalidQwenOutputs;
             const e = try self.entryOf(w.stream);
             for (w.positions, 0..) |p, r| if (p != e.cache.len + r + 1) return error.InvalidQwenPosition;
+            // The row budget is `max_segments * window_rows` (one window a stream, each at most `window_rows` rows):
+            // checked before the writes so a round of narrow windows can never run past `ids`.
+            if (total + n > ids.len) return error.InvalidQwenWindows;
             segments[i] = .{ .cache = &e.cache, .rows = n };
             ids[total] = w.pending;
             @memcpy(ids[total + 1 ..][0..w.tokens.len], w.tokens);
