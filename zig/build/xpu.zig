@@ -4,10 +4,10 @@
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 
-/// Modules with an accepted port under zig/kernels/xpu/qwen3_5/ports/.
-const port_keys = [_][]const u8{ "layout", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" };
-
 /// xpu-host-test (part of `test`), xpu-test (build + run on the card), xpu-gpu-build, xpu-kernel-exact (CLI install).
+/// The Qwen kernel sources under zig/kernels/xpu/shared/ carry the 2B shape values as preprocessor defaults; a 27B
+/// build overrides them by passing `-Dqwen-shape-defines="-DQW_HIDDEN=5120 -D..."` (see the defines at the top of each
+/// shared/<key>/<key>.cl and `zig/src/families/qwen27/config.zig`).
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Build.Step, build_options: *std.Build.Step.Options) void {
     const fixtures = b.addOptions();
     for ([_][]const u8{ "success", "failed", "missing" }) |kind| {
@@ -32,6 +32,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
 
     const ocloc = b.option([]const u8, "ocloc", "Intel OpenCL offline compiler for the XPU test kernels") orelse "ocloc";
     const xpu_device = b.option([]const u8, "xpu-device", "ocloc device name for the XPU test kernels") orelse "bmg";
+    // Extra -D flags for the shared Qwen kernels (27B: the model-shape overrides; empty = 2B defaults).
+    const shape_defines = b.option([]const u8, "qwen-shape-defines", "space-separated -D flags for the shared Qwen kernels (empty = 2B defaults)") orelse "";
 
     // Test kernels, compiled to native binaries: <name>_<device>.bin. The path is passed to the tests as a build option.
     const kernels = b.addOptions();
@@ -69,30 +71,24 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     q_run.step.dependOn(&q_install.step);
     b.step("xpu-qwen35-test", "Build and run tf-xpu-qwen35-test: Qwen3.5-2B weights + state gates on a B70 (opt-in)").dependOn(&q_run.step);
 
-    // Phase 4.3: Qwen3.5-2B forward pass (reference OpenCL kernels, ocloc-compiled) with gates A-C (opt-in, needs a card).
+    // Phase 4.3: Qwen3.5-2B forward pass (shared OpenCL kernels, ocloc-compiled) with gates A-C (opt-in, needs a card).
     // The binaries are @embedFile'd into the module (like upstream's metallibs and hip.zig's probe.hsaco), so the
     // executable carries its own kernels and works from any working directory - no cwd-relative .zig-cache paths.
+    // One source per key (zig/kernels/xpu/shared/<key>/<key>.cl) with the 2B shape values as preprocessor defaults;
+    // the 27B build overrides them with -D flags (see zig/build/xpu.zig `sharedDefines`).
     const qk_files = b.addWriteFiles();
-    var qk_src: []const u8 = "//! Compiled Qwen3.5-2B kernel binaries, embedded (see zig/build/xpu.zig).\n";
+    var qk_src: []const u8 = "//! Compiled Qwen kernel binaries, embedded (see zig/build/xpu.zig).\n";
     inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
-        c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/reference/" ++ name ++ "/" ++ name ++ ".cl"));
+        c.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
         c.addArg("-out_dir");
         const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         _ = qk_files.addCopyFile(out.path(b, file), file);
         qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
-    }
-    // Accepted optimized ports (ports/<key>/<key>.cl): const "<key>_port". Adding one = drop the files, add the key here
-    // and the .port arm in zig/src/families/qwen3_5/xpu_geometry.zig.
-    inline for (port_keys) |name| {
-        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
-        c.addFileArg(b.path("zig/kernels/xpu/qwen3_5/ports/" ++ name ++ "/" ++ name ++ ".cl"));
-        c.addArg("-out_dir");
-        const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-port-out");
-        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
-        _ = qk_files.addCopyFile(out.path(b, file), file);
-        qk_src = b.fmt("{s}pub const {s}_port align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
+        // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
+        var it = std.mem.tokenizeAny(u8, shape_defines, " \t");
+        while (it.next()) |d| c.addArg(d);
     }
     const qk = b.createModule(.{ .root_source_file = qk_files.add("xpu_qwen35_kernels.zig", qk_src) });
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });

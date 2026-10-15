@@ -322,8 +322,8 @@ fn measure(s: *rt.session.Session, m: *fwd.Model, _: *fwd.Scratch, capdir: []con
     for (fwd.kernel_ids) |id| {
         const i = @intFromEnum(id);
         if (sc.prof.?.count[i] == 0) continue;
-        std.debug.print("KERNEL {s:<15} {s:<9} launches {d:>4}  {d:>9.1} us  {d:>5.1}%\n", .{
-            @tagName(id), @tagName(m.kernels.variantOf(id)), sc.prof.?.count[i] / reps, sc.prof.?.ns[i] / reps / 1e3, 100.0 * sc.prof.?.ns[i] / reps / total,
+        std.debug.print("KERNEL {s:<15} launches {d:>4}  {d:>9.1} us  {d:>5.1}%\n", .{
+            @tagName(id), sc.prof.?.count[i] / reps, sc.prof.?.ns[i] / reps / 1e3, 100.0 * sc.prof.?.ns[i] / reps / total,
         });
     }
 }
