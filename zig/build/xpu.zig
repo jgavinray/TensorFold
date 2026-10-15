@@ -105,4 +105,20 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     bk_run.step.dependOn(&bk_install.step);
     b.step("xpu-qwen35-backend-test", "Build and run tf-xpu-qwen35-backend-test: Xpu through the lane engine + xpu_qualify on a B70 (opt-in)").dependOn(&bk_run.step);
     b.step("xpu-qwen35-backend-build", "Build tf-xpu-qwen35-backend-test without running it").dependOn(&bk_install.step);
+
+    // Phase 6.4: Qwen 3.8 27B weights and state on the card (opt-in, needs a card and the multi-shard checkpoint).
+    const q27_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    const q27_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-test", .root_module = q27_module });
+    const q27_install = b.addInstallArtifact(q27_exe, .{});
+    const q27_run = b.addRunArtifact(q27_exe);
+    q27_run.step.dependOn(&q27_install.step);
+    b.step("xpu-qwen27-test", "Build and run tf-xpu-qwen27-test: Qwen 3.8 27B weights + state gates on a B70 (opt-in)").dependOn(&q27_run.step);
+    b.step("xpu-qwen27-build", "Build zig-out/bin/tf-xpu-qwen27-test without running it").dependOn(&q27_install.step);
+
+    // The 27B pieces' host-side tests (arena packing, state sizes): no card, part of `test`.
+    const q27_host = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_tests.zig"), .target = b.graph.host, .link_libc = true });
+    const q27_tests = b.addTest(.{ .root_module = q27_host });
+    const q27_host_run = b.addRunArtifact(q27_tests);
+    test_step.dependOn(&q27_host_run.step);
+    b.step("xpu-qwen27-host-test", "Host-side tests for the 27B XPU weights and state modules").dependOn(&q27_host_run.step);
 }
