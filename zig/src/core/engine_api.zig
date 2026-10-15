@@ -186,6 +186,14 @@ pub const PromptCachePlan = struct {
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
 pub const Family = struct { model_type: []const u8, formats: []const []const u8 };
 
+/// Serve defaults a backend changes for the flags whose engine default it overrides (the backend's root lists them
+/// as `defaults`; `serve.zig` reads that the way it reads `serves`). Only fields a backend names are changed; null
+/// keeps the flag's own default. A request may still override any of them (`chat_template_kwargs.enable_thinking`).
+pub const ServeDefaults = struct {
+    /// Whether the chat template opens a reasoning block when a request does not say (`--thinking`/`--no-thinking`).
+    enable_thinking: ?bool = null,
+};
+
 /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
 pub const Open = struct {
     dir: []const u8,
