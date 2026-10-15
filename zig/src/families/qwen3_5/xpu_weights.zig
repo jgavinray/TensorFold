@@ -5,7 +5,7 @@
 const std = @import("std");
 const rt = @import("../../xpu/runtime.zig");
 const sys = @import("../../xpu/sys.zig");
-const st = @import("../../core/safetensors.zig");
+const st = @import("core").safetensors;
 const c = @import("config.zig");
 
 pub const DType = st.DType;

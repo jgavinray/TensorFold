@@ -1,9 +1,10 @@
 //! Qwen3.5-2B forward pass on an Intel B70 (Level Zero + OpenCL kernels), mirroring forward.zig's op order and rounding
 //! points (bf16 activations between every op, fp32 recurrence). Kernels are loaded by key from ocloc-compiled modules
-//! (build option `xpu_qwen35_kernels`). Each module has a reference build and, where one was accepted, a port
+//! embedded in the executable at build time (build option `xpu_qwen35_kernels`, @embedFile of the ocloc outputs), so the
+//! binary works from any working directory. Each module has a reference build and, where one was accepted, a port
 //! (<key>_port); a kernel's launch geometry comes with its variant (xpu_geometry.zig). Default: ports where they exist,
 //! reference otherwise; TF_XPU_QWEN35_VARIANT=reference forces all-reference. TF_XPU_QWEN35_KERNELS names a directory of
-//! <module key>.bin files that replaces the built-in modules (the variant still selects the geometry).
+//! <module key>.bin files that replaces the embedded modules (development override; the variant still selects the geometry).
 //! One segment per call (prefill rows or a decode row appended to the cache); no snapshot recording (record = false).
 const std = @import("std");
 const rt = @import("../../xpu/runtime.zig");
@@ -48,9 +49,10 @@ fn hasPort(comptime m: Module) bool {
     return @hasDecl(kbins, @tagName(m) ++ "_port");
 }
 
-fn builtinPath(m: Module, v: Variant) []const u8 {
+/// The compiled module's bytes, embedded in the executable by the build graph (`zig/build/xpu.zig`).
+fn builtinBytes(m: Module, v: Variant) []const u8 {
     return switch (m) {
-        inline else => |t| if (comptime hasPort(t)) (if (v == .port) @field(kbins, @tagName(t) ++ "_port") else @field(kbins, @tagName(t))) else @field(kbins, @tagName(t)),
+        inline else => |t| if (comptime hasPort(t)) (if (v == .port) &@field(kbins, @tagName(t) ++ "_port") else &@field(kbins, @tagName(t))) else &@field(kbins, @tagName(t)),
     };
 }
 
@@ -79,12 +81,17 @@ pub const Kernels = struct {
             const fname = @tagName(mod);
             self.variant[i] = chooseVariant(mod, force_ref);
             var buf: [1024]u8 = undefined;
-            const path = if (dir) |d| sys.zfmt(&buf, "{s}/{s}.bin", .{ d, fname }) else sys.zfmt(&buf, "{s}", .{builtinPath(mod, self.variant[i])});
-            const bin = sys.readFileAlloc(gpa, path orelse return error.KernelBinaryMissing, 64 << 20) orelse {
-                std.debug.print("cannot read kernel module {s}\n", .{path orelse "?"});
-                return error.KernelBinaryMissing;
-            };
-            defer gpa.free(bin);
+            // TF_XPU_QWEN35_KERNELS (development) reads <dir>/<key>.bin; otherwise the module embedded at build time.
+            var file: ?[]u8 = null;
+            const bin: []const u8 = if (dir) |d| blk: {
+                const path = sys.zfmt(&buf, "{s}/{s}.bin", .{ d, fname }) orelse return error.KernelBinaryMissing;
+                file = sys.readFileAlloc(gpa, path, 64 << 20) orelse {
+                    std.debug.print("cannot read kernel module {s}\n", .{path});
+                    return error.KernelBinaryMissing;
+                };
+                break :blk file.?;
+            } else builtinBytes(mod, self.variant[i]);
+            defer if (file) |b| gpa.free(b);
             var log: rt.module.BuildLog = .{};
             self.modules[i] = rt.module.Module.load(&s.ctx, bin, &log) catch |e| {
                 std.debug.print("module {s} load failed: {s}\n", .{ fname, log.text() });
