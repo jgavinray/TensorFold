@@ -186,7 +186,10 @@ pub fn load(gpa: std.mem.Allocator, s: *rt.session.Session, dir: []const u8, c: 
     // 1. weight_map: name -> shard file, then open every named shard and index its language_model header.
     const index = try readWeightMap(a, dir);
     defer index.deinit();
-    const map = index.value.object.get("weight_map").?.object;
+    const map = switch (index.value.object.get("weight_map") orelse return error.BadShardIndex) {
+        .object => |o| o,
+        else => return error.BadShardIndex,
+    };
     var shard_names = std.ArrayListUnmanaged([]const u8).empty;
     var shards: [max_shards]Shard = undefined;
     var n_shards: usize = 0;
