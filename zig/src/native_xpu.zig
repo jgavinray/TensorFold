@@ -18,6 +18,12 @@ pub const families: []const api.Family = &.{
 /// `serve --backend xpu` is honoured by this binary (server/cli.zig reads this from the root).
 pub const serves: []const []const u8 = &.{"--backend=xpu"};
 
+/// Serve defaults this backend changes (server/serve.zig reads them from the root): the XPU 2B reasons past a short
+/// max_tokens, so a served default with an open think block answers every chat request in reasoning_content and
+/// leaves content empty. A closed block (`enable_thinking` false) is what the Metal serving examples pass too
+/// (RUNBOOK.md `--no-thinking`); a request may still ask for thinking with chat_template_kwargs.
+pub const defaults: api.ServeDefaults = .{ .enable_thinking = false };
+
 /// Prompt plus reply tokens one request may use when --context is not given (the model's window is 262,144;
 /// the KV cache of a stream is allocated at this size).
 const default_window: i64 = 32768;
