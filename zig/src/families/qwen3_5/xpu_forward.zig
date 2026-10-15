@@ -182,16 +182,19 @@ pub const Scratch = struct {
     po: Buffer,
     logits: Buffer,
     conv_snap: Buffer,
-    /// Per-stream window snapshots for shared rounds, one slot a live stream: `max_segments * window_rows` recurrence
-    /// rows then the same many conv tails. A stream's `keep` reads its slot back; see `xpu_backend.Entry.restore`.
-    snaps_delta: Buffer,
+    /// Per-layer window snapshots for shared rounds, indexed by the absolute scratch row of the segment's last row
+    /// (as state.zig's Cache does): the recurrence is saved once per layer, the conv tail per segment. A stream's
+    /// `keep` reads its slot back; see `xpu_backend.Entry.keep`.
+    snaps_delta: [c.layers]?Buffer = @splat(null),
     snaps_conv: Buffer,
     /// Optional per-kernel device timing (Level Zero event timestamps); see `Profile`.
     prof: ?Profile = null,
     made: usize = 0,
+    /// Snapshot buffers made so far (the `snaps_delta` entries up to this index), for `deinit`.
+    made_snaps: usize = 0,
     dims_used: usize = 0,
 
-    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "snaps_delta", "snaps_conv" };
+    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "snaps_conv" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
 
@@ -203,6 +206,7 @@ pub const Scratch = struct {
         out.made = 0;
         out.dims_used = 0;
         out.prof = null;
+        out.snaps_delta = @splat(null);
         errdefer out.deinit();
         const chunks = (capacity + 127) / 128;
         const hid = rows * c.hidden * 2;
@@ -213,17 +217,28 @@ pub const Scratch = struct {
             rows * c.linear_heads * 2, rows * c.linear_heads * 2, rows * c.linear_heads * 2, rows * c.linear_heads * 4,
             rows * c.query_heads * chunks * 4, rows * c.query_heads * chunks * 4, rows * c.query_heads * chunks * c.head_dim * 4,
             logit_rows * c.vocab * 2, rows * xs.conv_bytes,
-            xs.max_segments * xs.snap_delta_bytes, xs.max_segments * xs.snap_conv_bytes,
+            rows * xs.conv_bytes,
         };
         inline for (names, 0..) |n, i| {
             const kind: rt.memory.Kind = if (i == 0) .host else .device;
             @field(out, n) = try Buffer.alloc(&s.ctx, kind, sizes[i]);
             out.made = i + 1;
         }
+        // One recurrence snapshot buffer per linear layer, `rows` state rows wide (the scratch row of each window row).
+        for (&out.snaps_delta, 0..) |*b, i| if (c.linear(i)) {
+            b.* = try Buffer.alloc(&s.ctx, .device, rows * xs.delta_bytes);
+            out.made_snaps = i + 1;
+        };
         return out;
     }
 
     pub fn deinit(self: *Scratch) void {
+        for (self.snaps_delta[0..self.made_snaps]) |*b| if (b.*) |buf| {
+            var x = buf;
+            x.free();
+            b.* = null;
+        };
+        self.made_snaps = 0;
         inline for (names, 0..) |n, i| if (i < self.made) @field(self, n).free();
         self.made = 0;
     }
@@ -242,22 +257,23 @@ pub const Scratch = struct {
         const bytes = std.mem.asBytes(&vals);
         std.debug.assert(bytes.len <= slot_bytes and self.dims_used < dims_slots);
         const p = self.dimsBase() + self.dims_used * slot_bytes;
-        @memcpy(p[0..bytes.len], vals);
+        @memcpy(p[0..bytes.len], bytes);
         self.dims_used += 1;
         return @ptrCast(p);
     }
 
-    /// Stream `slot`'s recurrence snapshot in the round scratch: `window_rows` rows of `delta_bytes` each, row `r` at
-    /// `snapDelta(slot) + r * delta_bytes`. The forward writes it when a segment records.
-    pub fn snapDelta(self: *Scratch, slot: usize) [*]u8 {
-        std.debug.assert(slot < xs.max_segments);
-        return @as([*]u8, @ptrCast(self.snaps_delta.ptr.?)) + slot * xs.snap_delta_bytes;
+    /// The recurrence snapshot of `layer` at absolute scratch row `row` (`delta_bytes` long); the kernel writes it
+    /// when a segment records, and `xpu_backend.Entry.keep` reads it back.
+    pub fn snapDelta(self: *Scratch, layer: usize, row: usize) *anyopaque {
+        const b = self.snaps_delta[layer] orelse unreachable;
+        std.debug.assert(row < self.rows);
+        return @ptrFromInt(@intFromPtr(b.ptr.?) + row * xs.delta_bytes);
     }
-    /// Stream `slot`'s conv-tail snapshot: `window_rows` tails of `conv_bytes` each, row `r` at
-    /// `snapConv(slot) + r * conv_bytes` (row 0 the state before the window, as the kernel writes it).
-    pub fn snapConv(self: *Scratch, slot: usize) [*]u8 {
-        std.debug.assert(slot < xs.max_segments);
-        return @as([*]u8, @ptrCast(self.snaps_conv.ptr.?)) + slot * xs.snap_conv_bytes;
+    /// The conv-tail snapshot at absolute scratch row `row` (`conv_bytes` long): row 0 the state before the window,
+    /// as the kernel writes it.
+    pub fn snapConv(self: *Scratch, row: usize) *anyopaque {
+        std.debug.assert(row < self.rows);
+        return @ptrFromInt(@intFromPtr(self.snaps_conv.ptr.?) + row * xs.conv_bytes);
     }
 };
 
@@ -309,32 +325,48 @@ pub const Options = struct {
     head: Head = .last,
 };
 
-/// A stream's rows in one shared round: its cache (at its own length) and the scratch row its first row lands on.
-/// `record` saves this window's recurrence rows and conv tails into stream `slot`'s snapshots (a later `keep` reads
-/// them back); `slot` is ignored without `record`.
+/// A stream's rows in one shared round: its cache and how many rows it contributes, in segment order (each segment's
+/// rows land in the scratch after the previous segment's). With `record` the forward saves the window's recurrence
+/// and conv snapshots so a later `keep` can roll back; without it (the single-stream path) only the final state is kept.
 pub const Segment = struct {
     cache: *xs.Cache,
     rows: usize,
-    base: usize = 0,
-    record: bool = false,
-    slot: usize = 0,
 };
 
 /// Streams one shared round serves at most (one segment a stream); the snapshot scratch has this many slots.
 pub const max_segments = xs.max_segments;
 
-/// Forward `tokens` as one segment appended to `cache`. Blocks until the card has finished. On return `cache.len` has
-/// advanced and `cache.logits` holds the last row's bf16 logits (unless `stop_after` is set); with head = .all
-/// `scratch.logits` holds every row.
+/// Forward `tokens` as one segment appended to `cache` (no snapshot recording). Blocks until the card has finished.
+/// On return `cache.len` has advanced and `cache.logits` holds the last row's bf16 logits (unless `stop_after` is
+/// set); with head = .all `scratch.logits` holds every row.
 pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, tokens: []const u32, o: Options) Error!void {
-    const total = tokens.len;
-    if (total == 0 or total > sc.rows or (o.head == .all and total > sc.logit_rows)) return error.QwenRowsExceeded;
-    if (cache.len + total > cache.capacity or cache.capacity > sc.capacity) return error.QwenContextFull;
+    return runSegments(s, m, sc, &.{.{ .cache = cache, .rows = tokens.len }}, tokens, false, o);
+}
+
+/// Forward `tokens` split across `segments`, each its own cache and row range, in one launch set (the shared-round
+/// forward). Each segment's `base` is its first row in the scratch (computed here from the segment order). With
+/// `record`, every row of a linear layer's recurrence and each segment's conv tail are saved to its `slot`'s snapshot
+/// so a later `keep` can roll back; `segments.len == 1 and !record` is the plain single-stream path.
+pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []const Segment, tokens: []const u32, record: bool, o: Options) Error!void {
+    var total: usize = 0;
+    for (segments) |seg| {
+        if (seg.rows == 0 or seg.cache.len + seg.rows > seg.cache.capacity) return error.QwenContextFull;
+        total += seg.rows;
+    }
+    if (total == 0 or total != tokens.len or total > sc.rows or (o.head == .all and total > sc.logit_rows)) return error.QwenRowsExceeded;
+    if (record and (segments.len > max_segments or total > xs.max_segments * xs.window_rows)) return error.QwenRowsExceeded;
+    if (!record and segments.len != 1) return error.QwenRowsExceeded;
     for (tokens) |id| if (id >= c.vocab) return error.InvalidQwenToken;
     @memcpy(sc.ids()[0..total], tokens);
-    for (0..total) |r| for (0..c.conv_taps) |tap| {
-        sc.windows()[r * c.conv_taps + tap] = @intCast(r + tap);
-    };
+    // Each segment's conv windows are relative to its own rows (row r of a segment sees taps r..r+TAPS-1), and its
+    // scratch row is the running `base`, exactly as the Metal path lays them out.
+    var base: usize = 0;
+    for (segments) |seg| {
+        for (0..seg.rows) |r| for (0..c.conv_taps) |tap| {
+            sc.windows()[(base + r) * c.conv_taps + tap] = @intCast(r + tap);
+        };
+        base += seg.rows;
+    }
     sc.dims_used = 0;
     const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc };
     const w = m.weights;
@@ -343,8 +375,8 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
     for (w.blocks, 0..) |block, i| {
         try ru.norm(sc.h.ptr.?, if (i == 0) null else sc.r.ptr, block.input_norm, sc.x.ptr.?, total);
         switch (block.mixer) {
-            .delta => |d| try delta(ru, d, &cache.blocks[i].delta, total),
-            .attention => |a| try attention(ru, a, &cache.blocks[i].attention, cache.len, cache.capacity, total),
+            .delta => |d| try delta(ru, d, i, segments, record, total),
+            .attention => |a| try attention(ru, a, i, segments, total),
         }
         try ru.norm(sc.h.ptr.?, sc.r.ptr, block.post_norm, sc.x.ptr.?, total);
         try ru.projection(block.gate, sc.x.ptr.?, sc.gate.ptr.?, total);
@@ -362,13 +394,22 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
     } else {
         try ru.projection(w.head(), off(sc.x, (total - 1) * c.hidden * 2), sc.logits.ptr.?, 1);
     }
-    const row: usize = if (o.head == .all) total - 1 else 0;
-    try s.queue.copy(cache.logits.ptr, off(sc.logits, row * c.vocab * 2), c.vocab * 2, null);
+    // Each segment's committed logits row: the last row of its range (head = .all keeps every row in sc.logits).
+    base = 0;
+    for (segments) |seg| {
+        const row: usize = if (o.head == .all) base + seg.rows - 1 else 0;
+        try s.queue.copy(seg.cache.logits.ptr, off(sc.logits, row * c.vocab * 2), c.vocab * 2, null);
+        var rec: [c.layers]?*const anyopaque = @splat(null);
+        for (&rec, 0..) |*r, i| if (c.linear(i)) {
+            r.* = sc.snapDelta(i, base + seg.rows - 1);
+        };
+        try seg.cache.commit(s, base, seg.rows, record, rec, sc.snapConv(base + seg.rows - 1));
+        base += seg.rows;
+    }
     try s.queue.synchronize();
-    cache.len += total;
 }
 
-fn delta(ru: Run, d: xw.Delta, cache: *xs.Delta, total: usize) rt.Error!void {
+fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: bool, total: usize) rt.Error!void {
     const sc = ru.sc;
     const T: u32 = @intCast(total);
     try ru.projection(d.qkv, sc.x.ptr.?, sc.qkv.ptr.?, total);
@@ -376,20 +417,35 @@ fn delta(ru: Run, d: xw.Delta, cache: *xs.Delta, total: usize) rt.Error!void {
     try ru.projection(d.a, sc.x.ptr.?, sc.a.ptr.?, total);
     try ru.projection(d.b, sc.x.ptr.?, sc.b.ptr.?, total);
     const w = ru.w;
-    try ru.go(.gdn_pre, geo.gdnPre(T, 3 * c.linear_heads), .{
-        sc.qkv.ptr, cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows().ptr)), sc.a.ptr, sc.b.ptr, w.ptr(d.a_log), w.ptr(d.dt_bias),
-        sc.q.ptr, sc.k.ptr, sc.v.ptr, sc.g.ptr, sc.beta.ptr, sc.conv_snap.ptr,
-    });
-    // The recurrence is read into registers before it is written, one state row per work-item, so state_in == state_out is safe.
-    try ru.go(.gdn_chain, geo.gdnChain(c.linear_dim, c.linear_heads), .{
-        sc.q.ptr, sc.k.ptr, sc.v.ptr, sc.g.ptr, sc.beta.ptr, cache.recurrence.ptr, sc.dims([2]i32{ @intCast(total), 0 }), sc.y.ptr, cache.recurrence.ptr,
-    });
-    try ru.s.queue.copy(cache.conv.ptr, off(sc.conv_snap, (total - 1) * xs.conv_bytes), xs.conv_bytes, null);
+    var base: usize = 0;
+    for (segments) |seg| {
+        const cache = &seg.cache.blocks[layer].delta;
+        // The conv snapshot is written at this segment's absolute scratch row (its rows land at base..base+rows-1).
+        const snap_conv: *anyopaque = sc.snapConv(base);
+        try ru.go(.gdn_pre, geo.gdnPre(@intCast(seg.rows), 3 * c.linear_heads), .{
+            off(sc.qkv, base * c.conv_dim * 2), cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows().ptr)),
+            off(sc.a, base * c.linear_heads * 2), off(sc.b, base * c.linear_heads * 2), w.ptr(d.a_log), w.ptr(d.dt_bias),
+            off(sc.q, base * c.hidden * 2), off(sc.k, base * c.hidden * 2), off(sc.v, base * c.hidden * 2),
+            off(sc.g, base * c.linear_heads * 4), off(sc.beta, base * c.linear_heads * 2), snap_conv,
+        });
+        // The recurrence is read into registers before it is written, one state row per work-item, so state_in == state_out is safe.
+        // With `record`, the kernel saves every row to `layer`'s snapshot at this segment's absolute row; otherwise only
+        // the final state, which it writes straight into `cache.recurrence` (state_in == state_out).
+        const snap_rec: *anyopaque = if (record) sc.snapDelta(layer, base) else cache.recurrence.ptr.?;
+        try ru.go(.gdn_chain, geo.gdnChain(c.linear_dim, c.linear_heads), .{
+            off(sc.q, base * c.hidden * 2), off(sc.k, base * c.hidden * 2), off(sc.v, base * c.hidden * 2),
+            off(sc.g, base * c.linear_heads * 4), off(sc.beta, base * c.linear_heads * 2), cache.recurrence.ptr,
+            sc.dims([2]i32{ @intCast(seg.rows), @intFromBool(record) }), off(sc.y, base * c.hidden * 2), snap_rec,
+        });
+        // Without `record` the recurrence went straight into `cache.recurrence`; the conv tail is the segment's last row.
+        if (!record) try ru.s.queue.copy(cache.conv.ptr, sc.snapConv(base + seg.rows - 1), xs.conv_bytes, null);
+        base += seg.rows;
+    }
     try ru.go(.gdn_post, geo.gdnPost(T, c.linear_heads), .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });
     try ru.projection(d.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }
 
-fn attention(ru: Run, a: xw.Attention, cache: *xs.Attention, len: usize, capacity: usize, total: usize) rt.Error!void {
+fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, total: usize) rt.Error!void {
     const sc = ru.sc;
     const w = ru.w;
     const T: u32 = @intCast(total);
@@ -400,14 +456,25 @@ fn attention(ru: Run, a: xw.Attention, cache: *xs.Attention, len: usize, capacit
     try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.query_heads), c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
     const kn = sc.dims([4]u32{ T, c.kv_heads, c.kv_heads * c.head_dim, c.head_dim });
     try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.kv_heads), c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.k.ptr, w.ptr(a.k_norm), sc.knorm.ptr, kn });
-    try ru.go(.queries, geo.layout(.queries, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(len), T, 0, 0 }) });
-    try ru.go(.keys, geo.layout(.keys, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
-    const nch: usize = (len + total + 127) / 128;
-    const dims = sc.dims([8]i32{ @intCast(len), @intCast(total), @intCast(capacity), @intCast(nch), 0, @intCast(total), 0, 0 });
-    try ru.go(.attn_partial, geo.attnPartial(@intCast(nch), T, c.query_heads), .{
-        sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
-    });
-    try ru.go(.attn_merge, geo.attnMerge(T, c.query_heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, sc.y.ptr });
+    // RoPE and the key/value cache rows are per segment: each writes at its own cache length, reading its own rows.
+    var base: usize = 0;
+    for (segments) |seg| {
+        const cache = &seg.cache.blocks[layer].attention;
+        const rows: u32 = @intCast(seg.rows);
+        try ru.go(.queries, geo.layout(.queries, rows, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{
+            sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), rows, @intCast(base), 0 }),
+        });
+        try ru.go(.keys, geo.layout(.keys, rows, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{
+            sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), @intCast(seg.cache.capacity), @intCast(base), 0 }),
+        });
+        const nch: usize = (seg.cache.len + seg.rows + 127) / 128;
+        const dims = sc.dims([8]i32{ @intCast(seg.cache.len), @intCast(seg.rows), @intCast(seg.cache.capacity), @intCast(nch), 0, @intCast(total), @intCast(base), 0 });
+        try ru.go(.attn_partial, geo.attnPartial(@intCast(nch), rows, c.query_heads), .{
+            sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
+        });
+        try ru.go(.attn_merge, geo.attnMerge(rows, c.query_heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, off(sc.y, base * c.hidden * 2) });
+        base += seg.rows;
+    }
     try ru.go(.attention_gate, geo.layout(.attention_gate, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
     try ru.projection(a.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }

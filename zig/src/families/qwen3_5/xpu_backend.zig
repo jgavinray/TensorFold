@@ -12,78 +12,49 @@ const be = lanes.backend;
 pub const window_rows = 16;
 pub const Options = struct { capacity: usize, chunk: usize = 128, streams: u32 = 8, qualify: bool = true };
 
-/// A stream's cache plus what a multi-row window needs to be rolled back.
+/// A stream's cache; the rollback a multi-row window needs lives in the round scratch (the forward records the
+/// window's snapshots, and `Cache.last` names the row range `keep` reads back).
 pub const Entry = struct {
     cache: xs.Cache,
-    snap: ?[c.layers]?xs.Delta = null,
-    start: usize = 0, // cache length before the last window
-    rows: usize = 0, // rows of the last window (0: none to keep)
-    ids: [window_rows]u32 = undefined,
-
-    fn snapshot(self: *Entry, s: *rt.session.Session) !void {
-        if (self.snap == null) {
-            var snaps: [c.layers]?xs.Delta = @splat(null);
-            self.snap = snaps;
-            errdefer self.freeSnap();
-            for (&snaps, 0..) |*sn, i| if (c.linear(i)) {
-                var r = try rt.memory.Buffer.alloc(&s.ctx, .device, xs.delta_bytes);
-                errdefer r.free();
-                const cv = try rt.memory.Buffer.alloc(&s.ctx, .device, xs.conv_bytes);
-                sn.* = .{ .recurrence = r, .conv = cv };
-                self.snap = snaps;
-            };
-        }
-        for (self.snap.?, 0..) |sn, i| if (sn) |d| {
-            const b = self.cache.blocks[i].delta;
-            try s.queue.copy(d.recurrence.ptr, b.recurrence.ptr, xs.delta_bytes, null);
-            try s.queue.copy(d.conv.ptr, b.conv.ptr, xs.conv_bytes, null);
-        };
-    }
-
-    fn restore(self: *Entry, s: *rt.session.Session) !void {
-        for (self.snap.?, 0..) |sn, i| if (sn) |d| {
-            const b = self.cache.blocks[i].delta;
-            try s.queue.copy(b.recurrence.ptr, d.recurrence.ptr, xs.delta_bytes, null);
-            try s.queue.copy(b.conv.ptr, d.conv.ptr, xs.conv_bytes, null);
-        };
-    }
-
-    fn freeSnap(self: *Entry) void {
-        if (self.snap) |*all| for (all) |*sn| if (sn.*) |*d| {
-            d.recurrence.free();
-            d.conv.free();
-            sn.* = null;
-        };
-        self.snap = null;
-    }
+    rows: usize = 0, // rows of the last recorded window (0: none to keep)
+    base: usize = 0, // the scratch row of its first row (the window's `base`)
 
     pub fn deinit(self: *Entry) void {
-        self.freeSnap();
         self.cache.deinit();
     }
 
     /// Forward `ids` (pending then drafts) as one window with every row's logits in `sc.logits`; remembers how to roll back.
     pub fn window(self: *Entry, s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, ids: []const u32) !void {
         if (ids.len == 0 or ids.len > window_rows) return error.UnsupportedQwenWindow;
-        if (ids.len > 1) try self.snapshot(s);
-        self.start = self.cache.len;
-        try fwd.run(s, m, sc, &self.cache, ids, .{ .head = .all });
-        self.rows = ids.len;
-        @memcpy(self.ids[0..ids.len], ids);
+        try fwd.runSegments(s, m, sc, &.{.{ .cache = &self.cache, .rows = ids.len }}, ids, ids.len > 1, .{ .head = .all });
+        if (self.cache.last) |last| {
+            self.rows = ids.len;
+            self.base = last.base;
+        } else {
+            self.rows = 0;
+        }
     }
 
     /// Roll back to the first `n` rows of the last window (logits row and recurrence as after exactly those rows).
     pub fn keep(self: *Entry, s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, path: []const u32) !void {
+        _ = m;
         if (self.rows == 0 or path.len == 0 or path.len > self.rows) return error.NothingToKeep;
         for (path, 0..) |row, i| if (row != i) return error.UnsupportedQwenTree;
         if (path.len != self.rows) {
-            try self.restore(s);
-            self.cache.len = self.start;
-            try fwd.run(s, m, sc, &self.cache, self.ids[0..path.len], .{ .head = .last });
+            const row = self.base + path.len - 1;
+            var rec: [c.layers]?*const anyopaque = @splat(null);
+            for (&rec, 0..) |*r, i| if (c.linear(i)) {
+                r.* = sc.snapDelta(i, row);
+            };
+            try self.cache.keep(s, path, rec, sc.snapConv(row), offLogits(sc, row));
         }
         self.rows = 0;
     }
 };
+
+fn offLogits(sc: *fwd.Scratch, row: usize) *const anyopaque {
+    return @ptrFromInt(@intFromPtr(sc.logits.ptr.?) + row * c.vocab * 2);
+}
 
 pub const Xpu = struct {
     gpa: std.mem.Allocator,
@@ -101,9 +72,9 @@ pub const Xpu = struct {
         errdefer gpa.destroy(out);
         const row = try gpa.alloc(u16, c.vocab);
         errdefer gpa.free(row);
-        const rows = try gpa.alloc(u16, window_rows * c.vocab);
+        const rows = try gpa.alloc(u16, xs.max_segments * window_rows * c.vocab);
         errdefer gpa.free(rows);
-        out.* = .{ .gpa = gpa, .session = session, .model = model, .options = options, .row = row, .rows = rows, .scratch = try fwd.Scratch.init(session, options.chunk, options.capacity, window_rows) };
+        out.* = .{ .gpa = gpa, .session = session, .model = model, .options = options, .row = row, .rows = rows, .scratch = try fwd.Scratch.init(session, options.chunk, options.capacity, xs.max_segments * window_rows) };
         errdefer out.scratch.deinit();
         if (options.qualify) {
             @import("xpu_qualify.zig").check(gpa, session, model, &out.scratch) catch |err| switch (err) {
@@ -132,7 +103,7 @@ pub const Xpu = struct {
     }
 
     pub fn facts(self: *const Xpu) lanes.Model {
-        return .{ .exact_width = self.width, .hidden_rows = false, .batch_rows = window_rows, .max_streams = 1, .streams_exact = true };
+        return .{ .exact_width = self.width, .hidden_rows = self.width > 1, .batch_rows = xs.max_segments * window_rows, .max_streams = self.options.streams, .streams_exact = true };
     }
 
     pub fn backend(self: *Xpu) be.Backend {
@@ -208,25 +179,35 @@ pub const Xpu = struct {
 
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) !void {
         const self = cast(ptr);
-        if (windows.len != out.len) return error.InvalidQwenWindows;
-        for (windows, out) |w, o| {
+        if (windows.len != out.len or windows.len > xs.max_segments) return error.InvalidQwenWindows;
+        var segments: [xs.max_segments]fwd.Segment = undefined;
+        var ids: [window_rows * xs.max_segments]u32 = undefined;
+        var total: usize = 0;
+        for (windows, out, 0..) |w, o, i| {
             const n = w.rows();
             if (w.parents != null or w.held != 0 or n > window_rows or w.positions.len != n) return error.UnsupportedQwenWindow;
             if (w.masks.len != 0 and w.masks.len != n * mask_words) return error.InvalidQwenMasks;
             if (o.sampled.len != n or o.drafts.len != w.tokens.len) return error.InvalidQwenOutputs;
             const e = try self.entryOf(w.stream);
             for (w.positions, 0..) |p, r| if (p != e.cache.len + r + 1) return error.InvalidQwenPosition;
-            var ids: [window_rows]u32 = undefined;
-            ids[0] = w.pending;
-            @memcpy(ids[1..][0..w.tokens.len], w.tokens);
-            try e.window(self.session, self.model, &self.scratch, ids[0..n]);
-            const bytes = std.mem.sliceAsBytes(self.rows[0 .. n * c.vocab]);
-            try self.scratch.logits.download(&self.session.queue, 0, bytes);
+            segments[i] = .{ .cache = &e.cache, .rows = n };
+            ids[total] = w.pending;
+            @memcpy(ids[total + 1 ..][0..w.tokens.len], w.tokens);
+            total += n;
+        }
+        // One forward over every window: each stream's rows are its own segment, snapshots recorded so `keep` can roll back.
+        try fwd.runSegments(self.session, self.model, &self.scratch, segments[0..windows.len], ids[0..total], true, .{ .head = .all });
+        const bytes = std.mem.sliceAsBytes(self.rows[0 .. total * c.vocab]);
+        try self.scratch.logits.download(&self.session.queue, 0, bytes);
+        var base: usize = 0;
+        for (windows, out) |w, o| {
+            const n = w.rows();
             for (o.sampled, w.positions, 0..) |*t, p, r| {
                 const mask = if (w.masks.len > 0) w.masks[r * mask_words ..][0..mask_words] else &.{};
-                t.* = try draw(self.gpa, self.rows[r * c.vocab ..][0..c.vocab], w.stream.sampling, p, mask);
+                t.* = try draw(self.gpa, self.rows[(base + r) * c.vocab ..][0..c.vocab], w.stream.sampling, p, mask);
             }
             @memcpy(o.drafts, w.tokens);
+            base += n;
         }
     }
 
