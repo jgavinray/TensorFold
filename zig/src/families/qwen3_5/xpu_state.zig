@@ -8,6 +8,14 @@ const c = @import("config.zig");
 pub const delta_bytes = c.linear_heads * c.linear_dim * c.linear_dim * 4;
 pub const conv_bytes = (c.conv_taps - 1) * c.conv_dim * 2;
 
+/// A window's rows at most, and the streams a shared round serves at most (one segment a stream).
+pub const window_rows = 16;
+pub const max_segments = window_rows;
+
+/// Bytes a stream's window snapshots take in the round scratch: `window_rows` recurrence rows then `window_rows` conv tails.
+pub const snap_delta_bytes = window_rows * delta_bytes;
+pub const snap_conv_bytes = window_rows * conv_bytes;
+
 pub const Delta = struct { recurrence: rt.memory.Buffer, conv: rt.memory.Buffer };
 pub const Attention = struct { keys: rt.memory.Buffer, values: rt.memory.Buffer };
 pub const Mixer = union(enum) { delta: Delta, attention: Attention };

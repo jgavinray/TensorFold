@@ -205,12 +205,16 @@ pub const Scratch = struct {
     po: Buffer,
     logits: Buffer,
     conv_snap: Buffer,
+    /// Per-stream window snapshots for shared rounds, one slot a live stream: `max_segments * window_rows` recurrence
+    /// rows then the same many conv tails. A stream's `keep` reads its slot back; see `xpu_backend.Entry.restore`.
+    snaps_delta: Buffer,
+    snaps_conv: Buffer,
     /// Optional per-kernel device timing (Level Zero event timestamps); see `Profile`.
     prof: ?Profile = null,
     made: usize = 0,
     dims_used: usize = 0,
 
-    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap" };
+    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "snaps_delta", "snaps_conv" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
 
@@ -232,6 +236,7 @@ pub const Scratch = struct {
             rows * c.linear_heads * 2, rows * c.linear_heads * 2, rows * c.linear_heads * 2, rows * c.linear_heads * 4,
             rows * c.query_heads * chunks * 4, rows * c.query_heads * chunks * 4, rows * c.query_heads * chunks * c.head_dim * 4,
             logit_rows * c.vocab * 2, rows * xs.conv_bytes,
+            xs.max_segments * xs.snap_delta_bytes, xs.max_segments * xs.snap_conv_bytes,
         };
         inline for (names, 0..) |n, i| {
             const kind: rt.memory.Kind = if (i == 0) .host else .device;
@@ -260,9 +265,22 @@ pub const Scratch = struct {
         const bytes = std.mem.asBytes(&vals);
         std.debug.assert(bytes.len <= slot_bytes and self.dims_used < dims_slots);
         const p = self.dimsBase() + self.dims_used * slot_bytes;
-        @memcpy(p[0..bytes.len], bytes);
+        @memcpy(p[0..bytes.len], vals);
         self.dims_used += 1;
         return @ptrCast(p);
+    }
+
+    /// Stream `slot`'s recurrence snapshot in the round scratch: `window_rows` rows of `delta_bytes` each, row `r` at
+    /// `snapDelta(slot) + r * delta_bytes`. The forward writes it when a segment records.
+    pub fn snapDelta(self: *Scratch, slot: usize) [*]u8 {
+        std.debug.assert(slot < xs.max_segments);
+        return @as([*]u8, @ptrCast(self.snaps_delta.ptr.?)) + slot * xs.snap_delta_bytes;
+    }
+    /// Stream `slot`'s conv-tail snapshot: `window_rows` tails of `conv_bytes` each, row `r` at
+    /// `snapConv(slot) + r * conv_bytes` (row 0 the state before the window, as the kernel writes it).
+    pub fn snapConv(self: *Scratch, slot: usize) [*]u8 {
+        std.debug.assert(slot < xs.max_segments);
+        return @as([*]u8, @ptrCast(self.snaps_conv.ptr.?)) + slot * xs.snap_conv_bytes;
     }
 };
 
@@ -316,6 +334,20 @@ pub const Options = struct {
     stop_after: ?usize = null,
     head: Head = .last,
 };
+
+/// A stream's rows in one shared round: its cache (at its own length) and the scratch row its first row lands on.
+/// `record` saves this window's recurrence rows and conv tails into stream `slot`'s snapshots (a later `keep` reads
+/// them back); `slot` is ignored without `record`.
+pub const Segment = struct {
+    cache: *xs.Cache,
+    rows: usize,
+    base: usize = 0,
+    record: bool = false,
+    slot: usize = 0,
+};
+
+/// Streams one shared round serves at most (one segment a stream); the snapshot scratch has this many slots.
+pub const max_segments = xs.max_segments;
 
 /// Forward `tokens` as one segment appended to `cache`. Blocks until the card has finished. On return `cache.len` has
 /// advanced and `cache.logits` holds the last row's bf16 logits (unless `stop_after` is set); with head = .all
