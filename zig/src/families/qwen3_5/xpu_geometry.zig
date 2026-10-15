@@ -24,9 +24,13 @@ pub fn norm(rows: u32, hidden: u32) Geo {
 pub fn normNores(rows: u32, hidden: u32) Geo {
     return norm(rows, hidden);
 }
-/// qwen35_mlp_act: each work-item covers QW_VEC = 8 columns, so intermediate/8 per row.
+/// qwen35_mlp_act: each work-item covers QW_VEC = 8 columns, so ceil(intermediate/8) work-items per row.
+/// The grid is rounded up to a whole number of 256-wide work-groups because the runtime rejects a global size that
+/// is not a multiple of the local size; the kernel's own `c >= QW_COLS_PER_ROW` guard discards the extra work-items.
+/// At the 2B intermediate (6144) the rounded value is the exact one (768); at the 27B 17408 it is 2304 (vs 2176).
 pub fn mlpAct(rows: u32, intermediate: u32) Geo {
-    return .{ .gx = intermediate / 8, .gy = rows, .lx = 256 };
+    const cols = ceilDiv(intermediate, 8); // QW_VEC = 8
+    return .{ .gx = ceilDiv(cols, 256) * 256, .gy = rows, .lx = 256 };
 }
 /// qwen35_gdn_pre: QW_DK = 128 work-items per (head, row); heads3 = 2*QW_NK + QW_NV.
 pub fn gdnPre(rows: u32, heads3: u32) Geo {
@@ -91,7 +95,7 @@ test "geometry matches launch.py (2B defaults)" {
 test "geometry scales to the 27B shapes" {
     // 27B: hidden 5120, intermediate 17408, head_dim 256, qheads 24, kv_heads 4, k/v heads 16/48.
     try expect(norm(4, 5120), 320, 4, 1, 320);
-    try expect(mlpAct(3, 17408), 2176, 3, 1, 256);
+    try expect(mlpAct(3, 17408), 2304, 3, 1, 256);
     try expect(layout(.attention_gate, 4, 5120, 256, 24, 4), 5120, 4, 1, 256);
     try expect(layout(.queries, 4, 5120, 256, 24, 4), 256, 24, 4, 256);
     try expect(layout(.keys, 4, 5120, 256, 24, 4), 256, 4, 4, 256);
