@@ -78,17 +78,17 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // the 27B build overrides them with -D flags (see zig/build/xpu.zig `sharedDefines`).
     const qk_files = b.addWriteFiles();
     var qk_src: []const u8 = "//! Compiled Qwen kernel binaries, embedded (see zig/build/xpu.zig).\n";
+    // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
+    // ocloc takes compile options as one string after -options, so the -D flags belong there, not as bare args.
+    const opt_string = b.fmt("-cl-std=CL3.0 {s}", .{shape_defines});
     inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
-        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", opt_string, "-file" });
         c.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
         c.addArg("-out_dir");
         const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         _ = qk_files.addCopyFile(out.path(b, file), file);
         qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
-        // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
-        var it = std.mem.tokenizeAny(u8, shape_defines, " \t");
-        while (it.next()) |d| c.addArg(d);
     }
     const qk = b.createModule(.{ .root_source_file = qk_files.add("xpu_qwen35_kernels.zig", qk_src) });
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
