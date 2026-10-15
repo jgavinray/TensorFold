@@ -1,10 +1,10 @@
 //! Qwen3.5-2B forward pass on an Intel B70 (Level Zero + OpenCL kernels), mirroring forward.zig's op order and rounding
 //! points (bf16 activations between every op, fp32 recurrence). Kernels are loaded by key from ocloc-compiled modules
 //! embedded in the executable at build time (build option `xpu_qwen35_kernels`, @embedFile of the ocloc outputs), so the
-//! binary works from any working directory. Each module has a reference build and, where one was accepted, a port
-//! (<key>_port); a kernel's launch geometry comes with its variant (xpu_geometry.zig). Default: ports where they exist,
-//! reference otherwise; TF_XPU_QWEN35_VARIANT=reference forces all-reference. TF_XPU_QWEN35_KERNELS names a directory of
-//! <module key>.bin files that replaces the embedded modules (development override; the variant still selects the geometry).
+//! binary works from any working directory. The kernels are the shared sources (zig/kernels/xpu/shared/<key>/) built with
+//! their 2B-default shape defines; a kernel's launch geometry comes from xpu_geometry.zig, which takes the shape values.
+//! TF_XPU_QWEN35_KERNELS names a directory of <module key>.bin files that replaces the embedded modules (development
+//! override; the geometry still follows the running shapes).
 //! One segment per call (prefill rows or a decode row appended to the cache); no snapshot recording (record = false).
 const std = @import("std");
 const rt = @import("../../xpu/runtime.zig");
@@ -22,7 +22,7 @@ pub const Head = enum { last, all };
 pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing };
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-/// Module keys (file names under reference/<key>/) and the kernels each provides.
+/// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
     embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
@@ -42,31 +42,13 @@ pub const KernelId = enum {
 const module_count = std.enums.values(Module).len;
 const kernel_count = std.enums.values(KernelId).len;
 
-pub const Variant = geo.Variant;
-
-/// The module's port exists in this build (zig/build/xpu.zig `port_keys`).
-fn hasPort(comptime m: Module) bool {
-    return @hasDecl(kbins, @tagName(m) ++ "_port");
-}
-
 /// The compiled module's bytes, embedded in the executable by the build graph (`zig/build/xpu.zig`).
-fn builtinBytes(m: Module, v: Variant) []const u8 {
-    return switch (m) {
-        inline else => |t| if (comptime hasPort(t)) (if (v == .port) &@field(kbins, @tagName(t) ++ "_port") else &@field(kbins, @tagName(t))) else &@field(kbins, @tagName(t)),
-    };
-}
-
-/// Variant a module runs as: the port where one is built, unless TF_XPU_QWEN35_VARIANT=reference.
-fn chooseVariant(m: Module, force_reference: bool) Variant {
-    if (force_reference) return .reference;
-    return switch (m) {
-        inline else => |t| if (comptime hasPort(t)) .port else .reference,
-    };
+fn builtinBytes(comptime m: Module) []const u8 {
+    return &@field(kbins, @tagName(m));
 }
 
 pub const Kernels = struct {
     modules: [module_count]rt.module.Module,
-    variant: [module_count]Variant = @splat(.reference),
     loaded: usize = 0,
     list: [kernel_count]Kernel,
     made: usize = 0,
@@ -75,11 +57,9 @@ pub const Kernels = struct {
         self.loaded = 0;
         self.made = 0;
         errdefer self.deinit();
-        const force_ref = if (getenv("TF_XPU_QWEN35_VARIANT")) |v| std.mem.eql(u8, std.mem.span(v), "reference") else false;
         const dir: ?[:0]const u8 = if (getenv("TF_XPU_QWEN35_KERNELS")) |p| std.mem.span(p) else null;
         inline for (std.enums.values(Module), 0..) |mod, i| {
             const fname = @tagName(mod);
-            self.variant[i] = chooseVariant(mod, force_ref);
             var buf: [1024]u8 = undefined;
             // TF_XPU_QWEN35_KERNELS (development) reads <dir>/<key>.bin; otherwise the module embedded at build time.
             var file: ?[]u8 = null;
@@ -90,7 +70,7 @@ pub const Kernels = struct {
                     return error.KernelBinaryMissing;
                 };
                 break :blk file.?;
-            } else builtinBytes(mod, self.variant[i]);
+            } else builtinBytes(mod);
             defer if (file) |b| gpa.free(b);
             var log: rt.module.BuildLog = .{};
             self.modules[i] = rt.module.Module.load(&s.ctx, bin, &log) catch |e| {
@@ -115,13 +95,10 @@ pub const Kernels = struct {
     fn get(self: *Kernels, id: KernelId) *Kernel {
         return &self.list[@intFromEnum(id)];
     }
-    pub fn variantOf(self: *const Kernels, id: KernelId) Variant {
-        return self.variant[@intFromEnum(id.module())];
-    }
-    /// One line per module: which variant is running.
+    /// One line per module (kept for parity with the profiler output).
     pub fn describe(self: *const Kernels) void {
-        std.debug.print("xpu qwen3.5 kernel variants:", .{});
-        inline for (std.enums.values(Module), 0..) |m, i| std.debug.print(" {s}={s}", .{ @tagName(m), @tagName(self.variant[i]) });
+        std.debug.print("xpu qwen3.5 kernels: shared ({d} modules)", .{self.loaded});
+        inline for (std.enums.values(Module)) |m| std.debug.print(" {s}", .{@tagName(m)});
         std.debug.print("\n", .{});
     }
 };
@@ -287,22 +264,19 @@ const Run = struct {
         }
         try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, null);
     }
-    fn v(self: Run, id: KernelId) Variant {
-        return self.k.variantOf(id);
-    }
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
-        try self.go(.qmm, geo.qmm(self.v(.qmm), @intCast(rows), @intCast(l.outputs)), .{
+        try self.go(.qmm, geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
         });
     }
     fn norm(self: Run, h: *anyopaque, residual: ?*anyopaque, weight: xw.Tensor, x: *anyopaque, rows: usize) rt.Error!void {
         if (residual) |r| {
-            try self.go(.norm, geo.norm(self.v(.norm), @intCast(rows)), .{ h, r, self.wp(weight), c.eps, h, x });
+            try self.go(.norm, geo.norm(@intCast(rows), c.hidden), .{ h, r, self.wp(weight), c.eps, h, x });
         } else {
-            try self.go(.norm_nores, geo.normNores(self.v(.norm_nores), @intCast(rows)), .{ h, self.wp(weight), c.eps, x });
+            try self.go(.norm_nores, geo.normNores(@intCast(rows), c.hidden), .{ h, self.wp(weight), c.eps, x });
         }
     }
 };
@@ -333,7 +307,7 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
     const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc };
     const w = m.weights;
     const T: u32 = @intCast(total);
-    try ru.go(.embed, geo.layout(ru.v(.embed), .embed, T), .{ sc.pool.ptr, w.ptr(w.embedding.weight), w.ptr(w.embedding.scales), w.ptr(w.embedding.biases), sc.h.ptr });
+    try ru.go(.embed, geo.layout(.embed, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.pool.ptr, w.ptr(w.embedding.weight), w.ptr(w.embedding.scales), w.ptr(w.embedding.biases), sc.h.ptr });
     for (w.blocks, 0..) |block, i| {
         try ru.norm(sc.h.ptr.?, if (i == 0) null else sc.r.ptr, block.input_norm, sc.x.ptr.?, total);
         switch (block.mixer) {
@@ -343,7 +317,7 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
         try ru.norm(sc.h.ptr.?, sc.r.ptr, block.post_norm, sc.x.ptr.?, total);
         try ru.projection(block.gate, sc.x.ptr.?, sc.gate.ptr.?, total);
         try ru.projection(block.up, sc.x.ptr.?, sc.up.ptr.?, total);
-        try ru.go(.mlp_act, geo.mlpAct(ru.v(.mlp_act), T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
+        try ru.go(.mlp_act, geo.mlpAct(T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
         try ru.projection(block.down, sc.act.ptr.?, sc.r.ptr.?, total);
         if (o.stop_after) |n| if (i == n) {
             try s.queue.synchronize();
@@ -370,16 +344,16 @@ fn delta(ru: Run, d: xw.Delta, cache: *xs.Delta, total: usize) rt.Error!void {
     try ru.projection(d.a, sc.x.ptr.?, sc.a.ptr.?, total);
     try ru.projection(d.b, sc.x.ptr.?, sc.b.ptr.?, total);
     const w = ru.w;
-    try ru.go(.gdn_pre, geo.gdnPre(ru.v(.gdn_pre), T, 3 * c.linear_heads), .{
+    try ru.go(.gdn_pre, geo.gdnPre(T, 3 * c.linear_heads), .{
         sc.qkv.ptr, cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows().ptr)), sc.a.ptr, sc.b.ptr, w.ptr(d.a_log), w.ptr(d.dt_bias),
         sc.q.ptr, sc.k.ptr, sc.v.ptr, sc.g.ptr, sc.beta.ptr, sc.conv_snap.ptr,
     });
     // The recurrence is read into registers before it is written, one state row per work-item, so state_in == state_out is safe.
-    try ru.go(.gdn_chain, geo.gdnChain(ru.v(.gdn_chain), c.linear_dim, c.linear_heads), .{
+    try ru.go(.gdn_chain, geo.gdnChain(c.linear_dim, c.linear_heads), .{
         sc.q.ptr, sc.k.ptr, sc.v.ptr, sc.g.ptr, sc.beta.ptr, cache.recurrence.ptr, sc.dims([2]i32{ @intCast(total), 0 }), sc.y.ptr, cache.recurrence.ptr,
     });
     try ru.s.queue.copy(cache.conv.ptr, off(sc.conv_snap, (total - 1) * xs.conv_bytes), xs.conv_bytes, null);
-    try ru.go(.gdn_post, geo.gdnPost(ru.v(.gdn_post), T, c.linear_heads), .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });
+    try ru.go(.gdn_post, geo.gdnPost(T, c.linear_heads), .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });
     try ru.projection(d.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }
 
@@ -391,17 +365,17 @@ fn attention(ru: Run, a: xw.Attention, cache: *xs.Attention, len: usize, capacit
     try ru.projection(a.k, sc.x.ptr.?, sc.k.ptr.?, total);
     try ru.projection(a.v, sc.x.ptr.?, sc.v.ptr.?, total);
     const qn = sc.dims([4]u32{ T, c.query_heads, 2 * c.hidden, 2 * c.head_dim });
-    try ru.go(.head_norm, geo.layout(ru.v(.head_norm), .head_norm, @intCast(total * c.query_heads)), .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
+    try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.query_heads), c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
     const kn = sc.dims([4]u32{ T, c.kv_heads, c.kv_heads * c.head_dim, c.head_dim });
-    try ru.go(.head_norm, geo.layout(ru.v(.head_norm), .head_norm, @intCast(total * c.kv_heads)), .{ sc.k.ptr, w.ptr(a.k_norm), sc.knorm.ptr, kn });
-    try ru.go(.queries, geo.layout(ru.v(.queries), .queries, T), .{ sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(len), T, 0, 0 }) });
-    try ru.go(.keys, geo.layout(ru.v(.keys), .keys, T), .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
+    try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.kv_heads), c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.k.ptr, w.ptr(a.k_norm), sc.knorm.ptr, kn });
+    try ru.go(.queries, geo.layout(.queries, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(len), T, 0, 0 }) });
+    try ru.go(.keys, geo.layout(.keys, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
     const nch: usize = (len + total + 127) / 128;
     const dims = sc.dims([8]i32{ @intCast(len), @intCast(total), @intCast(capacity), @intCast(nch), 0, @intCast(total), 0, 0 });
-    try ru.go(.attn_partial, geo.attnPartial(ru.v(.attn_partial), @intCast(nch), T, c.kv_heads), .{
+    try ru.go(.attn_partial, geo.attnPartial(@intCast(nch), T, c.query_heads), .{
         sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
     });
-    try ru.go(.attn_merge, geo.attnMerge(ru.v(.attn_merge), T, c.query_heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, sc.y.ptr });
-    try ru.go(.attention_gate, geo.layout(ru.v(.attention_gate), .attention_gate, T), .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
+    try ru.go(.attn_merge, geo.attnMerge(T, c.query_heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, sc.y.ptr });
+    try ru.go(.attention_gate, geo.layout(.attention_gate, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
     try ru.projection(a.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }
