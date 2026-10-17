@@ -6,11 +6,11 @@
 //! one `zeCommandQueueExecuteCommandLists` per token.
 //!
 //! Replay works because a decode step's only changing inputs are three integers - the token id, the RoPE position
-//! and the cache length - and the forward already passes every per-launch scalar through the host-visible
-//! `Scratch.pool` (its `dims` slots, `ids`, `windows`), never as a kernel argument. A recorded list bakes the
-//! *addresses* of those pool slots, and the forward allocates its `dims` slots in call order, so for a fixed shape
-//! each slot index holds the same field every token. The recorder therefore captures, per `dims` slot, which
-//! element carries the position or the cache length, and rewrites exactly those before each replay.
+//! and the cache length - and the forward passes every per-launch scalar through the host-visible `Scratch.pool`
+//! (its `dims` slots, `ids`), never as a kernel argument. A recorded list bakes the *addresses* of those pool slots,
+//! and the forward allocates its `dims` slots in call order, so for a fixed shape each slot index holds the same
+//! field every token. The recorder therefore captures, per `dims` slot, which element carries the position or the
+//! cache length, and rewrites exactly those before each replay.
 //!
 //! Scope: one token (`rows == 1`), one segment, `head = .last`. A different capacity or row count is a different
 //! shape and is recorded afresh, which is what the per-shape table is for.
@@ -33,17 +33,15 @@ pub const Values = struct {
     cache_len: u32,
 };
 
-/// A `dims` slot the recorded step reads, and which of its elements carries a value that moves per token.
-const DimsSlot = struct {
-    /// Byte offset of the slot from the pool's start.
-    offset: usize,
-    /// Index of the element inside the slot that holds the RoPE position, or null.
-    position_at: ?usize,
-    /// Index of the element inside the slot that holds the cache length, or null.
-    cache_len_at: ?usize,
-};
+/// The `dims`-slot classification lives with the forward that produces it (`xpu_forward.DimsSlot`).
+const DimsSlot = fwd.DimsSlot;
 
-/// One recorded decode step for a fixed (capacity, rows) shape.
+/// The shape a step was recorded for: a decode row count (always 1 here) and the cache capacity. The cache length at
+/// record time fixes which `dims` values are baked, but every kernel's *grid* depends only on the capacity
+/// (`attn_partial`'s chunk count is derived from it), so one recorded step per capacity serves every length.
+pub const Shape = struct { rows: usize, capacity: usize };
+
+/// One recorded decode step for a fixed (rows, capacity) shape.
 pub const Step = struct {
     list: Recorded,
     /// The `Scratch` the step was recorded against: its pool is written on every replay, so a replay is only valid
@@ -62,14 +60,14 @@ pub const Step = struct {
     }
 };
 
-/// One recorded step per (capacity, rows) shape; `find` returns the live one, `put` records or replaces it.
+/// One recorded step per (rows, capacity) shape; `find` returns the live one, `put` records or replaces it.
 pub const Replay = struct {
     gpa: std.mem.Allocator,
     buckets: std.ArrayList(Bucket) = .empty,
 
     const Bucket = struct {
-        capacity: usize,
         rows: usize,
+        capacity: usize,
         step: ?Step = null,
     };
 
@@ -84,23 +82,23 @@ pub const Replay = struct {
     }
 
     /// The recorded step for this shape, or null when none has been recorded yet.
-    pub fn find(self: *Replay, capacity: usize, rows: usize) ?*Step {
+    pub fn find(self: *Replay, rows: usize, capacity: usize) ?*Step {
         for (self.buckets.items) |*b| {
-            if (b.capacity == capacity and b.rows == rows) return if (b.step) |*st| st else null;
+            if (b.rows == rows and b.capacity == capacity) return if (b.step) |*st| st else null;
         }
         return null;
     }
 
-    /// Registers `step` under (capacity, rows), replacing any earlier one (whose list is freed).
-    pub fn put(self: *Replay, capacity: usize, rows: usize, step: Step) !void {
+    /// Registers `step` under (rows, capacity), replacing any earlier one (whose list is freed).
+    pub fn put(self: *Replay, rows: usize, capacity: usize, step: Step) !void {
         for (self.buckets.items) |*b| {
-            if (b.capacity == capacity and b.rows == rows) {
+            if (b.rows == rows and b.capacity == capacity) {
                 if (b.step) |*old| old.deinit(self.gpa);
                 b.step = step;
                 return;
             }
         }
-        try self.buckets.append(self.gpa, .{ .capacity = capacity, .rows = rows, .step = step });
+        try self.buckets.append(self.gpa, .{ .rows = rows, .capacity = capacity, .step = step });
     }
 };
 

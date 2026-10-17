@@ -71,7 +71,7 @@ pub const Xpu = struct {
         errdefer gpa.free(row);
         const rows = try gpa.alloc(u16, xs.max_segments * window_rows * c.vocab);
         errdefer gpa.free(rows);
-        out.* = .{ .gpa = gpa, .session = session, .model = model, .options = options, .row = row, .rows = rows, .scratch = try fwd.Scratch.init(session, options.chunk, options.capacity, xs.max_segments * window_rows) };
+        out.* = .{ .gpa = gpa, .session = session, .model = model, .options = options, .row = row, .rows = rows, .scratch = try fwd.Scratch.init(gpa, session, options.chunk, options.capacity, xs.max_segments * window_rows) };
         errdefer out.scratch.deinit();
         if (options.qualify) {
             @import("xpu_qualify.zig").check(gpa, session, model, &out.scratch) catch |err| switch (err) {

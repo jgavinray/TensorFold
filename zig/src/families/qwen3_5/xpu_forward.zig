@@ -193,16 +193,23 @@ pub const Scratch = struct {
     /// Snapshot buffers made so far (the `snaps_delta` entries up to this index), for `deinit`.
     made_snaps: usize = 0,
     dims_used: usize = 0,
+    /// While a decode step is being recorded, every `dims` slot index lands here so the replay can rewrite the
+    /// per-token scalars inside the captured arrays (see `xpu_replay.zig`). Null outside recording.
+    record_slots: ?*std.ArrayList(usize) = null,
+    /// Allocator for `record_slots` appends; the caller's, since the scratch does not own one otherwise.
+    gpa: std.mem.Allocator = undefined,
 
     const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
 
-    pub fn init(s: *rt.session.Session, rows: usize, capacity: usize, logit_rows: usize) rt.Error!Scratch {
+    pub fn init(gpa: std.mem.Allocator, s: *rt.session.Session, rows: usize, capacity: usize, logit_rows: usize) rt.Error!Scratch {
         var out: Scratch = undefined;
         out.rows = rows;
         out.capacity = capacity;
         out.logit_rows = logit_rows;
+        out.gpa = gpa;
+        out.record_slots = null;
         out.made = 0;
         out.dims_used = 0;
         out.prof = null;
@@ -261,13 +268,14 @@ pub const Scratch = struct {
     fn dimsBase(self: *Scratch) [*]u8 {
         return @as([*]u8, @ptrCast(self.pool.ptr.?)) + self.rows * 4 + self.rows * c.conv_taps * 4;
     }
-    /// Copies `vals` into a fresh slot of the pool and returns its device-visible address.
+    /// Copies `vals` into a fresh slot of the pool and returns its device-visible address. With a recorder active the
+    /// slot's index is appended to `record_slots` so the replay can rewrite the per-token scalars inside it.
     fn dims(self: *Scratch, vals: anytype) *anyopaque {
         const bytes = std.mem.asBytes(&vals);
         std.debug.assert(bytes.len <= slot_bytes and self.dims_used < dims_slots);
         const p: [*]u8 = self.dimsBase() + self.dims_used * slot_bytes;
         @memcpy(p[0..bytes.len], bytes);
-
+        if (self.record_slots) |list| list.append(self.gpa, self.dims_used) catch {};
         self.dims_used += 1;
         return @ptrCast(p);
     }
@@ -349,6 +357,14 @@ pub const Options = struct {
     /// Stop after this layer's MLP (no final norm / head): the layer output is h + r in the scratch.
     stop_after: ?usize = null,
     head: Head = .last,
+    /// When set, the forward *records* into this regular command list instead of executing: no work reaches the card
+    /// and nothing is synchronized. The caller closes the list and replays it (see `xpu_replay.zig`). The buffers the
+    /// launch arguments name are captured by address, so they must stay alive across replays; `rec` also forbids
+    /// profiling (a recorded list carries no timestamps) and the cache-commit copies at the end are skipped.
+    rec: ?*rt.cmdlist.Recorder = null,
+    /// Receives the pool slot index of every `dims` array the recorded step allocates, so the replay can find the
+    /// per-token scalars (position, cache length) inside them. Only used when `rec` is set.
+    slots: ?*std.ArrayList(usize) = null,
 };
 
 /// A stream's rows in one shared round: its cache and how many rows it contributes, in segment order (each segment's
@@ -359,6 +375,17 @@ pub const Segment = struct {
     rows: usize,
 };
 
+/// A `dims` pool slot a recorded decode step reads, and which of its elements carries a value that moves per token
+/// (the RoPE position and the cache length). `xpu_replay.zig` rewrites these before every replay.
+pub const DimsSlot = struct {
+    /// Byte offset of the slot from the pool's start.
+    offset: usize,
+    /// Index of the element that holds the RoPE position, or null.
+    position_at: ?usize = null,
+    /// Index of the element that holds the cache length, or null.
+    cache_len_at: ?usize = null,
+};
+
 /// Streams one shared round serves at most (one segment a stream); the snapshot scratch has this many slots.
 pub const max_segments = xs.max_segments;
 
@@ -367,6 +394,45 @@ pub const max_segments = xs.max_segments;
 /// set); with head = .all `scratch.logits` holds every row.
 pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, tokens: []const u32, o: Options) Error!void {
     return runSegments(s, m, sc, &.{.{ .cache = cache, .rows = tokens.len }}, tokens, false, o);
+}
+
+/// One decode token recorded into `rec` as a regular command list: the same launches as `run` with a single token and
+/// `head = .last`, but no work reaches the card and nothing is synchronized. `slots` receives one entry per `dims`
+/// array the step allocates, with the element index of every scalar that changes per token (the RoPE position and the
+/// cache length), so a replay can rewrite exactly those before re-submitting the list. `position` is the RoPE position
+/// (the cache length before this token). Caller closes the list (`Recorded.take`).
+pub fn recordDecode(
+    rec: *rt.cmdlist.Recorder,
+    m: *Model,
+    sc: *Scratch,
+    cache: *xs.Cache,
+    tokens: []const u32,
+    position: u32,
+    slots: *std.ArrayList(DimsSlot),
+) Error!void {
+    if (tokens.len != 1) return error.ReplayNeedsOneRow;
+    // The forward records one `dims` slot per attention/linear kernel; capture their pool indices in call order so the
+    // per-token scalars can be classified below against the values this pass was recorded with.
+    var capture: std.ArrayList(usize) = .empty;
+    defer capture.deinit(sc.gpa);
+    sc.record_slots = &capture;
+    defer sc.record_slots = null;
+    try runSegments(rec, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec });
+    // Classify: a slot is `position` when it holds the RoPE position, `cache_len` when it holds the cache length.
+    // Both appear in several slots (queries, keys and attn_partial all carry them), and every occurrence must be
+    // rewritten, so each slot records its own first matching element.
+    const pool: [*]u8 = @ptrCast(sc.pool.ptr.?);
+    const base = @intFromPtr(sc.dimsBase()) - @intFromPtr(sc.pool.ptr.?);
+    for (capture.items) |slot_i| {
+        const d: [*]const i32 = @ptrCast(@alignCast(pool + base + slot_i * Scratch.slot_bytes));
+        var s: DimsSlot = .{ .offset = base + slot_i * Scratch.slot_bytes };
+        for (0..8) |j| {
+            const v: u32 = @intCast(@max(d[j], 0));
+            if (v == position and s.position_at == null) s.position_at = j;
+            if (v == cache.len and s.cache_len_at == null) s.cache_len_at = j;
+        }
+        try slots.append(sc.gpa, s);
+    }
 }
 
 /// Forward `tokens` split across `segments`, each its own cache and row range, in one launch set (the shared-round
@@ -394,7 +460,9 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         base += seg.rows;
     }
     sc.dims_used = 0;
-    const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc };
+    sc.record_slots = o.slots;
+    defer sc.record_slots = null;
+    const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc, .rec = o.rec };
     const w = m.weights;
     const T: u32 = @intCast(total);
     try ru.go(.embed, geo.layout(.embed, T, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.pool.ptr, w.ptr(w.embedding.weight), w.ptr(w.embedding.scales), w.ptr(w.embedding.biases), sc.h.ptr });
@@ -410,7 +478,7 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         try ru.go(.mlp_act, geo.mlpAct(T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
         try ru.projection(block.down, sc.act.ptr.?, sc.r.ptr.?, total);
         if (o.stop_after) |n| if (i == n) {
-            try s.queue.synchronize();
+            if (o.rec == null) try s.queue.synchronize();
             return;
         };
     }
@@ -421,6 +489,9 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         try ru.projection(w.head(), off(sc.x, (total - 1) * c.hidden * 2), sc.logits.ptr.?, 1);
     }
     // Each segment's committed logits row: the last row of its range (head = .all keeps every row in sc.logits).
+    // A recording pass stops here: the commit is a queued copy plus a cache-length bump, and neither belongs in a
+    // replayed list (the caller commits once, after the last replay, from the eager path).
+    if (o.rec != null) return;
     base = 0;
     for (segments) |seg| {
         const row: usize = if (o.head == .all) base + seg.rows - 1 else 0;
@@ -466,7 +537,13 @@ fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: 
             sc.dims([2]i32{ @intCast(seg.rows), @intFromBool(record) }), off(sc.y, base * c.hidden * 2), snap_rec,
         });
         // Without `record` the recurrence went straight into `cache.recurrence`; the conv tail is the segment's last row.
-        if (!record) try ru.s.queue.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes, null);
+        if (!record) {
+            if (ru.rec) |r| {
+                try r.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes);
+            } else {
+                try ru.s.queue.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes, null);
+            }
+        }
         base += seg.rows;
     }
     try ru.go(.gdn_post, geo.gdnPost(T, c.linear_heads), .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });

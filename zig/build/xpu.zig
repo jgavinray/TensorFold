@@ -50,13 +50,33 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const shape_defines = b.option([]const u8, "qwen-shape-defines", "space-separated -D flags for the shared Qwen kernels (empty = 2B defaults)") orelse "";
 
     // Test kernels, compiled to native binaries: <name>_<device>.bin. The path is passed to the tests as a build option.
+    // `-Dtest-kernels=prebuilt[:<dir>]` embeds modules built earlier on a host without ocloc (same fallback the Qwen
+    // kernels use), so the on-card runtime tests stay runnable while intel-ocloc is absent.
+    const test_kernels = b.option([]const u8, "test-kernels", "ocloc | prebuilt[:<dir>]: where the runtime/dpas test kernel modules come from") orelse if (oclocAvailable(b, ocloc)) "ocloc" else "prebuilt";
+    const test_prebuilt: ?[]const u8 = if (std.mem.eql(u8, test_kernels, "prebuilt"))
+        "zig/kernels/xpu/prebuilt-test"
+    else if (std.mem.startsWith(u8, test_kernels, "prebuilt:"))
+        test_kernels["prebuilt:".len..]
+    else
+        null;
+    if (test_prebuilt == null and !std.mem.eql(u8, test_kernels, "ocloc")) {
+        std.debug.panic("test-kernels must be `ocloc`, `prebuilt` or `prebuilt:<dir>`, got {s}", .{test_kernels});
+    }
     const kernels = b.addOptions();
     inline for (.{ "runtime_tests", "dpas" }) |name| {
-        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
-        c.addFileArg(b.path("zig/kernels/xpu/" ++ name ++ ".cl"));
-        c.addArg("-out_dir");
-        const out = c.addOutputDirectoryArg(name ++ "-out");
-        kernels.addOptionPath(name, out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
+        if (test_prebuilt) |dir| {
+            const src = b.pathJoin(&.{ dir, file });
+            const wf = b.addWriteFiles();
+            const copied = wf.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
+            kernels.addOptionPath(name, copied);
+        } else {
+            const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
+            c.addFileArg(b.path("zig/kernels/xpu/" ++ name ++ ".cl"));
+            c.addArg("-out_dir");
+            const out = c.addOutputDirectoryArg(name ++ "-out");
+            kernels.addOptionPath(name, out.path(b, file));
+        }
     }
 
     const gpu_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/runtime_tests.zig"), .target = target, .link_libc = true });

@@ -266,7 +266,7 @@ fn measure(s: *rt.session.Session, m: *fwd.Model, _: *fwd.Scratch, capdir: []con
     defer gpa.free(ids);
     @memcpy(std.mem.sliceAsBytes(ids), ids_bytes);
     m.kernels.describe();
-    var sc_own = try fwd.Scratch.init(s, ids.len, capacity, ids.len);
+    var sc_own = try fwd.Scratch.init(gpa, s, ids.len, capacity, ids.len);
     defer sc_own.deinit();
     const sc = &sc_own;
     const row = try gpa.alloc(u16, cfg.vocab);
@@ -425,7 +425,7 @@ pub fn main(init: std.process.Init) !u8 {
     var m: fwd.Model = .{ .weights = &w, .kernels = undefined };
     try m.kernels.load(&s, gpa);
     defer m.kernels.deinit();
-    var sc = try fwd.Scratch.init(&s, 176, capacity, 64);
+    var sc = try fwd.Scratch.init(gpa, &s, 176, capacity, 64);
     defer sc.deinit();
     std.debug.print("weights {d:.1} MiB and kernels loaded\n", .{@as(f64, @floatFromInt(w.total_bytes)) / (1 << 20)});
 
