@@ -1,31 +1,34 @@
-// qwen35_qmm_pair: two int4 projections sharing one activation row, in one launch - the Qwen3.5 GatedDeltaNet
-// layer's `in_proj_a` and `in_proj_b` (both N = QW_PAIR_N = 16, K = hidden). Semantics are exactly two calls to
-// qmm.cl (one per projection) on the same X, with the same fp32 accumulation and the same single bf16 RNE store,
-// so each output is bit-identical to the unfused qmm. Nothing is recomputed and no activation is materialized;
-// the only saving is one kernel launch (the two N=16 projections are launch-bound: ~22 KB of traffic each).
+// qwen35_qmm_pair: two int4 projections of one activation row, in a single launch. Used for the Qwen3.5
+// GatedDeltaNet `in_proj_a`/`in_proj_b` (N = 16 each) and the attention `k_proj`/`v_proj` (N = 512 each).
+// Semantics are exactly two calls to qmm.cl (one per projection) on the same X, with the same fp32 accumulation
+// and the same single bf16 RNE store, so each output is bit-identical to the unfused qmm. Nothing is recomputed
+// and no activation is materialized; the saving is one kernel launch per pair, and the shared X is read once per
+// work-group instead of once per projection.
 //
-// Layout: the work-group covers QW_TILE = QW_SETS*8 = 64 columns as qmm.cl does, but only 2*QW_PAIR_N = 32
-// columns are live (QW_PAIR_N = 16 per projection). Column set s covers columns 8s..8s+7 of the *pair*: the first
-// QW_PAIR_SETS/2 sets (s < 2) belong to A, the remaining sets (s >= 2) to B. Each set's 8 columns come from the
-// source triple of its own projection (W/SC/BI) and are stored to that projection's own output buffer.
-// Work-group = QW_PAIR_SETS * QW_LANES = 4 * 32 = 128 work-items.
+// Layout: a work-group covers QW_TILE = QW_SETS*8 = 64 columns, split in half - the first QW_SETS/2 column sets
+// cover projection A's columns, the remaining sets cover projection B's. The grid walks both projections in
+// lockstep: work-group (bx, r) covers columns [bx*QW_HALF_TILE, +QW_HALF_TILE) of A and of B, where
+// QW_HALF_TILE = QW_TILE/2 = 32. Each set's 8 columns come from the source triple (W/SC/BI) of its own
+// projection and are stored to that projection's own output buffer, so no downstream indexing changes.
 //
-// The grid is (1, R): one work-group covers both projections of one row (the 2B/27B pair is 32 columns total,
-// well under the 64-column tile). R is a runtime argument.
+// Geometry: gx = ceil(max(NA, NB) / QW_HALF_TILE) * QW_WG, gy = R. NA and NB must be equal (the callers' pairs
+// are) and are passed as `N`; a set whose columns exceed N is dead and returns before any barrier.
 
 #pragma OPENCL EXTENSION cl_intel_bfloat16_conversions : enable
 
-#ifndef QW_PAIR_N
-#define QW_PAIR_N 16     // output columns per projection (linear_heads on 2B and 27B alike)
-#endif
 #ifndef QW_GROUP
 #define QW_GROUP 64      // affine quantisation group size
+#endif
+#ifndef QW_SETS
+#define QW_SETS 8        // column sets per work-group, 8 columns each
 #endif
 #ifndef QW_LANES
 #define QW_LANES 32      // work-items per column set
 #endif
-#define QW_PAIR_SETS ((2 * QW_PAIR_N) / 8)   // column sets covering both projections (4 at the default)
-#define QW_PAIR_WG (QW_PAIR_SETS * QW_LANES) // work-group size (128 at the default)
+#define QW_TILE (QW_SETS * 8)            // 64 output columns per work-group
+#define QW_HALF_TILE (QW_TILE / 2)       // 32 columns of each projection per work-group
+#define QW_SETS_PER_PROJ (QW_SETS / 2)   // 4 sets (32 columns) per projection
+#define QW_WG (QW_SETS * QW_LANES)       // 256 work-items per work-group
 
 inline float bf16_to_f32(ushort b) { return intel_convert_as_bfloat16_float(b); }
 
@@ -43,16 +46,17 @@ __kernel void qwen35_qmm_pair(__global const ushort* X,   // bf16 bits, R x K (s
     const int G = K / QW_GROUP;
 
     const int tid = get_local_id(0);
-    const int s = tid / QW_LANES;         // column set 0..QW_PAIR_SETS-1
+    const int s = tid / QW_LANES;         // column set 0..QW_SETS-1
     const int l = tid % QW_LANES;         // lane within the set
     const int r = get_group_id(1);
 
     if (r >= R) return;
 
-    // Set s < QW_PAIR_SETS/2 covers projection A's columns; the rest cover B's.
-    const bool is_a = s < QW_PAIR_SETS / 2;
-    const int n0 = (s % (QW_PAIR_SETS / 2)) * 8;   // column within the projection
-    if (n0 >= N) return;
+    // Sets below QW_SETS_PER_PROJ cover projection A; the rest cover B. Each projection's work-group covers
+    // QW_HALF_TILE columns, so the column within the projection is bx*QW_HALF_TILE + (set % sets-per-proj)*8.
+    const bool is_a = s < QW_SETS_PER_PROJ;
+    const int n0 = get_group_id(0) * QW_HALF_TILE + (s % QW_SETS_PER_PROJ) * 8;
+    if (n0 >= N) return;                  // whole set dead: exit before the barrier
 
     const __global uint* W = is_a ? WA : WB;
     const __global ushort* SC = is_a ? SCA : SCB;
@@ -66,8 +70,8 @@ __kernel void qwen35_qmm_pair(__global const ushort* X,   // bf16 bits, R x K (s
     acc[0] = acc[1] = acc[2] = acc[3] = acc[4] = acc[5] = acc[6] = acc[7] = 0.0f;
 
     for (int g = l; g < G; g += QW_LANES) {
-        const int xb = 8 * g;
-        const int wb = 2 * g;
+        const int xb = 8 * g;             // uint4 index of the group's first activation
+        const int wb = 2 * g;             // uint4 index of the group's first W word
         float sqx[8];
         sqx[0] = sqx[1] = sqx[2] = sqx[3] = sqx[4] = sqx[5] = sqx[6] = sqx[7] = 0.0f;
         float sx = 0.0f;
@@ -75,7 +79,7 @@ __kernel void qwen35_qmm_pair(__global const ushort* X,   // bf16 bits, R x K (s
         uint4 w0[8], w1[8];
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int nc = min(n0 + i, N - 1);
+            const int nc = min(n0 + i, N - 1); // clamp: dead columns read row N-1, results discarded
             const __global uint4* wv = (const __global uint4*)(W + (size_t)nc * (K >> 3));
             w0[i] = wv[wb];
             w1[i] = wv[wb + 1];
@@ -125,7 +129,7 @@ __kernel void qwen35_qmm_pair(__global const ushort* X,   // bf16 bits, R x K (s
         }
     }
 
-    __local float red[QW_PAIR_SETS][8][32];
+    __local float red[QW_SETS][8][32];
     #pragma unroll
     for (int i = 0; i < 8; ++i) red[s][i][l] = acc[i];
     barrier(CLK_LOCAL_MEM_FENCE);

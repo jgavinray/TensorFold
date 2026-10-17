@@ -377,9 +377,10 @@ const Run = struct {
         });
     }
     /// Two same-shape projections of one activation row in a single launch (`qmm_pair`). Bit-identical to two
-    /// `projection` calls; saves one launch for the launch-bound N=16 GatedDeltaNet a/b pair.
+    /// `projection` calls; saves one launch for the launch-bound N=16 GatedDeltaNet a/b pair and the N=512
+    /// attention k/v pair.
     fn projectionPair(self: Run, a: xw.Linear, a_out: *anyopaque, b: xw.Linear, b_out: *anyopaque, x: *anyopaque, rows: usize) Error!void {
-        std.debug.assert(a.inputs == b.inputs and a.outputs == b.outputs and a.outputs <= 16);
+        std.debug.assert(a.inputs == b.inputs and a.outputs == b.outputs);
         try self.goShape(.qmm_pair, Profile.shapeKey(a.outputs, a.inputs), geo.qmmPair(@intCast(rows), @intCast(a.outputs)), .{
             x,
             @as(i32, @intCast(rows)),
@@ -610,8 +611,8 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
     const w = ru.w;
     const T: u32 = @intCast(total);
     try ru.projection(a.q, sc.x.ptr.?, sc.qraw.ptr.?, total);
-    try ru.projection(a.k, sc.x.ptr.?, sc.k.ptr.?, total);
-    try ru.projection(a.v, sc.x.ptr.?, sc.v.ptr.?, total);
+    // k and v are both N = kv_heads*head_dim (512) projections of the same x: one fused launch instead of two.
+    try ru.projectionPair(a.k, sc.k.ptr.?, a.v, sc.v.ptr.?, sc.x.ptr.?, total);
     const qn = sc.dims([4]u32{ T, c.query_heads, 2 * c.hidden, 2 * c.head_dim });
     try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.query_heads), c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
     const kn = sc.dims([4]u32{ T, c.kv_heads, c.kv_heads * c.head_dim, c.head_dim });
