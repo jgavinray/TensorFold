@@ -113,17 +113,32 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
         q27_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ q27_src, name, file });
     }
     const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
+    // TEMP (ocloc removed from this host): build the two 27B tools against the kernel binaries that were compiled
+    // and cached before intel-ocloc was uninstalled, so the tools can be linked and exercised without a rebuild.
+    // Delete this block once ocloc is reinstalled (the real path is above).
+    const cached_dir = b.option([]const u8, "qwen27-cached-kernels", "directory of prebuilt <key>_bmg.bin 27B kernel modules") orelse null;
+    var q27k_cached: ?*std.Build.Module = null;
+    if (cached_dir) |dir| {
+        const files = b.addWriteFiles();
+        var src: []const u8 = "//! Cached 27B kernel binaries (see zig/build/xpu.zig TEMP block).\n";
+        inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+            const f = b.fmt("{s}_bmg.bin", .{name});
+            _ = files.addCopyFile(b.path(b.fmt("{s}/{s}", .{ dir, f })), f);
+            src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ src, name, f });
+        }
+        q27k_cached = b.createModule(.{ .root_source_file = files.add("xpu_qwen27_kernels.zig", src) });
+    }
     const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
-    q27_mod.addImport("xpu_qwen35_kernels", q27k);
+    q27_mod.addImport("xpu_qwen35_kernels", q27k_cached orelse q27k);
     // Phase 6.3: the two 27B tools. tf-xpu-qwen27-logits writes len(tokens) x vocab bf16 logits; tf-xpu-qwen27-greedy
     // prints n greedy token ids. Both share the forward and the 27B kernels above.
     const q27_logits = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_logits.zig"), .target = target, .optimize = .Debug, .link_libc = true });
-    q27_logits.addImport("xpu_qwen35_kernels", q27k);
+    q27_logits.addImport("xpu_qwen35_kernels", q27k_cached orelse q27k);
     q27_logits.addImport("qwen27_forward", q27_mod);
     const logits_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-logits", .root_module = q27_logits });
     const logits_install = b.addInstallArtifact(logits_exe, .{});
     const greedy = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_greedy.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
-    greedy.addImport("xpu_qwen35_kernels", q27k);
+    greedy.addImport("xpu_qwen35_kernels", q27k_cached orelse q27k);
     greedy.addImport("qwen27_forward", q27_mod);
     const greedy_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-greedy", .root_module = greedy });
     const greedy_install = b.addInstallArtifact(greedy_exe, .{});
