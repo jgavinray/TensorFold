@@ -43,16 +43,11 @@ const geo = @import("../qwen3_5/xpu_geometry.zig");
 const Buffer = rt.memory.Buffer;
 const Kernel = rt.module.Kernel;
 const Dim = rt.launch.Dim3;
-/// TEMP: launch tracing, enabled with TF_XPU_QWEN27_TRACE=1.
-var trace_on: bool = false;
-pub fn setTrace(v: bool) void {
-    trace_on = v;
-}
 pub const Head = enum { last, all };
 pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing };
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-/// TEMP: true when `name` is set and not "0".
+/// True when `name` is set and not "0" (used by `Kernels.load` for the TF_XPU_QWEN35_KERNELS override).
 pub fn getenvBool(name: [*:0]const u8) bool {
     const v = getenv(name) orelse return false;
     return !std.mem.eql(u8, std.mem.span(v), "0");
@@ -190,8 +185,19 @@ pub const Scratch = struct {
         errdefer out.deinit();
         const chunks = (capacity + 127) / 128;
         const hid = rows * config.hidden * 2;
+        // Every activation row buffer is sized to the widest writer, not to `hidden`: at 2B the GDN value width
+        // (v_heads*dv) and the query width (heads*head_dim) both happen to equal `hidden`, so `rows*hidden` was
+        // always enough; at 27B they are 6144 vs hidden 5120, and sizing by `hidden` under-allocated `q`, `v`,
+        // `y`, `mix` and `queries` by 20% - a silent device-buffer overrun (and a page-fault risk). The Metal
+        // frame (gpu_frame.zig) sizes by the same maxima; these match them.
+        const mix_w = @max(config.hidden, config.gdnValueDim()); // gdn_post writes rows*v_heads*dv, attention_gate rows*hidden
+        const q_w = @max(config.hidden, config.heads * config.head_dim); // head_norm writes rows*heads*head_dim
+        const v_w = @max(config.hidden, config.gdnValueDim()); // gdn_pre writes rows*v_heads*dv
+        const rows_mix = rows * mix_w * 2;
+        const rows_q = rows * q_w * 2;
+        const rows_v = rows * v_w * 2;
         const sizes = [_]usize{
-            rows * 4 + rows * config.conv_kernel * 4 + dims_slots * slot_bytes, hid, hid, hid, hid, hid, hid, hid, hid, hid, hid,
+            rows * 4 + rows * config.conv_kernel * 4 + dims_slots * slot_bytes, hid, hid, hid, rows_v, rows_q, hid, rows_v, rows_mix, rows_mix, rows_q,
             rows * config.intermediate * 2, rows * config.intermediate * 2, rows * config.intermediate * 2, rows * config.intermediate * 2,
             rows * config.qDim() * 2, rows * config.kvDim() * 2,
             rows * config.v_heads * 2, rows * config.v_heads * 2, rows * config.v_heads * 2, rows * config.v_heads * 4,
@@ -245,7 +251,6 @@ const Run = struct {
     fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
         const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
-        if (trace_on) std.debug.print("TRACE {s} g=({d},{d},{d}) l=({d},{d},{d})\n", .{ @tagName(id), g.gx, g.gy, g.gz, g.lx, g.ly, g.lz });
         try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, null);
     }
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
