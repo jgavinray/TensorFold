@@ -43,9 +43,20 @@ const geo = @import("../qwen3_5/xpu_geometry.zig");
 const Buffer = rt.memory.Buffer;
 const Kernel = rt.module.Kernel;
 const Dim = rt.launch.Dim3;
+/// TEMP: launch tracing, enabled with TF_XPU_QWEN27_TRACE=1.
+var trace_on: bool = false;
+pub fn setTrace(v: bool) void {
+    trace_on = v;
+}
 pub const Head = enum { last, all };
 pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing };
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// TEMP: true when `name` is set and not "0".
+pub fn getenvBool(name: [*:0]const u8) bool {
+    const v = getenv(name) orelse return false;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
 
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
@@ -234,6 +245,7 @@ const Run = struct {
     fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
         const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
+        if (trace_on) std.debug.print("TRACE {s} g=({d},{d},{d}) l=({d},{d},{d})\n", .{ @tagName(id), g.gx, g.gy, g.gz, g.lx, g.ly, g.lz });
         try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, null);
     }
     fn wp(self: Run, t: xw.Tensor) *anyopaque {

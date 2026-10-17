@@ -124,6 +124,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const t0 = sys.nowNs();
     std.debug.print("forward...\n", .{});
+    if (fwd.getenvBool("TF_XPU_QWEN27_TRACE")) fwd.setTrace(true);
     try fwd.run(&s, &m, &sc, &cache, ids, .{ .head = .all });
     std.debug.print("forward {d} tokens in {d:.2} s ({d:.2} tokens/s teacher-forced)\n", .{
         rows,

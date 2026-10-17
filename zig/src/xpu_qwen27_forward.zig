@@ -18,3 +18,5 @@ pub const Kernels = forward.Kernels;
 pub const KernelId = forward.KernelId;
 pub const kernel_ids = forward.kernel_ids;
 pub const run = forward.run;
+pub const setTrace = forward.setTrace;
+pub const getenvBool = forward.getenvBool;
