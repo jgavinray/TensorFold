@@ -314,7 +314,7 @@ fn measure(s: *rt.session.Session, m: *fwd.Model, _: *fwd.Scratch, capdir: []con
         try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
         next[0] = @intCast(top2(row).first);
         try fwd.run(s, m, sc, &cache, &next, .{});
-        try sc.prof.?.collect();
+        try sc.prof.?.collect(gpa);
     }
     var total: f64 = 0;
     for (sc.prof.?.ns) |x| total += x / reps;
@@ -324,6 +324,18 @@ fn measure(s: *rt.session.Session, m: *fwd.Model, _: *fwd.Scratch, capdir: []con
         if (sc.prof.?.count[i] == 0) continue;
         std.debug.print("KERNEL {s:<15} launches {d:>4}  {d:>9.1} us  {d:>5.1}%\n", .{
             @tagName(id), sc.prof.?.count[i] / reps, sc.prof.?.ns[i] / reps / 1e3, 100.0 * sc.prof.?.ns[i] / reps / total,
+        });
+    }
+    // Per-qmm-shape split: which projections own the 76% qmm share.
+    std.debug.print("MEASURE qmm by shape (N x K, mean of {d} steps):\n", .{reps});
+    var it = sc.prof.?.shape_ns.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        const n = fwd.Profile.shapeOutputs(key);
+        const k = fwd.Profile.shapeInputs(key);
+        const cnt = sc.prof.?.shape_count.get(key) orelse 0;
+        std.debug.print("  qmm N={d:<7} K={d:<6} launches {d:>4}  {d:>9.1} us  {d:>5.1}%  ({d:.2} us/launch)\n", .{
+            n, k, cnt / reps, e.value_ptr.* / reps / 1e3, 100.0 * e.value_ptr.* / reps / total, e.value_ptr.* / @as(f64, @floatFromInt(cnt)),
         });
     }
 }
