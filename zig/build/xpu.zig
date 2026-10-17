@@ -4,6 +4,9 @@
 
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
+/// The pinned Qwen 3.8 27B geometry, the source of the -D flags the 27B kernels are compiled with. Reading the
+/// module here (not a copy) keeps one definition; it has no imports beyond std, so the build can host it.
+const q27 = @import("../src/families/qwen27/config.zig");
 
 /// Whether the named ocloc binary is on PATH, so the default kernel source can follow it.
 fn oclocAvailable(b: *std.Build, name: []const u8) bool {
@@ -150,6 +153,69 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
         qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
     }
     const qk = b.createModule(.{ .root_source_file = qk_files.add("xpu_qwen35_kernels.zig", qk_src) });
+    // Phase 6: Qwen 3.8 27B. One more compilation of the same shared sources with the 27B shape defines, embedded
+    // under the same module name (`xpu_qwen35_kernels`), so `families/qwen27/xpu_forward.zig` reads them by key.
+    // The defines are the pinned geometry of families/qwen27/config.zig; the 2B build's empty default keeps its own.
+    // QW_ZS is gdn_post.cl's in_proj_z row stride, i.e. the value projection's width QW_NV*QW_DV = v_heads*dv
+    // (6144 at 27B), NOT `hidden`. The two coincide on the 2B (16*128 = 2048 = hidden), which is why the kernel's
+    // default works there; at 27B the z row is 6144 wide against hidden 5120, and passing `hidden` made gdn_post
+    // read each row 1024 elements early - heads 40..47 of every GDN layer consumed the next row's z (the last row
+    // read past the buffer), which is exactly the row-to-row corruption the smoke gate reported.
+    const q27_defines = b.fmt("-DQW_HIDDEN={d} -DQW_INTERMEDIATE={d} -DQW_HEADS={d} -DQW_Q_HEADS={d} -DQW_KV_HEADS={d} -DQW_NV={d} -DQW_HV={d} -DQW_ZS={d}", .{
+        q27.Pinned.hidden, q27.Pinned.intermediate, q27.Pinned.heads, q27.Pinned.heads, q27.Pinned.kv_heads, q27.Pinned.v_heads, q27.Pinned.v_heads, q27.Pinned.gdn_value_dim,
+    });
+    // Where the 27B modules come from, same two-source rule as the 2B path above:
+    //   * `ocloc` (default when the binary is on PATH): compile the shared sources with the 27B -D set here.
+    //   * `prebuilt` (default when ocloc is absent, or `-Dqwen27-kernels=prebuilt:<dir>`): @embedFile the
+    //     <dir>/<key>_bmg.bin committed under zig/kernels/xpu/prebuilt-27b/, so `zig build xpu-qwen27-tools`
+    //     works on a host without intel-ocloc. Those modules were compiled from the same sources with these
+    //     defines; the 2B-default modules under zig/kernels/xpu/prebuilt/ are NOT a substitute (they carry the
+    //     -cl-std=CL3.0 defaults only, so a 27B forward linked against them would run 2B shapes).
+    const q27_kernels = b.option([]const u8, "qwen27-kernels", "ocloc | prebuilt[:<dir>]: where the Qwen 3.8 27B kernel modules come from") orelse if (oclocAvailable(b, ocloc)) "ocloc" else "prebuilt";
+    const q27_prebuilt: ?[]const u8 = if (std.mem.eql(u8, q27_kernels, "prebuilt"))
+        "zig/kernels/xpu/prebuilt-27b"
+    else if (std.mem.startsWith(u8, q27_kernels, "prebuilt:"))
+        q27_kernels["prebuilt:".len..]
+    else
+        null;
+    if (q27_prebuilt == null and !std.mem.eql(u8, q27_kernels, "ocloc")) {
+        std.debug.panic("qwen27-kernels must be `ocloc`, `prebuilt` or `prebuilt:<dir>`, got {s}", .{q27_kernels});
+    }
+    const q27_files = b.addWriteFiles();
+    var q27_src: []const u8 = "//! Compiled Qwen kernel binaries for Qwen 3.8 27B, embedded (see zig/build/xpu.zig).\n";
+    const q27_opt = b.fmt("-cl-std=CL3.0 {s}", .{q27_defines});
+    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
+        if (q27_prebuilt) |dir| {
+            const src = b.pathJoin(&.{ dir, file });
+            _ = q27_files.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
+        } else {
+            const cc = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", q27_opt, "-file" });
+            cc.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
+            cc.addArg("-out_dir");
+            const out = cc.addOutputDirectoryArg("qwen27-" ++ name ++ "-out");
+            _ = q27_files.addCopyFile(out.path(b, file), file);
+        }
+        q27_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ q27_src, name, file });
+    }
+    const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
+    const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    q27_mod.addImport("xpu_qwen35_kernels", q27k);
+    // Phase 6.3: the two 27B tools. tf-xpu-qwen27-logits writes len(tokens) x vocab bf16 logits; tf-xpu-qwen27-greedy
+    // prints n greedy token ids. Both share the forward and the 27B kernels above.
+    const q27_logits = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_logits.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    q27_logits.addImport("xpu_qwen35_kernels", q27k);
+    q27_logits.addImport("qwen27_forward", q27_mod);
+    const logits_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-logits", .root_module = q27_logits });
+    const logits_install = b.addInstallArtifact(logits_exe, .{});
+    const greedy = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_greedy.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    greedy.addImport("xpu_qwen35_kernels", q27k);
+    greedy.addImport("qwen27_forward", q27_mod);
+    const greedy_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-greedy", .root_module = greedy });
+    const greedy_install = b.addInstallArtifact(greedy_exe, .{});
+    const tools = b.step("xpu-qwen27-tools", "Build tf-xpu-qwen27-logits and tf-xpu-qwen27-greedy into zig-out/bin");
+    tools.dependOn(&logits_install.step);
+    tools.dependOn(&greedy_install.step);
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
     const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
     test_step.dependOn(&geo_run.step);
