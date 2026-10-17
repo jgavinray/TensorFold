@@ -7,6 +7,7 @@ const rt = @import("../../xpu/runtime.zig");
 const c = @import("config.zig");
 const xs = @import("xpu_state.zig");
 const fwd = @import("xpu_forward.zig");
+const rp = @import("xpu_replay.zig");
 const be = lanes.backend;
 
 pub const window_rows = 16;
@@ -59,6 +60,10 @@ pub const Xpu = struct {
     model: *fwd.Model,
     options: Options,
     scratch: fwd.Scratch,
+    /// The recorded decode steps, one per (rows, capacity) shape, and the in-order command queue they replay through.
+    /// A step is recorded on a shape's first decode and replayed for every later token of that shape.
+    replay: rp.Replay,
+    queue: rt.cmdlist.Queue,
     width: u32 = 1,
     entries: std.AutoHashMapUnmanaged(*lanes.Stream, *Entry) = .empty,
     row: []u16, // host copy of one logits row
@@ -71,7 +76,7 @@ pub const Xpu = struct {
         errdefer gpa.free(row);
         const rows = try gpa.alloc(u16, xs.max_segments * window_rows * c.vocab);
         errdefer gpa.free(rows);
-        out.* = .{ .gpa = gpa, .session = session, .model = model, .options = options, .row = row, .rows = rows, .scratch = try fwd.Scratch.init(gpa, session, options.chunk, options.capacity, xs.max_segments * window_rows) };
+        out.* = .{ .gpa = gpa, .session = session, .model = model, .options = options, .row = row, .rows = rows, .replay = rp.Replay.init(gpa), .queue = try rt.cmdlist.Queue.init(&session.ctx), .scratch = try fwd.Scratch.init(gpa, session, options.chunk, options.capacity, xs.max_segments * window_rows) };
         errdefer out.scratch.deinit();
         if (options.qualify) {
             @import("xpu_qualify.zig").check(gpa, session, model, &out.scratch) catch |err| switch (err) {
@@ -93,6 +98,8 @@ pub const Xpu = struct {
             self.gpa.destroy(e.*);
         }
         self.entries.deinit(self.gpa);
+        self.replay.deinit();
+        self.queue.deinit();
         self.scratch.deinit();
         self.gpa.free(self.row);
         self.gpa.free(self.rows);
@@ -164,8 +171,35 @@ pub const Xpu = struct {
             .value => |v| v,
             .handle => |h| @intCast(h),
         };
-        try fwd.run(self.session, self.model, &self.scratch, &e.cache, &.{token}, .{ .head = .last });
+        try self.decode(stream, e, token);
         return try draw(self.gpa, try self.logits(e), stream.sampling, position, &.{});
+    }
+
+    /// One decode token: the recorded-step replay when a step for this cache shape is live, else the eager forward.
+    /// The step is recorded on the first decode of a shape (its launches captured with the cache length at that
+    /// moment); every later token of the same shape rewrites the captured token/position/cache-length scalars and
+    /// re-submits the one list. Recording costs one eager step, so a shape used once pays nothing extra.
+    fn decode(self: *Xpu, stream: *lanes.Stream, e: *Entry, token: u32) !void {
+        const v: rp.Values = .{ .token = token, .position = @intCast(e.cache.len), .cache_len = @intCast(e.cache.len) };
+        if (self.replay.find(1, e.cache.capacity)) |step| {
+            if (step.sc == &self.scratch and step.recorded.cache_len + step.replays == v.cache_len) {
+                try rp.replayStep(self.session, step, &self.queue, v);
+                e.cache.len += 1;
+                return;
+            }
+        }
+        if (stepFor(self.replay, 1, e.cache.capacity)) |step| {
+            if (step.sc != &self.scratch or step.recorded.cache_len != v.cache_len) {
+                step.deinit(self.gpa);
+                step.* = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
+            }
+            try rp.replayStep(self.session, step, &self.queue, v);
+            e.cache.len += 1;
+            return;
+        }
+        // No step for this shape yet: run the token eagerly and record the same launches for the next token.
+        try fwd.run(self.session, self.model, &self.scratch, &e.cache, &.{token}, .{ .head = .last });
+        _ = stream;
     }
 
     fn readFn(_: *anyopaque, handle: u64) !u32 {

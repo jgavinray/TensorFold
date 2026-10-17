@@ -100,6 +100,16 @@ pub const Replay = struct {
         }
         try self.buckets.append(self.gpa, .{ .rows = rows, .capacity = capacity, .step = step });
     }
+
+    /// The mutable step pointer for this shape, creating the bucket (with no step yet) when absent. Null only when the
+    /// bucket exists but has never held a step.
+    pub fn stepFor(self: *Replay, rows: usize, capacity: usize) ?*Step {
+        for (self.buckets.items) |*b| {
+            if (b.rows == rows and b.capacity == capacity) return if (b.step) |*st| st else null;
+        }
+        self.buckets.append(self.gpa, .{ .rows = rows, .capacity = capacity }) catch return null;
+        return null;
+    }
 };
 
 /// Rewrites the step's moving values in place: the token id and the position/cache-length elements of every `dims`
