@@ -216,6 +216,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const tools = b.step("xpu-qwen27-tools", "Build tf-xpu-qwen27-logits and tf-xpu-qwen27-greedy into zig-out/bin");
     tools.dependOn(&logits_install.step);
     tools.dependOn(&greedy_install.step);
+    // Phase 6.3/6.4: the 27B forward gate binary (gate C greedy vs the fixture, plus the decode-step measurement).
+    // Same forward module and 27B kernels as the tools; the run needs a card and the checkpoint.
+    const q27_fwd_test = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_fwd_test.addImport("xpu_qwen35_kernels", q27k);
+    q27_fwd_test.addImport("qwen27_forward", q27_mod);
+    const q27_fwd_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-forward-test", .root_module = q27_fwd_test });
+    const q27_fwd_install = b.addInstallArtifact(q27_fwd_exe, .{});
+    const q27_fwd_run = b.addRunArtifact(q27_fwd_exe);
+    q27_fwd_run.step.dependOn(&q27_fwd_install.step);
+    b.step("xpu-qwen27-forward-test", "Build and run tf-xpu-qwen27-forward-test: Qwen 3.8 27B forward gate C + decode step on a B70 (opt-in)").dependOn(&q27_fwd_run.step);
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
     const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
     test_step.dependOn(&geo_run.step);
