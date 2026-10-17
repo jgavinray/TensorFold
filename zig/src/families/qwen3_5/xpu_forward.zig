@@ -19,7 +19,7 @@ const Buffer = rt.memory.Buffer;
 const Kernel = rt.module.Kernel;
 const Dim = rt.launch.Dim3;
 pub const Head = enum { last, all };
-pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing, ReplayCannotProfile };
+pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing, ReplayCannotProfile, ReplayNeedsOneRow, OutOfMemory };
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
@@ -307,7 +307,9 @@ pub const Model = struct {
 };
 
 const Run = struct {
-    s: *rt.session.Session,
+    /// The card's session; null only while recording, where every launch goes to `rec` instead and no copy or
+    /// synchronize reaches the immediate queue.
+    s: ?*rt.session.Session,
     k: *Kernels,
     w: *const xw.Weights,
     sc: *Scratch,
@@ -325,12 +327,13 @@ const Run = struct {
             try r.run(self.k.get(id), cfg, args);
             return;
         }
+        const s = self.s orelse return error.Invalid;
         if (self.sc.prof) |*p| {
             const ev = p.next(id) orelse return error.Invalid;
-            try rt.launch.run(&self.s.queue, self.k.get(id), cfg, args, ev);
+            try rt.launch.run(&s.queue, self.k.get(id), cfg, args, ev);
             return;
         }
-        try rt.launch.run(&self.s.queue, self.k.get(id), cfg, args, null);
+        try rt.launch.run(&s.queue, self.k.get(id), cfg, args, null);
     }
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
@@ -417,7 +420,7 @@ pub fn recordDecode(
     defer capture.deinit(sc.gpa);
     sc.record_slots = &capture;
     defer sc.record_slots = null;
-    try runSegments(rec, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec });
+    try runSegments(null, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec });
     // Classify: a slot is `position` when it holds the RoPE position, `cache_len` when it holds the cache length.
     // Both appear in several slots (queries, keys and attn_partial all carry them), and every occurrence must be
     // rewritten, so each slot records its own first matching element.
@@ -439,7 +442,7 @@ pub fn recordDecode(
 /// forward). Each segment's `base` is its first row in the scratch (computed here from the segment order). With
 /// `record`, every row of a linear layer's recurrence and each segment's conv tail are saved to its `slot`'s snapshot
 /// so a later `keep` can roll back; `segments.len == 1 and !record` is the plain single-stream path.
-pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []const Segment, tokens: []const u32, record: bool, o: Options) Error!void {
+pub fn runSegments(s: ?*rt.session.Session, m: *Model, sc: *Scratch, segments: []const Segment, tokens: []const u32, record: bool, o: Options) Error!void {
     var total: usize = 0;
     for (segments) |seg| {
         if (seg.rows == 0 or seg.cache.len + seg.rows > seg.cache.capacity) return error.QwenContextFull;
@@ -478,7 +481,7 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         try ru.go(.mlp_act, geo.mlpAct(T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
         try ru.projection(block.down, sc.act.ptr.?, sc.r.ptr.?, total);
         if (o.stop_after) |n| if (i == n) {
-            if (o.rec == null) try s.queue.synchronize();
+            if (o.rec == null) try s.?.queue.synchronize();
             return;
         };
     }
@@ -492,20 +495,21 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
     // A recording pass stops here: the commit is a queued copy plus a cache-length bump, and neither belongs in a
     // replayed list (the caller commits once, after the last replay, from the eager path).
     if (o.rec != null) return;
+    const sess = s.?;
     base = 0;
     for (segments) |seg| {
         const row: usize = if (o.head == .all) base + seg.rows - 1 else 0;
-        try s.queue.copy(seg.cache.logits.ptr, off(sc.logits, row * c.vocab * 2), c.vocab * 2, null);
+        try sess.queue.copy(seg.cache.logits.ptr, off(sc.logits, row * c.vocab * 2), c.vocab * 2, null);
         var rec: [c.layers]?*const anyopaque = @splat(null);
         var cv: [c.layers]?*const anyopaque = @splat(null);
         for (&rec, &cv, 0..) |*r, *v, i| if (c.linear(i)) {
             r.* = sc.snapDelta(i, base + seg.rows - 1);
             v.* = sc.snapConv(i, base + seg.rows - 1);
         };
-        try seg.cache.commit(s, base, seg.rows, record, rec, cv);
+        try seg.cache.commit(sess, base, seg.rows, record, rec, cv);
         base += seg.rows;
     }
-    try s.queue.synchronize();
+    try sess.queue.synchronize();
 }
 
 fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: bool, total: usize) Error!void {
@@ -541,7 +545,7 @@ fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: 
             if (ru.rec) |r| {
                 try r.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes);
             } else {
-                try ru.s.queue.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes, null);
+                try ru.s.?.queue.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes, null);
             }
         }
         base += seg.rows;
