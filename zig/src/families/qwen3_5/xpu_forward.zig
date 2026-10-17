@@ -23,9 +23,9 @@ pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQ
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
-const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
+const Module = enum { layout, norm, norm_nores, qmm, qmm_pair, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_pair, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
@@ -111,9 +111,14 @@ pub const Profile = struct {
     pool: rt.event.Pool,
     events: []rt.event.Event,
     ids: []KernelId,
+    /// Per-qmm-shape device time and launch count, keyed by `Profile.shapeKey(outputs, inputs)`. Every launch gets
+    /// its shape recorded at queue time, so `collect` attributes each timestamp event to its own shape.
+    shapes: []u64,
     used: usize = 0,
     ns: [kernel_count]f64 = @splat(0),
     count: [kernel_count]usize = @splat(0),
+    shape_ns: std.AutoHashMapUnmanaged(u64, f64) = .empty,
+    shape_count: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
     pub fn init(s: *rt.session.Session, gpa: std.mem.Allocator, capacity: u32) !Profile {
         var pool = try rt.event.Pool.init(&s.ctx, capacity);
@@ -121,26 +126,53 @@ pub const Profile = struct {
         const events = try gpa.alloc(rt.event.Event, capacity);
         errdefer gpa.free(events);
         const ids = try gpa.alloc(KernelId, capacity);
+        errdefer gpa.free(ids);
+        const shapes = try gpa.alloc(u64, capacity);
+        errdefer gpa.free(shapes);
         for (events, 0..) |*e, i| e.* = try pool.event(@intCast(i));
-        return .{ .pool = pool, .events = events, .ids = ids };
+        return .{ .pool = pool, .events = events, .ids = ids, .shapes = shapes };
     }
     pub fn deinit(self: *Profile, gpa: std.mem.Allocator) void {
         for (self.events) |*e| e.deinit();
         gpa.free(self.events);
         gpa.free(self.ids);
+        gpa.free(self.shapes);
+        self.shape_ns.deinit(gpa);
+        self.shape_count.deinit(gpa);
         self.pool.deinit();
     }
-    fn next(self: *Profile, id: KernelId) ?*const rt.event.Event {
+    /// Shape key of a qmm launch: `(outputs << 32) | inputs`, so both fit for every Qwen shape.
+    pub fn shapeKey(outputs: usize, inputs: usize) u64 {
+        return (@as(u64, outputs) << 32) | @as(u64, inputs);
+    }
+    pub fn shapeOutputs(key: u64) usize {
+        return @intCast(key >> 32);
+    }
+    pub fn shapeInputs(key: u64) usize {
+        return @intCast(key & 0xffffffff);
+    }
+    /// Reserves the next timestamp event for `id`; `shape` is the qmm shape key (0 for non-qmm kernels).
+    fn next(self: *Profile, id: KernelId, shape: u64) ?*const rt.event.Event {
         if (self.used >= self.events.len) return null;
         self.ids[self.used] = id;
+        self.shapes[self.used] = shape;
         self.used += 1;
         return &self.events[self.used - 1];
     }
-    /// Adds the launches since the last call to `ns`/`count` and rearms their events.
-    pub fn collect(self: *Profile) rt.Error!void {
-        for (self.events[0..self.used], self.ids[0..self.used]) |*e, id| {
-            self.ns[@intFromEnum(id)] += try e.kernelNs();
+    /// Adds the launches since the last call to `ns`/`count`/`shape_ns` and rearms their events.
+    pub fn collect(self: *Profile, gpa: std.mem.Allocator) (rt.Error || error{OutOfMemory})!void {
+        for (self.events[0..self.used], self.ids[0..self.used], self.shapes[0..self.used]) |*e, id, shape| {
+            const t = try e.kernelNs();
+            self.ns[@intFromEnum(id)] += t;
             self.count[@intFromEnum(id)] += 1;
+            if (id == .qmm) {
+                const gop = try self.shape_ns.getOrPut(gpa, shape);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += t;
+                const goc = try self.shape_count.getOrPut(gpa, shape);
+                if (!goc.found_existing) goc.value_ptr.* = 0;
+                goc.value_ptr.* += 1;
+            }
             try e.reset();
         }
         self.used = 0;
@@ -316,6 +348,10 @@ const Run = struct {
     rec: ?*rt.cmdlist.Recorder = null,
 
     fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) Error!void {
+        try self.goShape(id, 0, g, args);
+    }
+    /// `shape` is the qmm shape key for `.qmm` launches (0 otherwise), used by the profiler.
+    fn goShape(self: Run, id: KernelId, shape: u64, g: geo.Geo, args: anytype) Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
         const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
         const cfg = rt.launch.Config{ .global = global, .local = local };
@@ -326,7 +362,7 @@ const Run = struct {
             return;
         }
         if (self.sc.prof) |*p| {
-            const ev = p.next(id) orelse return error.Invalid;
+            const ev = p.next(id, shape) orelse return error.Invalid;
             try rt.launch.run(&self.s.queue, self.k.get(id), cfg, args, ev);
             return;
         }
@@ -336,8 +372,27 @@ const Run = struct {
         return self.w.ptr(t);
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) Error!void {
-        try self.go(.qmm, geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
+        try self.goShape(.qmm, Profile.shapeKey(l.outputs, l.inputs), geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
+        });
+    }
+    /// Two same-shape projections of one activation row in a single launch (`qmm_pair`). Bit-identical to two
+    /// `projection` calls; saves one launch for the launch-bound N=16 GatedDeltaNet a/b pair.
+    fn projectionPair(self: Run, a: xw.Linear, a_out: *anyopaque, b: xw.Linear, b_out: *anyopaque, x: *anyopaque, rows: usize) Error!void {
+        std.debug.assert(a.inputs == b.inputs and a.outputs == b.outputs and a.outputs <= 16);
+        try self.goShape(.qmm_pair, Profile.shapeKey(a.outputs, a.inputs), geo.qmmPair(@intCast(rows), @intCast(a.outputs)), .{
+            x,
+            @as(i32, @intCast(rows)),
+            self.wp(a.weight),
+            self.wp(a.scales),
+            self.wp(a.biases),
+            self.wp(b.weight),
+            self.wp(b.scales),
+            self.wp(b.biases),
+            a_out,
+            b_out,
+            @as(i32, @intCast(a.outputs)),
+            @as(i32, @intCast(a.inputs)),
         });
     }
     fn norm(self: Run, h: *anyopaque, residual: ?*anyopaque, weight: xw.Tensor, x: *anyopaque, rows: usize) Error!void {
@@ -513,8 +568,8 @@ fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: 
     const T: u32 = @intCast(total);
     try ru.projection(d.qkv, sc.x.ptr.?, sc.qkv.ptr.?, total);
     try ru.projection(d.z, sc.x.ptr.?, sc.z.ptr.?, total);
-    try ru.projection(d.a, sc.x.ptr.?, sc.a.ptr.?, total);
-    try ru.projection(d.b, sc.x.ptr.?, sc.b.ptr.?, total);
+    // a and b are both N = linear_heads (16) projections of the same x: one fused launch instead of two.
+    try ru.projectionPair(d.a, sc.a.ptr.?, d.b, sc.b.ptr.?, sc.x.ptr.?, total);
     const w = ru.w;
     var base: usize = 0;
     for (segments) |seg| {

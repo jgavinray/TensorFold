@@ -135,7 +135,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
     // ocloc takes compile options as one string after -options, so the -D flags belong there, not as bare args.
     const opt_string = b.fmt("-cl-std=CL3.0 {s}", .{shape_defines});
-    inline for (.{ "layout", "norm", "norm_nores", "qmm", "norm_qmm", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+    inline for (.{ "layout", "norm", "norm_nores", "qmm", "qmm_pair", "norm_qmm", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         if (prebuilt) |dir| {
             const src = b.pathJoin(&.{ dir, file });
@@ -188,6 +188,22 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const ad_exe = b.addExecutable(.{ .name = "tf-xpu-actdown-probe", .root_module = ad_module });
     const ad_install = b.addInstallArtifact(ad_exe, .{});
     b.step("xpu-actdown-probe", "TEMP: fused mlp_act_down vs mlp_act+qmm bit-exactness probe").dependOn(&ad_install.step);
+
+    // TEMP (S02 investigation): device-time comparison of fused vs unfused pairs, batched (no per-launch sync).
+    const fp_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_fusion_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    fp_module.addImport("xpu_qwen35_kernels", qk);
+    fp_module.addImport("core", core);
+    const fp_exe = b.addExecutable(.{ .name = "tf-xpu-fusion-probe", .root_module = fp_module });
+    const fp_install = b.addInstallArtifact(fp_exe, .{});
+    b.step("xpu-fusion-probe", "TEMP: fused vs unfused device-time comparison (batched)").dependOn(&fp_install.step);
+
+    // TEMP (S02 investigation): qmm_pair vs two qmm calls on the real a/b weights, bit-exactness + device time.
+    const pairprobe_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qmmpair_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    pairprobe_module.addImport("xpu_qwen35_kernels", qk);
+    pairprobe_module.addImport("core", core);
+    const pairprobe_exe = b.addExecutable(.{ .name = "tf-xpu-qmmpair-probe", .root_module = pairprobe_module });
+    const pairprobe_install = b.addInstallArtifact(pairprobe_exe, .{});
+    b.step("xpu-qmmpair-probe", "TEMP: qmm_pair vs two qmm calls (bit-exact + device time)").dependOn(&pairprobe_install.step);
 
     // Phase 4.4-4.5: `Xpu` behind the lane engine's backend interface + qualify, on card (opt-in, needs a card).
     const lanes_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
