@@ -271,6 +271,11 @@ pub const Scratch = struct {
         self.dims_used += 1;
         return @ptrCast(p);
     }
+    /// The byte offset (from the pool's start) of the slot `dims` allocated last, for the replay recorder.
+    fn lastDimsOffset(self: *Scratch) usize {
+        const base = @intFromPtr(self.dimsBase()) - @intFromPtr(self.pool.ptr.?);
+        return base + (self.dims_used - 1) * slot_bytes;
+    }
 
     /// The recurrence snapshot of `layer` at absolute scratch row `row` (`delta_bytes` long); the kernel writes it
     /// when a segment records, and `xpu_backend.Entry.keep` reads it back.
@@ -298,16 +303,26 @@ const Run = struct {
     k: *Kernels,
     w: *const xw.Weights,
     sc: *Scratch,
+    /// When set, launches are recorded into this regular list instead of executed on the immediate queue; the
+    /// caller closes and replays it (xpu_replay.zig). Kernel arguments are captured at record time.
+    rec: ?*rt.cmdlist.Recorder = null,
 
     fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
         const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
-        if (self.sc.prof) |*p| {
-            const ev = p.next(id) orelse return error.Invalid;
-            try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, ev);
+        const cfg = rt.launch.Config{ .global = global, .local = local };
+        if (self.rec) |r| {
+            // A recorded list cannot carry timestamps: profile only the eager path.
+            if (self.sc.prof != null) return error.ReplayCannotProfile;
+            try r.run(self.k.get(id), cfg, args);
             return;
         }
-        try rt.launch.run(&self.s.queue, self.k.get(id), .{ .global = global, .local = local }, args, null);
+        if (self.sc.prof) |*p| {
+            const ev = p.next(id) orelse return error.Invalid;
+            try rt.launch.run(&self.s.queue, self.k.get(id), cfg, args, ev);
+            return;
+        }
+        try rt.launch.run(&self.s.queue, self.k.get(id), cfg, args, null);
     }
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
