@@ -107,7 +107,6 @@ pub fn main(init: std.process.Init) !u8 {
     var w = try xw.load(gpa, &s, dir, config, group);
     defer w.deinit();
     std.debug.print("weights loaded: {d} tensors, {d:.1} MiB\n", .{ w.ledger.len, @as(f64, @floatFromInt(w.total_bytes)) / (1 << 20) });
-    std.debug.print("PROBE sizeOf Layer {d} Weights {d} layers_ptr {*} layers_len {d}\n", .{ @sizeOf(xw.Layer), @sizeOf(xw.Weights), w.layers.ptr, w.layers.len });
     var m: fwd.Model = .{ .weights = &w, .kernels = undefined };
     try m.kernels.load(&s, gpa);
     defer m.kernels.deinit();
@@ -124,7 +123,6 @@ pub fn main(init: std.process.Init) !u8 {
 
     const t0 = sys.nowNs();
     std.debug.print("forward...\n", .{});
-    if (fwd.getenvBool("TF_XPU_QWEN27_TRACE")) fwd.setTrace(true);
     try fwd.run(&s, &m, &sc, &cache, ids, .{ .head = .all });
     std.debug.print("forward {d} tokens in {d:.2} s ({d:.2} tokens/s teacher-forced)\n", .{
         rows,
