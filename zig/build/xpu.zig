@@ -117,6 +117,27 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     b.step("xpu-qwen35-backend-test", "Build and run tf-xpu-qwen35-backend-test: Xpu through the lane engine + xpu_qualify on a B70 (opt-in)").dependOn(&bk_run.step);
     b.step("xpu-qwen35-backend-build", "Build tf-xpu-qwen35-backend-test without running it").dependOn(&bk_install.step);
 
+    // TEMP probe: the engine's queue path (prefill/first/queue) vs the reference, to isolate the serve divergence.
+    const qp_module = b.createModule(.{ .root_source_file = b.path("zig/src/qprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    qp_module.addImport("xpu_qwen35_kernels", qk);
+    qp_module.addImport("lanes", lanes_mod);
+    qp_module.addImport("core", core);
+    const qp_exe = b.addExecutable(.{ .name = "tf-qprobe", .root_module = qp_module });
+    const qp_install = b.addInstallArtifact(qp_exe, .{});
+    const qp_run = b.addRunArtifact(qp_exe);
+    qp_run.step.dependOn(&qp_install.step);
+    b.step("qprobe", "TEMP: engine queue path vs reference").dependOn(&qp_run.step);
+
+    const vp_module = b.createModule(.{ .root_source_file = b.path("zig/src/vprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    vp_module.addImport("xpu_qwen35_kernels", qk);
+    vp_module.addImport("lanes", lanes_mod);
+    vp_module.addImport("core", core);
+    const vp_exe = b.addExecutable(.{ .name = "tf-vprobe", .root_module = vp_module });
+    const vp_install = b.addInstallArtifact(vp_exe, .{});
+    const vp_run = b.addRunArtifact(vp_exe);
+    vp_run.step.dependOn(&vp_install.step);
+    b.step("vprobe", "TEMP: 1-row verify path vs reference").dependOn(&vp_run.step);
+
     // Phase 5: `zig build xpu-native` -> zig-out/xpu/bin/tensorfold-native: the HTTP server over `Xpu` (serve --backend xpu).
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native_xpu.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes_mod }, .{ .name = "core", .module = core } } });
