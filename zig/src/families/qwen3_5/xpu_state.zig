@@ -79,11 +79,11 @@ pub const Cache = struct {
     }
 
     /// The segment finished its rows: with `record` the forward wrote every row's recurrence to `snap_rec` and the
-    /// conv tail to `snap_conv`, so the committed state (the window's last row) is copied back into `cache.recurrence`
-    /// and `cache.conv` — the recurrence is otherwise untouched (state_in == state_out read the old one). Remembers the
-    /// window so `keep` can roll it back. Without `record` the kernel wrote the final state in place and there is
-    /// nothing to roll back.
-    pub fn commit(self: *Cache, s: *rt.session.Session, base: usize, rows: usize, record: bool, snap_rec: [c.layers]?*const anyopaque, snap_conv: *const anyopaque) rt.Error!void {
+    /// conv tail to `snap_conv` (one pointer each, per layer), so the committed state (the window's last row) is
+    /// copied back into `cache.recurrence` and `cache.conv` — the recurrence is otherwise untouched (state_in ==
+    /// state_out read the old one). Remembers the window so `keep` can roll it back. Without `record` the kernel wrote
+    /// the final state in place and there is nothing to roll back.
+    pub fn commit(self: *Cache, s: *rt.session.Session, base: usize, rows: usize, record: bool, snap_rec: [c.layers]?*const anyopaque, snap_conv: [c.layers]?*const anyopaque) rt.Error!void {
         if (!record) {
             self.last = null;
             self.len += rows;
@@ -91,7 +91,7 @@ pub const Cache = struct {
         }
         for (&self.blocks, 0..) |*b, i| if (c.linear(i)) {
             try s.queue.copy(b.delta.recurrence.ptr, snap_rec[i].?, delta_bytes, null);
-            try s.queue.copy(b.delta.conv.ptr, snap_conv, conv_bytes, null);
+            try s.queue.copy(b.delta.conv.ptr, snap_conv[i].?, conv_bytes, null);
         };
         self.last = .{ .start = self.len, .base = base, .rows = rows };
         self.len += rows;
@@ -99,14 +99,14 @@ pub const Cache = struct {
 
     /// Roll back to the first `path.len` rows of the last recorded window: the recurrence and conv state as after
     /// exactly those rows, and the logits row of that row. The caller supplies the window row's snapshot addresses
-    /// (`snapRec` per layer, `snapConv`) and its logits row, read from the round scratch.
-    pub fn keep(self: *Cache, s: *rt.session.Session, path: []const u32, snap_rec: [c.layers]?*const anyopaque, snap_conv: *const anyopaque, logits_row: *const anyopaque) !void {
+    /// (`snapRec`/`snapConv` per layer) and its logits row, read from the round scratch.
+    pub fn keep(self: *Cache, s: *rt.session.Session, path: []const u32, snap_rec: [c.layers]?*const anyopaque, snap_conv: [c.layers]?*const anyopaque, logits_row: *const anyopaque) !void {
         const last = self.last orelse return error.NothingToKeep;
         if (path.len == 0 or path.len > last.rows) return error.NothingToKeep;
         for (path, 0..) |row, i| if (row != i) return error.UnsupportedQwenTree;
         for (&self.blocks, 0..) |*b, i| if (c.linear(i)) {
             try s.queue.copy(b.delta.recurrence.ptr, snap_rec[i].?, delta_bytes, null);
-            try s.queue.copy(b.delta.conv.ptr, snap_conv, conv_bytes, null);
+            try s.queue.copy(b.delta.conv.ptr, snap_conv[i].?, conv_bytes, null);
         };
         self.len = last.start + path.len;
         try s.queue.copy(self.logits.ptr, logits_row, c.vocab * 2, null);

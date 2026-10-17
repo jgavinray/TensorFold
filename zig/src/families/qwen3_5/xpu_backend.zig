@@ -16,39 +16,36 @@ pub const Options = struct { capacity: usize, chunk: usize = 128, streams: u32 =
 /// window's snapshots, and `Cache.last` names the row range `keep` reads back).
 pub const Entry = struct {
     cache: xs.Cache,
-    rows: usize = 0, // rows of the last recorded window (0: none to keep)
-    base: usize = 0, // the scratch row of its first row (the window's `base`)
 
     pub fn deinit(self: *Entry) void {
         self.cache.deinit();
     }
 
-    /// Forward `ids` (pending then drafts) as one window with every row's logits in `sc.logits`; remembers how to roll back.
+    /// Forward `ids` (pending then drafts) as one window with every row's logits in `sc.logits`. `Cache.commit`
+    /// remembers the window (row range and snapshots) so a later `keep` can roll it back.
     pub fn window(self: *Entry, s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, ids: []const u32) !void {
         if (ids.len == 0 or ids.len > window_rows) return error.UnsupportedQwenWindow;
         try fwd.runSegments(s, m, sc, &.{.{ .cache = &self.cache, .rows = ids.len }}, ids, ids.len > 1, .{ .head = .all });
-        if (self.cache.last) |last| {
-            self.rows = ids.len;
-            self.base = last.base;
-        } else {
-            self.rows = 0;
-        }
     }
 
-    /// Roll back to the first `n` rows of the last window (logits row and recurrence as after exactly those rows).
+    /// Roll back to the first `n` rows of the last recorded window (logits row and recurrence as after exactly those
+    /// rows). The window's row range comes from `cache.last` (set by `Cache.commit`), so this serves both the
+    /// single-stream `window` path and a shared round's `verify` (which commits through `runSegments`).
     pub fn keep(self: *Entry, s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, path: []const u32) !void {
         _ = m;
-        if (self.rows == 0 or path.len == 0 or path.len > self.rows) return error.NothingToKeep;
+        const last = self.cache.last orelse return error.NothingToKeep;
+        if (path.len == 0 or path.len > last.rows) return error.NothingToKeep;
         for (path, 0..) |row, i| if (row != i) return error.UnsupportedQwenTree;
-        if (path.len != self.rows) {
-            const row = self.base + path.len - 1;
+        if (path.len != last.rows) {
+            const row = last.base + path.len - 1;
             var rec: [c.layers]?*const anyopaque = @splat(null);
-            for (&rec, 0..) |*r, i| if (c.linear(i)) {
+            var cv: [c.layers]?*const anyopaque = @splat(null);
+            for (&rec, &cv, 0..) |*r, *v, i| if (c.linear(i)) {
                 r.* = sc.snapDelta(i, row);
+                v.* = sc.snapConv(i, row);
             };
-            try self.cache.keep(s, path, rec, sc.snapConv(row), offLogits(sc, row));
+            try self.cache.keep(s, path, rec, cv, offLogits(sc, row));
         }
-        self.rows = 0;
     }
 };
 
@@ -167,7 +164,6 @@ pub const Xpu = struct {
             .value => |v| v,
             .handle => |h| @intCast(h),
         };
-        e.rows = 0;
         try fwd.run(self.session, self.model, &self.scratch, &e.cache, &.{token}, .{ .head = .last });
         return try draw(self.gpa, try self.logits(e), stream.sampling, position, &.{});
     }

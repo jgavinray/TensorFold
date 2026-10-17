@@ -183,10 +183,10 @@ pub const Scratch = struct {
     logits: Buffer,
     conv_snap: Buffer,
     /// Per-layer window snapshots for shared rounds, indexed by the absolute scratch row of the segment's last row
-    /// (as state.zig's Cache does): the recurrence is saved once per layer, the conv tail per segment. A stream's
-    /// `keep` reads its slot back; see `xpu_backend.Entry.keep`.
+    /// (as state.zig's Cache does): the recurrence and the conv tail are saved once per layer, so layers never
+    /// overwrite each other's window state. A stream's `keep` reads its slot back; see `xpu_backend.Entry.keep`.
     snaps_delta: [c.layers]?Buffer = @splat(null),
-    snaps_conv: Buffer,
+    snaps_conv: [c.layers]?Buffer = @splat(null),
     /// Optional per-kernel device timing (Level Zero event timestamps); see `Profile`.
     prof: ?Profile = null,
     made: usize = 0,
@@ -194,7 +194,7 @@ pub const Scratch = struct {
     made_snaps: usize = 0,
     dims_used: usize = 0,
 
-    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "snaps_conv" };
+    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
 
@@ -207,6 +207,7 @@ pub const Scratch = struct {
         out.dims_used = 0;
         out.prof = null;
         out.snaps_delta = @splat(null);
+        out.snaps_conv = @splat(null);
         errdefer out.deinit();
         const chunks = (capacity + 127) / 128;
         const hid = rows * c.hidden * 2;
@@ -217,23 +218,31 @@ pub const Scratch = struct {
             rows * c.linear_heads * 2, rows * c.linear_heads * 2, rows * c.linear_heads * 2, rows * c.linear_heads * 4,
             rows * c.query_heads * chunks * 4, rows * c.query_heads * chunks * 4, rows * c.query_heads * chunks * c.head_dim * 4,
             logit_rows * c.vocab * 2, rows * xs.conv_bytes,
-            rows * xs.conv_bytes,
         };
         inline for (names, 0..) |n, i| {
             const kind: rt.memory.Kind = if (i == 0) .host else .device;
             @field(out, n) = try Buffer.alloc(&s.ctx, kind, sizes[i]);
             out.made = i + 1;
         }
-        // One recurrence snapshot buffer per linear layer, `rows` state rows wide (the scratch row of each window row).
+        // One recurrence and one conv snapshot buffer per linear layer, `rows` rows wide (the scratch row of each
+        // window row). Per layer, so one layer's window state never overwrites another's before `commit` reads it.
         for (&out.snaps_delta, 0..) |*b, i| if (c.linear(i)) {
             b.* = try Buffer.alloc(&s.ctx, .device, rows * xs.delta_bytes);
             out.made_snaps = i + 1;
+        };
+        for (&out.snaps_conv, 0..) |*b, i| if (c.linear(i)) {
+            b.* = try Buffer.alloc(&s.ctx, .device, rows * xs.conv_bytes);
         };
         return out;
     }
 
     pub fn deinit(self: *Scratch) void {
         for (self.snaps_delta[0..self.made_snaps]) |*b| if (b.*) |buf| {
+            var x = buf;
+            x.free();
+            b.* = null;
+        };
+        for (&self.snaps_conv) |*b| if (b.*) |buf| {
             var x = buf;
             x.free();
             b.* = null;
@@ -256,8 +265,9 @@ pub const Scratch = struct {
     fn dims(self: *Scratch, vals: anytype) *anyopaque {
         const bytes = std.mem.asBytes(&vals);
         std.debug.assert(bytes.len <= slot_bytes and self.dims_used < dims_slots);
-        const p = self.dimsBase() + self.dims_used * slot_bytes;
+        const p: [*]u8 = self.dimsBase() + self.dims_used * slot_bytes;
         @memcpy(p[0..bytes.len], bytes);
+
         self.dims_used += 1;
         return @ptrCast(p);
     }
@@ -269,11 +279,12 @@ pub const Scratch = struct {
         std.debug.assert(row < self.rows);
         return @ptrFromInt(@intFromPtr(b.ptr.?) + row * xs.delta_bytes);
     }
-    /// The conv-tail snapshot at absolute scratch row `row` (`conv_bytes` long): row 0 the state before the window,
-    /// as the kernel writes it.
-    pub fn snapConv(self: *Scratch, row: usize) *anyopaque {
+    /// The conv-tail snapshot of `layer` at absolute scratch row `row` (`conv_bytes` long); the kernel writes it
+    /// when a segment records, and `xpu_backend.Entry.keep` reads it back.
+    pub fn snapConv(self: *Scratch, layer: usize, row: usize) *anyopaque {
+        const b = self.snaps_conv[layer] orelse unreachable;
         std.debug.assert(row < self.rows);
-        return @ptrFromInt(@intFromPtr(self.snaps_conv.ptr.?) + row * xs.conv_bytes);
+        return @ptrFromInt(@intFromPtr(b.ptr.?) + row * xs.conv_bytes);
     }
 };
 
@@ -400,10 +411,12 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         const row: usize = if (o.head == .all) base + seg.rows - 1 else 0;
         try s.queue.copy(seg.cache.logits.ptr, off(sc.logits, row * c.vocab * 2), c.vocab * 2, null);
         var rec: [c.layers]?*const anyopaque = @splat(null);
-        for (&rec, 0..) |*r, i| if (c.linear(i)) {
+        var cv: [c.layers]?*const anyopaque = @splat(null);
+        for (&rec, &cv, 0..) |*r, *v, i| if (c.linear(i)) {
             r.* = sc.snapDelta(i, base + seg.rows - 1);
+            v.* = sc.snapConv(i, base + seg.rows - 1);
         };
-        try seg.cache.commit(s, base, seg.rows, record, rec, sc.snapConv(base + seg.rows - 1));
+        try seg.cache.commit(s, base, seg.rows, record, rec, cv);
         base += seg.rows;
     }
     try s.queue.synchronize();
@@ -421,7 +434,7 @@ fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: 
     for (segments) |seg| {
         const cache = &seg.cache.blocks[layer].delta;
         // The conv snapshot is written at this segment's absolute scratch row (its rows land at base..base+rows-1).
-        const snap_conv: *anyopaque = sc.snapConv(base);
+        const snap_conv: *anyopaque = sc.snapConv(layer, base);
         try ru.go(.gdn_pre, geo.gdnPre(@intCast(seg.rows), 3 * c.linear_heads), .{
             off(sc.qkv, base * c.conv_dim * 2), cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows().ptr)),
             off(sc.a, base * c.linear_heads * 2), off(sc.b, base * c.linear_heads * 2), w.ptr(d.a_log), w.ptr(d.dt_bias),
@@ -438,7 +451,7 @@ fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: 
             sc.dims([2]i32{ @intCast(seg.rows), @intFromBool(record) }), off(sc.y, base * c.hidden * 2), snap_rec,
         });
         // Without `record` the recurrence went straight into `cache.recurrence`; the conv tail is the segment's last row.
-        if (!record) try ru.s.queue.copy(cache.conv.ptr, sc.snapConv(base + seg.rows - 1), xs.conv_bytes, null);
+        if (!record) try ru.s.queue.copy(cache.conv.ptr, sc.snapConv(layer, base + seg.rows - 1), xs.conv_bytes, null);
         base += seg.rows;
     }
     try ru.go(.gdn_post, geo.gdnPost(T, c.linear_heads), .{ sc.y.ptr, sc.z.ptr, w.ptr(d.norm), c.eps, sc.mix.ptr });
@@ -461,8 +474,10 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
     for (segments) |seg| {
         const cache = &seg.cache.blocks[layer].attention;
         const rows: u32 = @intCast(seg.rows);
+        // dims[1] is the row stride of the shared `queries` buffer (all segments' rows), dims[2] this segment's base;
+        // Metal passes the same pair. dims[1] = rows here would stride the buffer as if the segment were alone.
         try ru.go(.queries, geo.layout(.queries, rows, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{
-            sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), rows, @intCast(base), 0 }),
+            sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), T, @intCast(base), 0 }),
         });
         try ru.go(.keys, geo.layout(.keys, rows, c.hidden, c.head_dim, c.query_heads, c.kv_heads), .{
             sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), @intCast(seg.cache.capacity), @intCast(base), 0 }),
