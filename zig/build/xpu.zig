@@ -138,6 +138,26 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     vp_run.step.dependOn(&vp_install.step);
     b.step("vprobe", "TEMP: 1-row verify path vs reference").dependOn(&vp_run.step);
 
+    const lp_module = b.createModule(.{ .root_source_file = b.path("zig/src/lprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    lp_module.addImport("xpu_qwen35_kernels", qk);
+    lp_module.addImport("lanes", lanes_mod);
+    lp_module.addImport("core", core);
+    const lp_exe = b.addExecutable(.{ .name = "tf-lprobe", .root_module = lp_module });
+    const lp_install = b.addInstallArtifact(lp_exe, .{});
+    const lp_run = b.addRunArtifact(lp_exe);
+    lp_run.step.dependOn(&lp_install.step);
+    b.step("lprobe", "TEMP: long-prompt chunked prefill divergence").dependOn(&lp_run.step);
+
+    const ep_module = b.createModule(.{ .root_source_file = b.path("zig/src/eprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    ep_module.addImport("xpu_qwen35_kernels", qk);
+    ep_module.addImport("lanes", lanes_mod);
+    ep_module.addImport("core", core);
+    const ep_exe = b.addExecutable(.{ .name = "tf-eprobe", .root_module = ep_module });
+    const ep_install = b.addInstallArtifact(ep_exe, .{});
+    const ep_run = b.addRunArtifact(ep_exe);
+    ep_run.step.dependOn(&ep_install.step);
+    b.step("eprobe", "TEMP: serve path on a long prompt").dependOn(&ep_run.step);
+
     // Phase 5: `zig build xpu-native` -> zig-out/xpu/bin/tensorfold-native: the HTTP server over `Xpu` (serve --backend xpu).
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native_xpu.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes_mod }, .{ .name = "core", .module = core } } });
