@@ -270,3 +270,68 @@ test "xpu req7: DPAS int8 (K=32, 0x33) and int4 (K=64, 0xC3) bit-exact vs CPU, 1
         try std.testing.expectEqual(@as(usize, runs), ok4);
     }
 }
+
+// ---- requirement: a recorded regular command list replays bit-exact vs the eager immediate-list run ----------------
+
+test "xpu cmdlist: a recorded DPAS step replays bit-for-bit equal to the eager launch, 100/100" {
+    const runs = 100;
+    for (0..rt.device.cards.len) |card| {
+        var s: Session = undefined;
+        try open(&s, card);
+        defer s.close();
+        var m = try loadModule(&s, kernels.dpas);
+        defer m.unload();
+        var k = try m.kernel("tf_dpas_int8");
+        defer k.deinit();
+        var da = try rt.memory.Buffer.alloc(&s.ctx, .device, 32);
+        defer da.free();
+        var db = try rt.memory.Buffer.alloc(&s.ctx, .device, 512);
+        defer db.free();
+        var dc = try rt.memory.Buffer.alloc(&s.ctx, .device, 64);
+        defer dc.free();
+        var hc = try rt.memory.Buffer.alloc(&s.ctx, .host, 64);
+        defer hc.free();
+
+        // The step's inputs are read-only device buffers whose *contents* change between replays while their addresses
+        // (baked into the recorded list) do not - the same contract the decode step's token/position/cache-length
+        // values rely on. Record one launch of the DPAS step, then replay it against fresh inputs each round and check
+        // every round equals the eager immediate-list launch on the same inputs.
+        var rec = try rt.cmdlist.Recorder.init(&s.ctx);
+        errdefer rec.deinit();
+        try rec.run(&k, rt.launch.Config{ .global = .{ .x = 16 }, .local = .{ .x = 16 } }, .{ da.ptr, db.ptr, dc.ptr });
+        // `take` closes the list and moves the handle into `list`; the recorder must not be destroyed afterwards.
+        var list = try rt.cmdlist.Recorded.take(&rec);
+        defer list.deinit();
+        var q = try rt.cmdlist.Queue.init(&s.ctx);
+        defer q.deinit();
+
+        var exact: usize = 0;
+        var eager_buf: [16]i32 = undefined;
+        var replay_buf: [16]i32 = undefined;
+        for (0..runs) |r| {
+            var prng = std.Random.DefaultPrng.init(9000 + r);
+            const rnd = prng.random();
+            var a: [16]i16 = undefined;
+            var b: [128]i32 = undefined;
+            for (&a) |*x| x.* = @bitCast(@as(u16, rnd.int(u16)));
+            for (&b) |*x| x.* = rnd.int(i32);
+            // Eager path: immediate in-order list.
+            try da.upload(&s.queue, 0, std.mem.asBytes(&a));
+            try db.upload(&s.queue, 0, std.mem.asBytes(&b));
+            try rt.launch.run(&s.queue, &k, .{ .global = .{ .x = 16 }, .local = .{ .x = 16 } }, .{ da.ptr, db.ptr, dc.ptr }, null);
+            try s.queue.copy(hc.ptr, dc.ptr, 64, null);
+            try s.queue.synchronize();
+            @memcpy(std.mem.sliceAsBytes(&eager_buf), (try hc.bytes())[0..64]);
+            // Replay path: same buffers, same recorded list, fresh contents uploaded between replays.
+            try da.upload(&s.queue, 0, std.mem.asBytes(&a));
+            try db.upload(&s.queue, 0, std.mem.asBytes(&b));
+            try list.replaySync(&q);
+            try s.queue.copy(hc.ptr, dc.ptr, 64, null);
+            try s.queue.synchronize();
+            @memcpy(std.mem.sliceAsBytes(&replay_buf), (try hc.bytes())[0..64]);
+            if (std.mem.eql(i32, &eager_buf, &replay_buf)) exact += 1;
+        }
+        std.debug.print("card {d}: recorded-list replay vs eager {d}/{d} bit-exact\n", .{ card, exact, runs });
+        try std.testing.expectEqual(@as(usize, runs), exact);
+    }
+}
