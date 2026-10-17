@@ -217,6 +217,26 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     ep_run.step.dependOn(&ep_install.step);
     b.step("eprobe", "TEMP: serve path on a long prompt").dependOn(&ep_run.step);
 
+    const bp_module = b.createModule(.{ .root_source_file = b.path("zig/src/bprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    bp_module.addImport("xpu_qwen35_kernels", qk);
+    bp_module.addImport("lanes", lanes_mod);
+    bp_module.addImport("core", core);
+    const bp_exe = b.addExecutable(.{ .name = "tf-bprobe", .root_module = bp_module });
+    const bp_install = b.addInstallArtifact(bp_exe, .{});
+    const bp_run = b.addRunArtifact(bp_exe);
+    bp_run.step.dependOn(&bp_install.step);
+    b.step("bprobe", "TEMP: the bench 16K cell through the served prefill path").dependOn(&bp_run.step);
+
+    const sp_module = b.createModule(.{ .root_source_file = b.path("zig/src/sprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    sp_module.addImport("xpu_qwen35_kernels", qk);
+    sp_module.addImport("lanes", lanes_mod);
+    sp_module.addImport("core", core);
+    const sp_exe = b.addExecutable(.{ .name = "tf-sprobe", .root_module = sp_module });
+    const sp_install = b.addInstallArtifact(sp_exe, .{});
+    const sp_run = b.addRunArtifact(sp_exe);
+    sp_run.step.dependOn(&sp_install.step);
+    b.step("sprobe", "TEMP: prompt-length sweep on the bench text").dependOn(&sp_run.step);
+
     // Phase 5: `zig build xpu-native` -> zig-out/xpu/bin/tensorfold-native: the HTTP server over `Xpu` (serve --backend xpu).
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native_xpu.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes_mod }, .{ .name = "core", .module = core } } });
