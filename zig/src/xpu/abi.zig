@@ -10,6 +10,7 @@ pub const Driver = ?*opaque {};
 pub const Device = ?*opaque {};
 pub const Context = ?*opaque {};
 pub const CommandList = ?*opaque {};
+pub const CommandQueue = ?*opaque {};
 pub const EventPool = ?*opaque {};
 pub const Event = ?*opaque {};
 pub const Module = ?*opaque {};
@@ -29,6 +30,7 @@ pub const stype = struct {
     pub const device_mem_alloc_desc: u32 = 0x15;
     pub const host_mem_alloc_desc: u32 = 0x16;
     pub const module_desc: u32 = 0x1b;
+    pub const command_list_desc: u32 = 0x19;
     pub const kernel_desc: u32 = 0x1d;
     pub const pci_ext_properties: u32 = 0x10008;
 };
@@ -107,6 +109,26 @@ pub const ModuleDesc = extern struct {
 };
 pub const KernelDesc = extern struct { stype: u32 = stype.kernel_desc, pNext: ?*const anyopaque = null, flags: u32 = 0, pKernelName: ?[*:0]const u8 = null };
 pub const GroupCount = extern struct { x: u32, y: u32, z: u32 };
+/// A range within a buffer, for zeCommandListAppendMemoryCopyRegion (dst/src size + offset, then row/slice pitch).
+pub const CopyRegion = extern struct {
+    origin: GroupCount = .{ .x = 0, .y = 0, .z = 0 },
+    region: GroupCount = .{ .x = 0, .y = 0, .z = 0 },
+};
+pub const CommandListDesc = extern struct {
+    stype: u32 = stype.command_list_desc,
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    commandQueueGroupOrdinal: u32 = 0,
+};
+pub const CommandQueueDesc = extern struct {
+    stype: u32 = stype.command_queue_desc,
+    pNext: ?*const anyopaque = null,
+    ordinal: u32 = 0,
+    index: u32 = 0,
+    flags: u32 = 0,
+    mode: u32 = 0,
+    priority: u32 = 0,
+};
 pub const TimestampData = extern struct { start: u64 = 0, end: u64 = 0 };
 pub const TimestampResult = extern struct { global: TimestampData = .{}, context: TimestampData = .{} };
 
@@ -136,6 +158,13 @@ pub const Api = struct {
     zeMemAllocHost: *const fn (Context, *const HostMemDesc, usize, usize, *?*anyopaque) callconv(C) Result,
     zeMemFree: *const fn (Context, ?*anyopaque) callconv(C) Result,
     zeCommandListCreateImmediate: *const fn (Context, Device, *const QueueDesc, *CommandList) callconv(C) Result,
+    zeCommandListCreate: *const fn (Context, Device, *const CommandListDesc, *CommandList) callconv(C) Result,
+    zeCommandListClose: *const fn (CommandList) callconv(C) Result,
+    zeCommandListReset: *const fn (CommandList) callconv(C) Result,
+    zeCommandQueueCreate: *const fn (Context, Device, *const CommandQueueDesc, *CommandQueue) callconv(C) Result,
+    zeCommandQueueDestroy: *const fn (CommandQueue) callconv(C) Result,
+    zeCommandQueueExecuteCommandLists: *const fn (CommandQueue, u32, [*]const CommandList, Event) callconv(C) Result,
+    zeCommandQueueSynchronize: *const fn (CommandQueue, u64) callconv(C) Result,
     zeCommandListDestroy: *const fn (CommandList) callconv(C) Result,
     zeCommandListAppendMemoryCopy: *const fn (CommandList, ?*anyopaque, ?*const anyopaque, usize, Event, u32, ?[*]Event) callconv(C) Result,
     zeCommandListAppendMemoryFill: *const fn (CommandList, ?*anyopaque, *const anyopaque, usize, usize, Event, u32, ?[*]Event) callconv(C) Result,

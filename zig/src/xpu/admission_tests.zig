@@ -15,6 +15,7 @@ test {
     _ = @import("session.zig");
     _ = @import("memory.zig").Buffer.alloc;
     _ = @import("module.zig").Module.load;
+    _ = @import("cmdlist.zig").Recorder.init;
 }
 
 test "a library missing a Level Zero symbol is refused whole" {
@@ -67,4 +68,33 @@ test "allocation failure and oversize allocation are errors, not buffers" {
     try std.testing.expectError(error.ZeFailed, rt.memory.Buffer.alloc(&ctx, .device, 4096));
     try std.testing.expectError(error.Invalid, rt.memory.Buffer.alloc(&ctx, .device, 0));
     try std.testing.expectError(error.Invalid, rt.memory.Buffer.alloc(&ctx, .device, 1 << 40));
+}
+
+test "a regular list is created on the compute group and a replay submits exactly one list" {
+    var r = try rt.Runtime.openPath(fixtures.success);
+    defer r.close();
+    const d = try rt.device.select(&r, "0000:44:00.0");
+    var ctx = try rt.context.Context.init(d);
+    defer ctx.deinit();
+    var rec = try rt.cmdlist.Recorder.init(&ctx);
+    const group = r.lib.lookup(*const fn () callconv(.c) u32, "tf_mock_last_list_group").?;
+    try std.testing.expectEqual(ctx.compute_ordinal, group());
+
+    var q = try rt.cmdlist.Queue.init(&ctx);
+    defer q.deinit();
+    const qgroup = r.lib.lookup(*const fn () callconv(.c) u32, "tf_mock_last_queue_group").?;
+    try std.testing.expectEqual(ctx.compute_ordinal, qgroup());
+
+    var list = try rt.cmdlist.Recorded.take(&rec);
+    defer list.deinit();
+    const executes = r.lib.lookup(*const fn () callconv(.c) c_int, "tf_mock_executes").?;
+    const submitted = r.lib.lookup(*const fn () callconv(.c) u32, "tf_mock_last_execute_lists").?;
+    try std.testing.expectEqual(@as(c_int, 0), executes());
+    try list.replaySync(&q);
+    try std.testing.expectEqual(@as(c_int, 1), executes());
+    try std.testing.expectEqual(@as(u32, 1), submitted());
+    // A second replay re-submits the same closed list: the recorded step is immutable.
+    try list.replaySync(&q);
+    try std.testing.expectEqual(@as(c_int, 2), executes());
+    try std.testing.expectEqual(@as(u32, 1), submitted());
 }

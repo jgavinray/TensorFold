@@ -8,6 +8,7 @@ pub const lock = @import("lock.zig");
 pub const context = @import("context.zig");
 pub const memory = @import("memory.zig");
 pub const queue = @import("queue.zig");
+pub const cmdlist = @import("cmdlist.zig");
 pub const module = @import("module.zig");
 pub const launch = @import("launch.zig");
 pub const event = @import("event.zig");

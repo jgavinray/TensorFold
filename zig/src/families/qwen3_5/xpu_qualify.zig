@@ -38,7 +38,7 @@ pub fn equal(gpa: std.mem.Allocator, s: *rt.session.Session, a: *const xs.Cache,
 }
 
 pub fn check(gpa: std.mem.Allocator, s: *rt.session.Session, m: *fwd.Model, wide: *fwd.Scratch) !void {
-    var solo = try fwd.Scratch.init(s, 1, 128, 1);
+    var solo = try fwd.Scratch.init(gpa, s, 1, 128, 1);
     defer solo.deinit();
     var caches: [4]xb.Entry = undefined;
     var initialized: usize = 0;

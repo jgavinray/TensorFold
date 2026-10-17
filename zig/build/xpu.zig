@@ -1,8 +1,22 @@
 //! Level Zero (Intel Arc Pro B70): mock-backed admission tests join `zig build test`; on-card runs are opt-in steps
-//! (`xpu-test`, `xpu-kernel-exact`). Kernels are compiled with ocloc for device bmg; set -Docloc / -Dxpu-device to override.
+//! (`xpu-test`, `xpu-kernel-exact`). Kernels are compiled with ocloc for device bmg; set -Docloc / -Dxpu-device to
+//! override, or -Dqwen-kernels=prebuilt:<dir> to embed modules from an earlier build on a host without ocloc.
 
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
+
+/// Whether the named ocloc binary is on PATH, so the default kernel source can follow it.
+fn oclocAvailable(b: *std.Build, name: []const u8) bool {
+    const path = b.graph.environ_map.get("PATH") orelse return false;
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = b.pathJoin(&.{ dir, name });
+        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), full, .{}) catch continue;
+        return true;
+    }
+    return false;
+}
 
 /// xpu-host-test (part of `test`), xpu-test (build + run on the card), xpu-gpu-build, xpu-kernel-exact (CLI install).
 /// The Qwen kernel sources under zig/kernels/xpu/shared/ carry the 2B shape values as preprocessor defaults; a 27B
@@ -36,13 +50,33 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const shape_defines = b.option([]const u8, "qwen-shape-defines", "space-separated -D flags for the shared Qwen kernels (empty = 2B defaults)") orelse "";
 
     // Test kernels, compiled to native binaries: <name>_<device>.bin. The path is passed to the tests as a build option.
+    // `-Dtest-kernels=prebuilt[:<dir>]` embeds modules built earlier on a host without ocloc (same fallback the Qwen
+    // kernels use), so the on-card runtime tests stay runnable while intel-ocloc is absent.
+    const test_kernels = b.option([]const u8, "test-kernels", "ocloc | prebuilt[:<dir>]: where the runtime/dpas test kernel modules come from") orelse if (oclocAvailable(b, ocloc)) "ocloc" else "prebuilt";
+    const test_prebuilt: ?[]const u8 = if (std.mem.eql(u8, test_kernels, "prebuilt"))
+        "zig/kernels/xpu/prebuilt-test"
+    else if (std.mem.startsWith(u8, test_kernels, "prebuilt:"))
+        test_kernels["prebuilt:".len..]
+    else
+        null;
+    if (test_prebuilt == null and !std.mem.eql(u8, test_kernels, "ocloc")) {
+        std.debug.panic("test-kernels must be `ocloc`, `prebuilt` or `prebuilt:<dir>`, got {s}", .{test_kernels});
+    }
     const kernels = b.addOptions();
     inline for (.{ "runtime_tests", "dpas" }) |name| {
-        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
-        c.addFileArg(b.path("zig/kernels/xpu/" ++ name ++ ".cl"));
-        c.addArg("-out_dir");
-        const out = c.addOutputDirectoryArg(name ++ "-out");
-        kernels.addOptionPath(name, out.path(b, b.fmt(name ++ "_{s}.bin", .{xpu_device})));
+        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
+        if (test_prebuilt) |dir| {
+            const src = b.pathJoin(&.{ dir, file });
+            const wf = b.addWriteFiles();
+            const copied = wf.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
+            kernels.addOptionPath(name, copied);
+        } else {
+            const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", "-cl-std=CL3.0", "-file" });
+            c.addFileArg(b.path("zig/kernels/xpu/" ++ name ++ ".cl"));
+            c.addArg("-out_dir");
+            const out = c.addOutputDirectoryArg(name ++ "-out");
+            kernels.addOptionPath(name, out.path(b, file));
+        }
     }
 
     const gpu_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/runtime_tests.zig"), .target = target, .link_libc = true });
@@ -76,18 +110,43 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // executable carries its own kernels and works from any working directory - no cwd-relative .zig-cache paths.
     // One source per key (zig/kernels/xpu/shared/<key>/<key>.cl) with the 2B shape values as preprocessor defaults;
     // the 27B build overrides them with -D flags (see zig/build/xpu.zig `sharedDefines`).
+    //
+    // The kernel modules come from one of two places:
+    //   * `ocloc` (default when the binary is on PATH): compile zig/kernels/xpu/shared/<key>/<key>.cl here.
+    //   * `prebuilt` (default when ocloc is absent, or `-Dqwen-kernels=prebuilt:<dir>`): @embedFile the
+    //     <dir>/<key>_<device>.bin committed under zig/kernels/xpu/prebuilt/, so a host without ocloc still builds
+    //     the on-card tests from modules that were compiled from the same sources.
+    // Both paths produce module bytes that load on the card; nothing else in the graph changes.
+    const qwen_kernels = b.option([]const u8, "qwen-kernels", "ocloc | prebuilt[:<dir>]: where the Qwen kernel modules come from") orelse if (oclocAvailable(b, ocloc)) "ocloc" else "prebuilt";
+    const prebuilt: ?[]const u8 = if (std.mem.eql(u8, qwen_kernels, "prebuilt"))
+        "zig/kernels/xpu/prebuilt"
+    else if (std.mem.startsWith(u8, qwen_kernels, "prebuilt:"))
+        qwen_kernels["prebuilt:".len..]
+    else
+        null;
+    if (prebuilt == null and !std.mem.eql(u8, qwen_kernels, "ocloc")) {
+        std.debug.panic("qwen-kernels must be `ocloc`, `prebuilt` or `prebuilt:<dir>`, got {s}", .{qwen_kernels});
+    }
+    if (prebuilt == null and shape_defines.len != 0) {
+        std.debug.panic("qwen-kernels=ocloc cannot apply -Dqwen-shape-defines here: the 27B shapes need their own build host", .{});
+    }
     const qk_files = b.addWriteFiles();
     var qk_src: []const u8 = "//! Compiled Qwen kernel binaries, embedded (see zig/build/xpu.zig).\n";
     // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
     // ocloc takes compile options as one string after -options, so the -D flags belong there, not as bare args.
     const opt_string = b.fmt("-cl-std=CL3.0 {s}", .{shape_defines});
     inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
-        const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", opt_string, "-file" });
-        c.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
-        c.addArg("-out_dir");
-        const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
-        _ = qk_files.addCopyFile(out.path(b, file), file);
+        if (prebuilt) |dir| {
+            const src = b.pathJoin(&.{ dir, file });
+            _ = qk_files.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
+        } else {
+            const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", opt_string, "-file" });
+            c.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
+            c.addArg("-out_dir");
+            const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
+            _ = qk_files.addCopyFile(out.path(b, file), file);
+        }
         qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
     }
     const qk = b.createModule(.{ .root_source_file = qk_files.add("xpu_qwen35_kernels.zig", qk_src) });
