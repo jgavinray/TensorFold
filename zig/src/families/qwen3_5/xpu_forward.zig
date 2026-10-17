@@ -19,7 +19,7 @@ const Buffer = rt.memory.Buffer;
 const Kernel = rt.module.Kernel;
 const Dim = rt.launch.Dim3;
 pub const Head = enum { last, all };
-pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing };
+pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing, ReplayCannotProfile };
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
@@ -307,7 +307,7 @@ const Run = struct {
     /// caller closes and replays it (xpu_replay.zig). Kernel arguments are captured at record time.
     rec: ?*rt.cmdlist.Recorder = null,
 
-    fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
+    fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
         const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
         const cfg = rt.launch.Config{ .global = global, .local = local };
@@ -327,12 +327,12 @@ const Run = struct {
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
     }
-    fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
+    fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) Error!void {
         try self.go(.qmm, geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
         });
     }
-    fn norm(self: Run, h: *anyopaque, residual: ?*anyopaque, weight: xw.Tensor, x: *anyopaque, rows: usize) rt.Error!void {
+    fn norm(self: Run, h: *anyopaque, residual: ?*anyopaque, weight: xw.Tensor, x: *anyopaque, rows: usize) Error!void {
         if (residual) |r| {
             try self.go(.norm, geo.norm(@intCast(rows), c.hidden), .{ h, r, self.wp(weight), c.eps, h, x });
         } else {
@@ -437,7 +437,7 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
     try s.queue.synchronize();
 }
 
-fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: bool, total: usize) rt.Error!void {
+fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: bool, total: usize) Error!void {
     const sc = ru.sc;
     const T: u32 = @intCast(total);
     try ru.projection(d.qkv, sc.x.ptr.?, sc.qkv.ptr.?, total);
@@ -473,7 +473,7 @@ fn delta(ru: Run, d: xw.Delta, layer: usize, segments: []const Segment, record: 
     try ru.projection(d.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }
 
-fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, total: usize) rt.Error!void {
+fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, total: usize) Error!void {
     const sc = ru.sc;
     const w = ru.w;
     const T: u32 = @intCast(total);
