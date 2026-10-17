@@ -8,6 +8,11 @@ static int foreign_pci_queries = 0;
 static uint32_t last_queue_flags = 0xdeadbeef;
 static int queue_creates = 0;
 static int drivers_asked = 0;
+static int list_creates = 0;
+static int executes = 0;
+static uint32_t last_list_group = 0xdeadbeef;
+static uint32_t last_queue_group = 0xdeadbeef;
+static uint32_t last_execute_lists = 0;
 
 #ifndef INIT_RESULT
 #define INIT_RESULT 0
@@ -48,6 +53,17 @@ R zeMemFree(void *c, void *p) { return 0; }
 R zeCommandListCreateImmediate(void *c, void *dev, const void *desc, void **l) {
   memcpy(&last_queue_flags, (const uint8_t *)desc + 24, 4); queue_creates++; *l = (void *)0x300; return 0;
 }
+R zeCommandListCreate(void *c, void *dev, const void *desc, void **l) {
+  memcpy(&last_list_group, (const uint8_t *)desc + 20, 4); list_creates++; *l = (void *)0x301; return 0;
+}
+R zeCommandListClose(void *l) { return 0; }
+R zeCommandListReset(void *l) { return 0; }
+R zeCommandQueueCreate(void *c, void *dev, const void *desc, void **q) {
+  memcpy(&last_queue_group, (const uint8_t *)desc + 16, 4); queue_creates++; *q = (void *)0x302; return 0;
+}
+R zeCommandQueueDestroy(void *q) { return 0; }
+R zeCommandQueueExecuteCommandLists(void *q, uint32_t n, void **l, void *e) { last_execute_lists = n; executes++; return 0; }
+R zeCommandQueueSynchronize(void *q, uint64_t t) { return 0; }
 R zeCommandListDestroy(void *l) { return 0; }
 R zeCommandListAppendMemoryCopy(void *l, void *d, const void *s, size_t n, void *e, uint32_t nw, void **w) { return 0; }
 R zeCommandListAppendMemoryFill(void *l, void *d, const void *p, size_t ps, size_t n, void *e, uint32_t nw, void **w) { return 0; }
@@ -74,4 +90,9 @@ R zeKernelSetGroupSize(void *k, uint32_t x, uint32_t y, uint32_t z) { return 0; 
 int tf_mock_foreign_pci_queries(void) { return foreign_pci_queries; }
 uint32_t tf_mock_last_queue_flags(void) { return last_queue_flags; }
 int tf_mock_queue_creates(void) { return queue_creates; }
+int tf_mock_list_creates(void) { return list_creates; }
+int tf_mock_executes(void) { return executes; }
+uint32_t tf_mock_last_list_group(void) { return last_list_group; }
+uint32_t tf_mock_last_queue_group(void) { return last_queue_group; }
+uint32_t tf_mock_last_execute_lists(void) { return last_execute_lists; }
 uint32_t tf_mock_init_flags(void) { return init_flags; }
