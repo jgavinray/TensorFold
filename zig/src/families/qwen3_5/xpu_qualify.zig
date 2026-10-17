@@ -52,17 +52,23 @@ pub fn check(gpa: std.mem.Allocator, s: *rt.session.Session, m: *fwd.Model, wide
         const rows: usize = if (i % 2 == 0) 1 else 3;
         try fwd.run(s, m, wide, &e.cache, ids[0..rows], .{ .head = .last });
     }
-    const got = try gpa.alloc(u16, 16 * c.vocab);
+    const got = try gpa.alloc(u16, 32 * c.vocab);
     defer gpa.free(got);
     const one = try gpa.alloc(u16, c.vocab);
     defer gpa.free(one);
+    // Both streams' 16-row windows in one shared forward, as the Metal qualify does: `caches[1]` then lands at base
+    // 16, so the two streams' snapshots occupy disjoint scratch rows and both later `keep`s read their own.
+    try fwd.runSegments(s, m, wide, &.{
+        .{ .cache = &caches[0].cache, .rows = 16 },
+        .{ .cache = &caches[1].cache, .rows = 16 },
+    }, ids[0..32], true, .{ .head = .all });
+    try wide.logits.download(&s.queue, 0, std.mem.sliceAsBytes(got));
     for (0..2) |stream| {
-        try caches[stream].window(s, m, wide, ids[stream * 16 ..][0..16]);
-        try wide.logits.download(&s.queue, 0, std.mem.sliceAsBytes(got));
         for (0..16) |r| {
             try fwd.run(s, m, &solo, &caches[stream + 2].cache, ids[stream * 16 + r ..][0..1], .{ .head = .all });
             try solo.logits.download(&s.queue, 0, std.mem.sliceAsBytes(one));
-            if (!std.mem.eql(u8, std.mem.sliceAsBytes(got[r * c.vocab ..][0..c.vocab]), std.mem.sliceAsBytes(one))) return error.QwenWindowLogitsMismatch;
+            const row = (stream * 16 + r) * c.vocab;
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(got[row..][0..c.vocab]), std.mem.sliceAsBytes(one))) return error.QwenWindowLogitsMismatch;
         }
         try equal(gpa, s, &caches[stream].cache, &caches[stream + 2].cache);
     }
