@@ -135,7 +135,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
     // ocloc takes compile options as one string after -options, so the -D flags belong there, not as bare args.
     const opt_string = b.fmt("-cl-std=CL3.0 {s}", .{shape_defines});
-    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+    inline for (.{ "layout", "norm", "norm_nores", "qmm", "norm_qmm", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         if (prebuilt) |dir| {
             const src = b.pathJoin(&.{ dir, file });
@@ -162,6 +162,32 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const f_run = b.addRunArtifact(f_exe);
     f_run.step.dependOn(&f_install.step);
     b.step("xpu-qwen35-forward-test", "Build and run tf-xpu-qwen35-forward-test: Qwen3.5-2B forward gates A-C on a B70 (opt-in)").dependOn(&f_run.step);
+
+    // TEMP (S02 investigation): per-shape qmm bench probe; delete with zig/src/xpu_bench_probe.zig.
+    const bp_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_bench_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    bp_module.addImport("xpu_qwen35_kernels", qk);
+    bp_module.addImport("core", core);
+    const bp_exe = b.addExecutable(.{ .name = "tf-xpu-bench-probe", .root_module = bp_module });
+    const bp_install = b.addInstallArtifact(bp_exe, .{});
+    const bp_run = b.addRunArtifact(bp_exe);
+    bp_run.step.dependOn(&bp_install.step);
+    b.step("xpu-bench-probe", "TEMP: per-shape qmm timing probe").dependOn(&bp_install.step);
+
+    // TEMP (S02 investigation): fused norm_qmm vs norm+qmm correctness probe.
+    const nq_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_normqmm_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    nq_module.addImport("xpu_qwen35_kernels", qk);
+    nq_module.addImport("core", core);
+    const nq_exe = b.addExecutable(.{ .name = "tf-xpu-normqmm-probe", .root_module = nq_module });
+    const nq_install = b.addInstallArtifact(nq_exe, .{});
+    b.step("xpu-normqmm-probe", "TEMP: fused norm_qmm vs norm+qmm bit-exactness probe").dependOn(&nq_install.step);
+
+    // TEMP (S02 investigation): fused mlp_act_down vs mlp_act+qmm correctness probe.
+    const ad_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_actdown_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    ad_module.addImport("xpu_qwen35_kernels", qk);
+    ad_module.addImport("core", core);
+    const ad_exe = b.addExecutable(.{ .name = "tf-xpu-actdown-probe", .root_module = ad_module });
+    const ad_install = b.addInstallArtifact(ad_exe, .{});
+    b.step("xpu-actdown-probe", "TEMP: fused mlp_act_down vs mlp_act+qmm bit-exactness probe").dependOn(&ad_install.step);
 
     // Phase 4.4-4.5: `Xpu` behind the lane engine's backend interface + qualify, on card (opt-in, needs a card).
     const lanes_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
