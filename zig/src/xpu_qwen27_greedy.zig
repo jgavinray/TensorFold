@@ -129,7 +129,10 @@ pub fn main(init: std.process.Init) !u8 {
     try m.kernels.load(&s, gpa);
     defer m.kernels.deinit();
 
-    var sc = try fwd.Scratch.init(&s, config, 1, capacity, 1);
+    // The scratch must hold the whole prompt in one prefill segment (rows = prompt length); the one-row decode
+    // steps reuse the same buffers, since `run` only needs rows >= that call's token count. `logit_rows` stays 1
+    // because every call here asks for the last row only.
+    var sc = try fwd.Scratch.init(&s, config, ids.len, capacity, 1);
     defer sc.deinit();
     var cache = try xs.Cache.init(gpa, &s, config, capacity);
     defer cache.deinit();

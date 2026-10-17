@@ -20,6 +20,9 @@
 // Shapes are compile-time defines; defaults are the Qwen3.5-2B geometry, so the proven 2B gate applies to
 // this file unchanged. The 27B build overrides QW_HIDDEN (5120), QW_HEADS (24), QW_KV_HEADS (4) and
 // QW_VOCAB (248320); QW_HEAD_DIM (256), QW_ROTARY_DIM (64) and the partial-rotary layout are shared.
+// QW_ATTN_WIDTH is the attention output row width, QW_HEADS*QW_HEAD_DIM: the 2B's 8*256 = 2048 happens to
+// equal its hidden size, so attention_gate could use QW_HIDDEN as that stride and be right; at 27B it is
+// 24*256 = 6144 against hidden 5120, and using QW_HIDDEN read and wrote each row 1024 elements early.
 
 #pragma OPENCL EXTENSION cl_intel_bfloat16_conversions : enable
 
@@ -40,6 +43,9 @@
 #endif
 #ifndef QW_VOCAB
 #define QW_VOCAB 248320           // only used for sizing comments; the embed grid supplies the rows
+#endif
+#ifndef QW_ATTN_WIDTH
+#define QW_ATTN_WIDTH (QW_HEADS * QW_HEAD_DIM)   // attention output row width (== QW_HIDDEN on the 2B)
 #endif
 
 #define QW_HALF_ROTARY (QW_ROTARY_DIM / 2)  // 32: pair offset inside the rotary half
@@ -161,8 +167,9 @@ __kernel void qwen35_keys(__global const ushort* k,
 }
 
 // thread (d, r): head = d/QW_HEAD_DIM; gate = q[r*QW_QGATE_STRIDE + head*2*QW_HEAD_DIM + QW_HEAD_DIM + d%QW_HEAD_DIM];
-// s = bf16(1/(1+exp(-gate))); out[r*QW_HIDDEN + d] = bf16(x[r*QW_HIDDEN + d] * s). The sigmoid is rounded to bf16
-// before the product, as in Metal.
+// s = bf16(1/(1+exp(-gate))); out[r*QW_ATTN_WIDTH + d] = bf16(x[r*QW_ATTN_WIDTH + d] * s). The sigmoid is rounded to
+// bf16 before the product, as in Metal. QW_ATTN_WIDTH is the attention row width (heads*head_dim), which equals
+// QW_HIDDEN on the 2B but is wider on the 27B (6144 vs 5120) - the row stride of both x and out.
 __kernel void qwen35_attention_gate(__global const ushort* x,
                                     __global const ushort* q,
                                     __global ushort* out) {
@@ -174,5 +181,5 @@ __kernel void qwen35_attention_gate(__global const ushort* x,
                                    + (size_t)QW_HEAD_DIM + (size_t)(d % (uint)QW_HEAD_DIM)]);
   const float s = bf16_to_f32(f32_to_bf16(1.0f / (1.0f + exp(-gate))));
 
-  out[(size_t)r * QW_HIDDEN + (size_t)d] = f32_to_bf16(bf16_to_f32(x[(size_t)r * QW_HIDDEN + (size_t)d]) * s);
+  out[(size_t)r * QW_ATTN_WIDTH + (size_t)d] = f32_to_bf16(bf16_to_f32(x[(size_t)r * QW_ATTN_WIDTH + (size_t)d]) * s);
 }
