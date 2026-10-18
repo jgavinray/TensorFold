@@ -76,6 +76,16 @@ pub const Config = struct {
     eos_count: usize = 0,
     max_position: usize = 262144,
     mrope_interleaved: bool = true,
+    /// The checkpoint's affine quantization group size (config.json's `quantization.group_size`), 64 when unstated.
+    group: usize = 64,
+
+    pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
+        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+        defer gpa.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
+        defer gpa.free(bytes);
+        return parse(gpa, bytes, null);
+    }
 
     pub fn kind(c: Config, layer: usize) Kind {
         return c.kinds[layer];
@@ -202,6 +212,10 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
         .rope_theta = if (rope) |r| try optional(r, "rope_theta", try optional(t, "rope_theta", 10000000)) else try optional(t, "rope_theta", 10000000),
     };
     if (t.get("max_position_embeddings")) |v| c.max_position = try integer(v, false);
+    if (root.get("quantization")) |v| if (v != .null) {
+        const q = try object(v);
+        if (q.get("group_size")) |g| c.group = try integer(g, false);
+    };
     if (rope) |r| if (r.get("mrope_interleaved")) |v| {
         if (v != .bool or !v.bool) return error.UnsupportedMrope;
         c.mrope_interleaved = v.bool;
