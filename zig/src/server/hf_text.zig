@@ -131,12 +131,15 @@ pub const HfText = struct {
             const holders = [_]?std.json.Value{ model_config.object.get("eos_token_id"), if (model_config.object.get("text_config")) |tc| (if (tc == .object) tc.object.get("eos_token_id") else null) else null };
             for (holders) |h| {
                 const v = h orelse continue;
+                const n = out.items.len;
                 switch (v) {
                     .integer => |i| try out.append(a, @intCast(i)),
                     .array => |list| for (list.items) |x| if (x == .integer) try out.append(a, @intCast(x.integer)),
                     else => {},
                 }
-                if (out.items.len > 0) break;
+                // A holder that yielded nothing (the 27B's scalar `eos_token_id` beside a text_config that
+                // states only `bos_token_id`) must not stop the search: the next holder may have the ids.
+                if (out.items.len > n) break;
             }
         }
         if (config == .object) if (config.object.get("eos_token")) |e| {
@@ -300,6 +303,10 @@ test "model EOS does not hide a different tokenizer chat end" {
     try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, same, config));
     const added = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token\":{\"content\":\"<|im_end|>\"}}", .{});
     try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, model, added));
+    // The 27B checkpoint: a scalar root `eos_token_id` and a text_config that names no end id. The scalar must
+    // not end the search, or a served stream never sees its stop token and runs to max_tokens.
+    const scalar = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token_id\":248044,\"text_config\":{\"bos_token_id\":248044}}", .{});
+    try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, scalar, config));
     try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, .null, config));
 }
 
