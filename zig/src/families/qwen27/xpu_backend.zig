@@ -4,9 +4,11 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const rt = @import("../../xpu/runtime.zig");
-const c = @import("config.zig");
+const cfg = @import("config.zig");
+const c = cfg;
 const xs = @import("xpu_state.zig");
 const fwd = @import("xpu_forward.zig");
+const kernels = @import("xpu_qwen27_kernels");
 const rp = @import("xpu_replay.zig");
 const be = lanes.backend;
 
@@ -50,7 +52,7 @@ pub const Entry = struct {
 };
 
 fn offLogits(sc: *fwd.Scratch, row: usize) *const anyopaque {
-    return @ptrFromInt(@intFromPtr(sc.logits.ptr.?) + row * c.vocab * 2);
+    return @ptrFromInt(@intFromPtr(sc.logits.ptr.?) + row * cfg.xpu_vocab * 2);
 }
 
 pub const Xpu = struct {
@@ -71,9 +73,9 @@ pub const Xpu = struct {
     pub fn init(gpa: std.mem.Allocator, session: *rt.session.Session, model: *fwd.Model, config: c.Config, options: Options) !*Xpu {
         const out = try gpa.create(Xpu);
         errdefer gpa.destroy(out);
-        const row = try gpa.alloc(u16, c.vocab);
+        const row = try gpa.alloc(u16, cfg.xpu_vocab);
         errdefer gpa.free(row);
-        const rows = try gpa.alloc(u16, xs.max_segments * window_rows * c.vocab);
+        const rows = try gpa.alloc(u16, xs.max_segments * window_rows * cfg.xpu_vocab);
         errdefer gpa.free(rows);
         out.* = .{
             .gpa = gpa,
@@ -202,12 +204,15 @@ pub const Xpu = struct {
             e.cache.len += 1;
             return;
         }
-        // No step for this shape yet: run the token eagerly and record the same launches for the next token.
+        // No step for this shape yet: record this token's launches (captured at the current cache length), then run
+        // the token eagerly so this call still produces logits. Every later token of the shape replays the one list.
+        const step = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
+        try self.replay.put(1, e.cache.capacity, step);
         try fwd.run(self.session, self.model, &self.scratch, &e.cache, &.{token}, .{ .head = .last });
     }
 
     fn readFn(_: *anyopaque, handle: u64) !u32 {
-        if (handle >= c.vocab) return error.InvalidQwenToken;
+        if (handle >= cfg.xpu_vocab) return error.InvalidQwenToken;
         return @intCast(handle);
     }
 
@@ -234,14 +239,14 @@ pub const Xpu = struct {
         }
         // One forward over every window: each stream's rows are its own segment, snapshots recorded so `keep` rolls back.
         try fwd.runSegments(self.session, self.model, &self.scratch, segments[0..windows.len], ids[0..total], true, .{ .head = .all });
-        const bytes = std.mem.sliceAsBytes(self.rows[0 .. total * c.vocab]);
+        const bytes = std.mem.sliceAsBytes(self.rows[0 .. total * cfg.xpu_vocab]);
         try self.scratch.logits.download(&self.session.queue, 0, bytes);
         var base: usize = 0;
         for (windows, out) |w, o| {
             const n = w.rows();
             for (o.sampled, w.positions, 0..) |*t, p, r| {
                 const mask = if (w.masks.len > 0) w.masks[r * mask_words ..][0..mask_words] else &.{};
-                t.* = try draw(self.gpa, self.rows[(base + r) * c.vocab ..][0..c.vocab], w.stream.sampling, p, mask);
+                t.* = try draw(self.gpa, self.rows[(base + r) * cfg.xpu_vocab ..][0..cfg.xpu_vocab], w.stream.sampling, p, mask);
             }
             @memcpy(o.drafts, w.tokens);
             base += n;
@@ -267,7 +272,7 @@ pub const Xpu = struct {
 };
 
 /// A row's allowed-token bits (structured output): one bit a logit.
-const mask_words = (c.vocab + 31) / 32;
+const mask_words = (cfg.xpu_vocab + 31) / 32;
 
 pub fn value(word: u16) f64 {
     return @as(f32, @bitCast(@as(u32, word) << 16));

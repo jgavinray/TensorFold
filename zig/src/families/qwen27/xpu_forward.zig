@@ -13,7 +13,7 @@ pub const sys = @import("../../xpu/sys.zig");
 pub const cfg = @import("config.zig");
 pub const xw = @import("xpu_weights.zig");
 pub const xs = @import("xpu_state.zig");
-const kbins = @import("xpu_qwen35_kernels");
+const kbins = @import("xpu_qwen27_kernels");
 const cfgmod = cfg;
 const c = struct {
     pub const hidden = cfgmod.xpu_hidden;
@@ -36,6 +36,14 @@ const c = struct {
     /// k_proj's / v_proj's output width (the KV cache row width).
     pub fn kvDim() usize {
         return kv_heads * head_dim;
+    }
+    /// The value projection's width (in_proj_z / out_proj row count): QW_NV * QW_DV.
+    pub fn gdnValueDim() usize {
+        return v_heads * dv;
+    }
+    /// The GatedDeltaNet convolution's channel count: 2*QW_NK*QW_DK + QW_NV*QW_DV (gdn_pre.cl's QW_CC).
+    pub fn gdnQkvDim() usize {
+        return 2 * k_heads * dk + gdnValueDim();
     }
 };
 const geo = @import("../qwen3_5/xpu_geometry.zig");

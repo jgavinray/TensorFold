@@ -77,6 +77,8 @@ pub const Config = struct {
     max_position: usize = 262144,
     mrope_interleaved: bool = true,
     /// The checkpoint's affine quantization group size (config.json's `quantization.group_size`), 64 when unstated.
+    /// Read from the checkpoint, not assumed: the XPU weight loader sizes every `.scales`/`.biases` row by it, so a
+    /// checkpoint quantized with another group size is admitted here and loaded by its own numbers.
     group: usize = 64,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
@@ -212,7 +214,9 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
         .rope_theta = if (rope) |r| try optional(r, "rope_theta", try optional(t, "rope_theta", 10000000)) else try optional(t, "rope_theta", 10000000),
     };
     if (t.get("max_position_embeddings")) |v| c.max_position = try integer(v, false);
-    if (root.get("quantization")) |v| if (v != .null) {
+    // The affine group size the checkpoint's `.scales`/`.biases` rows are shaped by; the loader reads it back off
+    // `Config.group`, so a config that states another size loads by that size rather than by the 64 default.
+    for ([_][]const u8{ "quantization", "quantization_config" }) |key| if (root.get(key)) |v| if (v != .null) {
         const q = try object(v);
         if (q.get("group_size")) |g| c.group = try integer(g, false);
     };

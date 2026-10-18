@@ -79,7 +79,20 @@ pub const Replay = struct {
         return null;
     }
 
-    /// The mutable step pointer for this shape, creating the bucket (with no step yet) when absent.
+    /// Registers `step` under (rows, capacity), replacing any earlier one (whose list is freed).
+    pub fn put(self: *Replay, rows: usize, capacity: usize, step: Step) !void {
+        for (self.buckets.items) |*b| {
+            if (b.rows == rows and b.capacity == capacity) {
+                if (b.step) |*old| old.deinit(self.gpa);
+                b.step = step;
+                return;
+            }
+        }
+        try self.buckets.append(self.gpa, .{ .rows = rows, .capacity = capacity, .step = step });
+    }
+
+    /// The mutable step pointer for this shape, creating the bucket (with no step yet) when absent. Null only when the
+    /// bucket exists but has never held a step.
     pub fn stepFor(self: *Replay, rows: usize, capacity: usize) ?*Step {
         for (self.buckets.items) |*b| {
             if (b.rows == rows and b.capacity == capacity) return if (b.step) |*st| st else null;

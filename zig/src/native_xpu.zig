@@ -115,6 +115,15 @@ const Family = enum {
         if (std.mem.eql(u8, model_type, "qwen27")) return .qwen27;
         return null;
     }
+
+    /// The checkpoint's own context window, read before any card work: both families' configs read themselves the
+    /// same way, so one call serves either (the 2B states it as `context`, the 27B as `max_position`).
+    fn context(family: Family, gpa: Allocator, io: std.Io, dir: []const u8) !usize {
+        return switch (family) {
+            .qwen35 => (try @import("families/qwen3_5/config.zig").Config.read(gpa, io, dir)).context,
+            .qwen27 => (try @import("families/qwen27/config.zig").Config.read(gpa, io, dir)).max_position,
+        };
+    }
 };
 
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
@@ -122,11 +131,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "--backend xpu serves Qwen3.5-2B (qwen3_5) and Qwen3.8-27B (qwen27) only, not {s}", .{o.model_type});
         return null;
     };
-    const context = family.context(gpa, io, o.dir) catch |err| {
+    const context: i64 = @intCast(family.context(gpa, io, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot read this checkpoint's config ({s})", .{@errorName(err)});
         return null;
-    };
-    const window: i64 = o.context orelse @min(default_window, @as(i64, @intCast(context)));
+    });
+    const window: i64 = o.context orelse @min(default_window, context);
     if (window < 1 or window > context) {
         problem.* = "--context must fit the Qwen checkpoint's positive context window";
         return null;
@@ -190,7 +199,7 @@ fn openQwen27(h: *Host, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, p
     const config = try cfg.Config.read(gpa, io, o.dir);
     const window: i64 = o.context orelse @min(default_window, @as(i64, @intCast(config.max_position)));
     h.weights = .{ .qwen27 = try gpa.create(xw.Weights) };
-    h.weights.qwen27.* = xw.load(gpa, h.session, o.dir, config, config.group) catch |err| {
+    h.weights.qwen27.* = xw.load(gpa, h.session, o.dir, config) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot load this checkpoint ({s})", .{@errorName(err)});
         return;
     };
