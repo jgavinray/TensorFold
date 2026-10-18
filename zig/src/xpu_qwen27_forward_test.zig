@@ -155,6 +155,10 @@ fn gateC(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, refdir: []cons
 
 /// One-row decode segments, capacity 512, until >= 60 timed steps (the contract's measurement line). The prompt is
 /// the fixture's, so the first step follows a real prefill; every later step is one token.
+/// The timed steps go through the recorded-step replay (S01): the one-token step is recorded once into a regular
+/// command list and each token re-submits that one list, instead of ~660 immediate-list submits per token. The
+/// recorded list is checked against the eager step for the same token before any timing is trusted, so a replay
+/// that dropped or reordered a command cannot be mistaken for a speedup.
 fn decodeSteps(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, ids: []const u32, steps: *std.ArrayList(u64)) !void {
     var cache = try xs.Cache.init(gpa, s, sc.cfg, capacity);
     defer cache.deinit();
@@ -162,14 +166,42 @@ fn decodeSteps(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, ids: []c
     defer gpa.free(row);
     try fwd.run(s, m, sc, &cache, ids, .{});
     var next: [1]u32 = undefined;
+    try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+    next[0] = @intCast(argmax(row));
+
+    // The recorded list goes through its own in-order queue, so the eager path's queue stays untouched.
+    var rq = try rt.cmdlist.Queue.init(&s.ctx);
+    defer rq.deinit();
+    var step = try fwd.rp.recordStep(s, m, sc, &cache, &next, .{}, gpa);
+    defer step.deinit(gpa);
+
+    // The recorded list must reproduce the eager step for the same token bit for bit; otherwise the replay is
+    // not a valid measurement of the same work and the gate must not accept its timing.
+    const eager_row = try gpa.alloc(u16, sc.cfg.vocab);
+    defer gpa.free(eager_row);
+    var probe = try xs.Cache.init(gpa, s, sc.cfg, capacity);
+    defer probe.deinit();
+    try fwd.run(s, m, sc, &probe, ids, .{});
+    try fwd.run(s, m, sc, &probe, &next, .{});
+    try probe.logits.download(&s.queue, 0, std.mem.sliceAsBytes(eager_row));
+    const vals0: fwd.rp.Values = .{ .token = next[0], .position = @intCast(cache.len), .cache_len = @intCast(cache.len) };
+    try fwd.rp.replayStep(&step, &rq, vals0);
+    cache.len += 1;
+    try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+    const identical = std.mem.eql(u8, std.mem.sliceAsBytes(row), std.mem.sliceAsBytes(eager_row));
+    std.debug.print("GATE D replay vs eager logits row: {s}\n", .{if (identical) "bit-identical" else "DIFFERENT"});
+    if (!identical) return error.ReplayLogitsMismatch;
+
     // 3 warm-up steps, then as many timed steps as the capacity allows after the prompt (>= 60 whenever capacity
     // leaves room; the fixture prompt is 14 tokens, so 512 - 14 - 3 = 495 timed steps).
-    var i: usize = 0;
+    var i: usize = 1;
     while (i < 63) : (i += 1) {
         try cache.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
         next[0] = @intCast(argmax(row));
         const t1 = sys.nowNs();
-        try fwd.run(s, m, sc, &cache, &next, .{});
+        const v: fwd.rp.Values = .{ .token = next[0], .position = @intCast(cache.len), .cache_len = @intCast(cache.len) };
+        try fwd.rp.replayStep(&step, &rq, v);
+        cache.len += 1;
         if (i >= 3) try steps.append(gpa, sys.nowNs() - t1);
     }
 }
