@@ -19,7 +19,7 @@ const Buffer = rt.memory.Buffer;
 const Kernel = rt.module.Kernel;
 const Dim = rt.launch.Dim3;
 pub const Head = enum { last, all };
-pub const Error = rt.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing, ReplayCannotProfile, ReplayNeedsOneRow };
+pub const Error = rt.Error || std.mem.Allocator.Error || error{ QwenRowsExceeded, QwenContextFull, InvalidQwenToken, KernelBinaryMissing, ReplayCannotProfile, ReplayNeedsOneRow };
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
@@ -458,6 +458,7 @@ pub fn run(s: *rt.session.Session, m: *Model, sc: *Scratch, cache: *xs.Cache, to
 /// cache length), so a replay can rewrite exactly those before re-submitting the list. `position` is the RoPE position
 /// (the cache length before this token). Caller closes the list (`Recorded.take`).
 pub fn recordDecode(
+    s: *rt.session.Session,
     rec: *rt.cmdlist.Recorder,
     m: *Model,
     sc: *Scratch,
@@ -473,7 +474,7 @@ pub fn recordDecode(
     defer capture.deinit(sc.gpa);
     sc.record_slots = &capture;
     defer sc.record_slots = null;
-    try runSegments(rec, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec });
+    try runSegments(s, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec, .slots = &capture });
     // Classify: a slot is `position` when it holds the RoPE position, `cache_len` when it holds the cache length.
     // Both appear in several slots (queries, keys and attn_partial all carry them), and every occurrence must be
     // rewritten, so each slot records its own first matching element.
@@ -481,13 +482,13 @@ pub fn recordDecode(
     const base = @intFromPtr(sc.dimsBase()) - @intFromPtr(sc.pool.ptr.?);
     for (capture.items) |slot_i| {
         const d: [*]const i32 = @ptrCast(@alignCast(pool + base + slot_i * Scratch.slot_bytes));
-        var s: DimsSlot = .{ .offset = base + slot_i * Scratch.slot_bytes };
+        var slot: DimsSlot = .{ .offset = base + slot_i * Scratch.slot_bytes };
         for (0..8) |j| {
             const v: u32 = @intCast(@max(d[j], 0));
-            if (v == position and s.position_at == null) s.position_at = j;
-            if (v == cache.len and s.cache_len_at == null) s.cache_len_at = j;
+            if (v == position and slot.position_at == null) slot.position_at = j;
+            if (v == cache.len and slot.cache_len_at == null) slot.cache_len_at = j;
         }
-        try slots.append(sc.gpa, s);
+        try slots.append(sc.gpa, slot);
     }
 }
 
