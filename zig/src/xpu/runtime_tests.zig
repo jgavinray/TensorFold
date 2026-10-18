@@ -10,10 +10,22 @@ const sys = @import("sys.zig");
 const gpa = std.heap.page_allocator;
 
 fn open(s: *Session, card: usize) !void {
+    if (!try openCard(s, card)) return error.CardNotBound;
+}
+
+/// Opens a session on `card`, returning false when the card is parked (no driver bound): such a card is not in the
+/// lock pool, so `only` would wait out `wait_ms` and time out. This suite tests the usable cards; the host may
+/// legitimately hold a parked one.
+fn openCard(s: *Session, card: usize) !bool {
+    if (!rt.preflight.isBound(.{}, rt.device.cards[card])) {
+        std.debug.print("card {d} ({s}) has no driver bound; skipped\n", .{ card, rt.device.cards[card] });
+        return false;
+    }
     s.open(.{ .only = card, .wait_ms = 300_000 }) catch |e| {
         std.debug.print("session on card {d} refused: {s} ({s})\n", .{ card, @errorName(e), s.diag.message() });
         return e;
     };
+    return true;
 }
 
 fn loadBinary(path: []const u8) ![]u8 {
@@ -38,7 +50,10 @@ fn loadModule(s: *Session, path: []const u8) !rt.module.Module {
 test "xpu req1/req3: select both B70s by PCI address, refuse others, hold the shared card lock" {
     for (0..rt.device.cards.len) |card| {
         var s: Session = undefined;
-        try open(&s, card);
+        open(&s, card) catch |e| switch (e) {
+            error.CardNotBound => continue, // a parked card: not in the pool, nothing to test here
+            else => return e,
+        };
         defer s.close();
         const d = s.ctx.dev;
         var buf: [12]u8 = undefined;
@@ -48,24 +63,30 @@ test "xpu req1/req3: select both B70s by PCI address, refuse others, hold the sh
         try std.testing.expectEqualStrings(rt.device.cards[card], d.bdf.format(&buf));
         try std.testing.expectEqual(@as(u32, 0x8086), d.props.vendorId);
         // While this session holds the card, its lock is taken.
-        try std.testing.expect((try rt.lock.tryCard(rt.lock.default_dir, card)) == null);
+        try std.testing.expect((try rt.lock.tryCard(rt.lock.default_dir, card, .{})) == null);
         for ([_][]const u8{ "0000:c1:00.0", "0000:01:00.0", "0000:00:02.0" }) |bad|
             try std.testing.expectError(error.ForbiddenCard, rt.device.select(&s.rt, bad));
     }
-    // Locks are free again after close.
+    // Locks are free again after close (a parked card is not in the pool, so `tryCard` returns null for it).
     for (0..rt.device.cards.len) |card| {
-        var h = (try rt.lock.tryCard(rt.lock.default_dir, card)).?;
-        h.release();
+        var held = try rt.lock.tryCard(rt.lock.default_dir, card, .{});
+        if (held) |*h| h.release();
     }
 }
 
 test "xpu req2: preflight on the live host reads 100 W caps and 24 GiB" {
     var d: rt.preflight.Diag = .{};
-    rt.preflight.check(.{}, "0000:08:00.0", &d) catch |e| {
-        std.debug.print("preflight refused: {s}\n", .{d.message()});
-        return e;
-    };
-    try rt.preflight.check(.{}, "0000:44:00.0", &d);
+    // Every bound card must pass preflight; a parked card is skipped by the sweep, so it is not asserted.
+    for (rt.device.cards) |card| {
+        if (!rt.preflight.isBound(.{}, card)) {
+            std.debug.print("card {s} has no driver bound; skipped\n", .{card});
+            continue;
+        }
+        rt.preflight.check(.{}, card, &d) catch |e| {
+            std.debug.print("preflight refused {s}: {s}\n", .{ card, d.message() });
+            return e;
+        };
+    }
     std.debug.print("MemAvailable {d} MiB\n", .{rt.preflight.memAvailableKiB("/proc/meminfo").? >> 10});
 }
 
@@ -75,7 +96,7 @@ test "xpu req4: 256 MiB host-device-host round trip is bit-exact on both cards; 
     const size: usize = 256 << 20;
     for (0..rt.device.cards.len) |card| {
         var s: Session = undefined;
-        try open(&s, card);
+        if (!try openCard(&s, card)) continue; // a parked card is not in the pool
         defer s.close();
         var src = try rt.memory.Buffer.alloc(&s.ctx, .host, size);
         defer src.free();
@@ -119,7 +140,7 @@ test "xpu req5: fill sentinel, kernel writes, copy back - 100/100 exact with no 
     const runs = 100;
     for (0..rt.device.cards.len) |card| {
         var s: Session = undefined;
-        try open(&s, card);
+        if (!try openCard(&s, card)) continue; // a parked card is not in the pool
         defer s.close();
         var m = try loadModule(&s, kernels.runtime_tests);
         defer m.unload();
@@ -156,7 +177,7 @@ test "xpu req6: native module, mixed-width kernel args, group size, launch, even
     const n: u32 = 1025;
     for (0..rt.device.cards.len) |card| {
         var s: Session = undefined;
-        try open(&s, card);
+        if (!try openCard(&s, card)) continue; // a parked card is not in the pool
         defer s.close();
         var m = try loadModule(&s, kernels.runtime_tests);
         defer m.unload();
@@ -237,7 +258,7 @@ test "xpu req7: DPAS int8 (K=32, 0x33) and int4 (K=64, 0xC3) bit-exact vs CPU, 1
     const runs = 100;
     for (0..rt.device.cards.len) |card| {
         var s: Session = undefined;
-        try open(&s, card);
+        if (!try openCard(&s, card)) continue; // a parked card is not in the pool
         defer s.close();
         var m = try loadModule(&s, kernels.dpas);
         defer m.unload();
@@ -277,7 +298,7 @@ test "xpu cmdlist: a recorded DPAS step replays bit-for-bit equal to the eager l
     const runs = 100;
     for (0..rt.device.cards.len) |card| {
         var s: Session = undefined;
-        try open(&s, card);
+        if (!try openCard(&s, card)) continue; // a parked card is not in the pool
         defer s.close();
         var m = try loadModule(&s, kernels.dpas);
         defer m.unload();

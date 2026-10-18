@@ -49,28 +49,6 @@ fn readNpyU32(dir: []const u8, name: []const u8) ![]u32 {
     return out;
 }
 
-fn loadGroup(dir: []const u8) !usize {
-    var cb: [1024]u8 = undefined;
-    const cpath = sys.zfmt(&cb, "{s}/config.json", .{dir}) orelse return error.PathTooLong;
-    const text = sys.readFileAlloc(gpa, cpath, 1 << 22) orelse return error.NoConfig;
-    defer gpa.free(text);
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.BadConfig,
-    };
-    for ([_][]const u8{ "quantization", "quantization_config" }) |key| {
-        const v = root.get(key) orelse continue;
-        if (v != .object) continue;
-        if (v.object.get("group_size")) |gs| {
-            if (gs != .integer or gs.integer < 1) return error.BadAffine;
-            return @intCast(gs.integer);
-        }
-    }
-    return error.MissingAffineFormat;
-}
-
 fn loadConfig(dir: []const u8) !cfg.Config {
     var cb: [1024]u8 = undefined;
     const cpath = sys.zfmt(&cb, "{s}/config.json", .{dir}) orelse return error.PathTooLong;
@@ -192,12 +170,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("config error: {s}\n", .{@errorName(e)});
         return 1;
     };
-    const group = loadGroup(dir) catch |e| {
-        std.debug.print("quantization error: {s}\n", .{@errorName(e)});
-        return 1;
-    };
-    std.debug.print("config: hidden {d}, layers {d}, heads {d}, kv {d}, intermediate {d}, group {d}\n", .{ config.hidden, config.layers, config.heads, config.kv_heads, config.intermediate, group });
-    var w = try xw.load(gpa, &s, dir, config, group);
+    std.debug.print("config: hidden {d}, layers {d}, heads {d}, kv {d}, intermediate {d}, group {d}\n", .{ config.hidden, config.layers, config.heads, config.kv_heads, config.intermediate, config.group });
+    var w = try xw.load(gpa, &s, dir, config);
     defer w.deinit();
     var m: fwd.Model = .{ .weights = &w, .kernels = undefined };
     try m.kernels.load(&s, gpa);

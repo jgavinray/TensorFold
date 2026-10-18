@@ -58,36 +58,11 @@ fn loadConfig(gpa: std.mem.Allocator, dir: []const u8) !cfg.Config {
     return cfg.parse(gpa, text, gen);
 }
 
-/// The checkpoint's affine group size from config.json's quantization block (this loader assumes one global format).
-fn loadGroup(gpa: std.mem.Allocator, dir: []const u8) !usize {
-    var cb: [1024]u8 = undefined;
-    const cpath = sys.zfmt(&cb, "{s}/config.json", .{dir}) orelse return error.PathTooLong;
-    const text = sys.readFileAlloc(gpa, cpath, 1 << 22) orelse return error.NoConfig;
-    defer gpa.free(text);
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.BadConfig,
-    };
-    for ([_][]const u8{ "quantization", "quantization_config" }) |key| {
-        const v = root.get(key) orelse continue;
-        if (v != .object) continue;
-        const q = v.object;
-        if (q.get("group_size")) |gs| {
-            if (gs != .integer or gs.integer < 1) return error.BadAffine;
-            return @intCast(gs.integer);
-        }
-    }
-    return error.MissingAffineFormat;
-}
-
 fn weightsGate(gpa: std.mem.Allocator, s: *rt.session.Session, lib: *std.DynLib, dir: []const u8) !bool {
     const config = try loadConfig(gpa, dir);
-    const group = try loadGroup(gpa, dir);
 
     const before = cardUsedBytes(s, lib);
-    var w = try xw.load(gpa, s, dir, config, group);
+    var w = try xw.load(gpa, s, dir, config);
     defer w.deinit();
     const after = cardUsedBytes(s, lib);
     std.debug.print("weights: {d} tensors from {d} shards, {d} bytes ({d:.1} MiB, {d:.2} GiB), affine 4-bit g{d}, layers {d}, load {d:.2} s ({d:.2} GB/s incl. hashing)\n", .{
@@ -96,7 +71,7 @@ fn weightsGate(gpa: std.mem.Allocator, s: *rt.session.Session, lib: *std.DynLib,
         w.total_bytes,
         mib(w.total_bytes),
         @as(f64, @floatFromInt(w.total_bytes)) / (1 << 30),
-        group,
+        config.group,
         config.layers,
         @as(f64, @floatFromInt(w.load_ns)) / 1e9,
         @as(f64, @floatFromInt(w.total_bytes)) / @as(f64, @floatFromInt(w.load_ns)),

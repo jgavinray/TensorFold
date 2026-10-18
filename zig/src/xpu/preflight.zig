@@ -29,6 +29,11 @@ pub const Paths = struct {
 
 pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
     for (device.cards) |card| {
+        // A card with no driver bound cannot be opened, so it is not part of the usable pool: the harness mirrors this
+        // by calling `preflight` per card inside its lock loop and moving on when one refuses (see xpu_harness.py
+        // `card()`). Refusing the whole pool for a card the session will never touch would block a job on a parked
+        // card; instead skip it here, and require the card actually held (`bdf`) to be bound below.
+        if (!isBound(p, card)) continue;
         const cap = try readCap(p, card, diag);
         if (cap != cap_uw) {
             diag.set("{s}: power1_cap is {d} uW, not 100000000 (100 W) - ask the human (do not re-set it)", .{ card, cap });
@@ -36,9 +41,7 @@ pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
         }
     }
     if (bdf) |b| {
-        var path: [160]u8 = undefined;
-        const driver = sys.zfmt(&path, "{s}/{s}/driver", .{ p.pci_root, b }) orelse return error.Unreadable;
-        if (!sys.exists(driver)) {
+        if (!isBound(p, b)) {
             diag.set("{s}: not bound to a driver - card may be wedged; stop and tell the human", .{b});
             return error.CardNotBound;
         }
@@ -51,6 +54,14 @@ pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
         diag.set("MemAvailable {d} KiB < 24 GiB", .{avail});
         return error.MemoryLow;
     }
+}
+
+/// Whether the card has a driver bound: a card with no `driver` symlink cannot be opened, so it is not usable. The
+/// lock and the pool sweep both use this so a parked card is never handed out or swept.
+pub fn isBound(p: Paths, card: []const u8) bool {
+    var path: [160]u8 = undefined;
+    const driver = sys.zfmt(&path, "{s}/{s}/driver", .{ p.pci_root, card }) orelse return false;
+    return sys.exists(driver);
 }
 
 fn readCap(p: Paths, card: []const u8, diag: *Diag) Refusal!u64 {
@@ -130,5 +141,15 @@ test "preflight refuses a changed cap, an unbound card, low memory and a missing
     defer tmp3.cleanup();
     const h = try fixture(&tmp3, .{ "100000000", "100000000" }, true, 23 * 1024 * 1024);
     try std.testing.expectError(error.MemoryLow, check(.{ .pci_root = h.root[0..h.rl], .meminfo = h.mem[0..h.ml] }, "0000:08:00.0", &d));
-    try std.testing.expectError(error.NoPowerCap, check(.{ .pci_root = "/nonexistent", .meminfo = "/proc/meminfo" }, null, &d));
+    // A bound card with no readable `power1_cap` is refused; a card with no driver is skipped, not refused (the pool
+    // may legitimately hold a parked card, as xpu_harness.py's per-card `preflight` loop does).
+    var tmp4 = std.testing.tmpDir(.{});
+    defer tmp4.cleanup();
+    const io = std.testing.io;
+    try tmp4.dir.createDirPath(io, "dev/0000:08:00.0/driver");
+    const real = try tmp4.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(real);
+    var root: [200]u8 = undefined;
+    const rl = (try std.fmt.bufPrint(&root, "{s}/dev", .{real})).len;
+    try std.testing.expectError(error.NoPowerCap, check(.{ .pci_root = root[0..rl], .meminfo = "/proc/meminfo" }, null, &d));
 }

@@ -7,7 +7,7 @@
 const std = @import("std");
 const rt = @import("../../xpu/runtime.zig");
 const sys = @import("../../xpu/sys.zig");
-const st = @import("../../core/safetensors.zig");
+const st = @import("core").safetensors;
 const cfg = @import("config.zig");
 
 pub const DType = st.DType;
@@ -175,9 +175,10 @@ fn readWeightMap(a: std.mem.Allocator, dir: []const u8) LoadError!std.json.Parse
     return parsed;
 }
 
-/// Loads every `language_model.` tensor of a multi-shard MLX affine checkpoint onto the session's card.
-/// `c` is config.json's parsed geometry; `group` is the checkpoint's affine group size (config.json's quantization).
-pub fn load(gpa: std.mem.Allocator, s: *rt.session.Session, dir: []const u8, c: cfg.Config, group: usize) LoadError!Weights {
+/// Loads every `language_model.` tensor of the checkpoint named by `<dir>/model.safetensors.index.json` onto the
+/// session's card. `c` is config.json's parsed geometry; its `group` is the checkpoint's affine group size, so the
+/// loader sizes every `.scales`/`.biases` row by what the checkpoint states.
+pub fn load(gpa: std.mem.Allocator, s: *rt.session.Session, dir: []const u8, c: cfg.Config) LoadError!Weights {
     const t0 = sys.nowNs();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -278,7 +279,7 @@ pub fn load(gpa: std.mem.Allocator, s: *rt.session.Session, dir: []const u8, c: 
 
     // 3. Structure: exactly the geometry and formats the Metal path declares (widths.zig `shape`, gpu_weights.zig dtypes).
     if (c.v_heads % c.k_heads != 0 or c.heads % c.kv_heads != 0) return error.UnexpectedQwenTensor;
-    const g = group;
+    const g = c.group;
     var w: Weights = .{
         .arena = undefined,
         .embed = try idx.projection("language_model.model.embed_tokens", c.vocab, c.hidden, g),

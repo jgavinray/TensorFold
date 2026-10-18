@@ -24,6 +24,10 @@ pub fn logitsBytes(c: cfg.Config) usize {
     return c.vocab * 2;
 }
 
+/// A stream's rows at most (a verify window), and the streams one shared round serves (one segment a stream).
+pub const window_rows = 16;
+pub const max_segments = window_rows;
+
 pub const Gdn = struct { recurrence: rt.memory.Buffer, conv: rt.memory.Buffer };
 pub const Attention = struct { keys: rt.memory.Buffer, values: rt.memory.Buffer };
 pub const Mixer = union(cfg.Kind) { linear: Gdn, attention: Attention };
@@ -33,6 +37,9 @@ pub const Cache = struct {
     c: cfg.Config,
     capacity: usize,
     len: usize = 0,
+    /// The last recorded window: its cache start, its first scratch row and its row count; `keep` rolls the
+    /// recurrence/conv back to the first `path.len` rows of it (null when the last round did not record).
+    last: ?struct { start: usize, base: usize, rows: usize } = null,
     blocks: []Mixer,
     logits: rt.memory.Buffer,
     total_bytes: usize,
@@ -99,6 +106,39 @@ pub const Cache = struct {
         self.gpa.free(self.blocks);
         self.made = 0;
         self.has_logits = false;
+    }
+
+    /// The segment finished its rows: with `record` the forward wrote every row's recurrence to `snap_rec` and the
+    /// conv tail to `snap_conv` (one pointer each, per linear layer), so the committed state (the window's last row)
+    /// is copied back into `cache.recurrence`/`cache.conv`; without `record` the kernel wrote the final state in
+    /// place and there is nothing to roll back. Remembers the window so `keep` can roll it back.
+    pub fn commit(self: *Cache, s: *rt.session.Session, base: usize, rows: usize, record: bool, snap_rec: [cfg.max_layers]?*const anyopaque, snap_conv: [cfg.max_layers]?*const anyopaque) rt.Error!void {
+        if (!record) {
+            self.last = null;
+            self.len += rows;
+            return;
+        }
+        for (self.blocks, 0..) |*b, i| if (self.c.kind(i) == .linear) {
+            try s.queue.copy(b.linear.recurrence.ptr, snap_rec[i].?, deltaBytes(self.c), null);
+            try s.queue.copy(b.linear.conv.ptr, snap_conv[i].?, convBytes(self.c), null);
+        };
+        self.last = .{ .start = self.len, .base = base, .rows = rows };
+        self.len += rows;
+    }
+
+    /// Roll back to the first `path.len` rows of the last recorded window: the recurrence and conv state as after
+    /// exactly those rows, and that row's logits. The caller supplies the window row's snapshot addresses.
+    pub fn keep(self: *Cache, s: *rt.session.Session, path: []const u32, snap_rec: [cfg.max_layers]?*const anyopaque, snap_conv: [cfg.max_layers]?*const anyopaque, logits_row: *const anyopaque) !void {
+        const last = self.last orelse return error.NothingToKeep;
+        if (path.len == 0 or path.len > last.rows) return error.NothingToKeep;
+        for (path, 0..) |row, i| if (row != i) return error.UnsupportedQwenTree;
+        for (self.blocks, 0..) |*b, i| if (self.c.kind(i) == .linear) {
+            try s.queue.copy(b.linear.recurrence.ptr, snap_rec[i].?, deltaBytes(self.c), null);
+            try s.queue.copy(b.linear.conv.ptr, snap_conv[i].?, convBytes(self.c), null);
+        };
+        self.len = last.start + path.len;
+        try s.queue.copy(self.logits.ptr, logits_row, logitsBytes(self.c), null);
+        self.last = null;
     }
 
     /// Counts the buffers the cache owns: two per layer, plus the logits row.

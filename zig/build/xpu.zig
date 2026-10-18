@@ -201,6 +201,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
     const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
     q27_mod.addImport("xpu_qwen35_kernels", q27k);
+    // The forward imports its kernels as `xpu_qwen27_kernels` and the weights read safetensors through `core`.
+    q27_mod.addImport("xpu_qwen27_kernels", q27k);
+    q27_mod.addImport("core", core);
     // Phase 6.3: the two 27B tools. tf-xpu-qwen27-logits writes len(tokens) x vocab bf16 logits; tf-xpu-qwen27-greedy
     // prints n greedy token ids. Both share the forward and the 27B kernels above.
     const q27_logits = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_logits.zig"), .target = target, .optimize = .Debug, .link_libc = true });
@@ -319,6 +322,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native_xpu.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes_mod }, .{ .name = "core", .module = core } } });
     engines.addImport("xpu_qwen35_kernels", qk);
+    // The 27B forward reads its own compilation of the same shared sources under the same module name; the serving
+    // engine must reach it by the name its forward imports, so both sets are visible to `native_engines`.
+    engines.addImport("xpu_qwen27_kernels", q27k);
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const checkpoint = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "native_engines", .module = engines }, exlr8_build.cliImport(b, target, .ReleaseSafe, core) } });
     const server = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
@@ -342,8 +348,35 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
 
     // The 27B pieces' host-side tests (arena packing, state sizes): no card, part of `test`.
     const q27_host = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_tests.zig"), .target = b.graph.host, .link_libc = true });
+    // The weights module reads safetensors through the `core` module (its file lives outside this module's root).
+    q27_host.addImport("core", core);
     const q27_tests = b.addTest(.{ .root_module = q27_host });
     const q27_host_run = b.addRunArtifact(q27_tests);
     test_step.dependOn(&q27_host_run.step);
     b.step("xpu-qwen27-host-test", "Host-side tests for the 27B XPU weights and state modules").dependOn(&q27_host_run.step);
+
+    // Phase 6.4/6.5: `Xpu` (27B) behind the lane engine's backend interface + qualify, on card (opt-in, needs a card).
+    const q27_bk_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_backend_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_bk_module.addImport("qwen27_forward", q27_mod);
+    q27_bk_module.addImport("xpu_qwen27_kernels", q27k);
+    q27_bk_module.addImport("lanes", lanes_mod);
+    q27_bk_module.addImport("core", core);
+    const q27_bk_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-backend-test", .root_module = q27_bk_module });
+    const q27_bk_install = b.addInstallArtifact(q27_bk_exe, .{});
+    const q27_bk_run = b.addRunArtifact(q27_bk_exe);
+    q27_bk_run.step.dependOn(&q27_bk_install.step);
+    b.step("xpu-qwen27-backend-test", "Build and run tf-xpu-qwen27-backend-test: the 27B Xpu through the lane engine + xpu_qualify on a B70 (opt-in)").dependOn(&q27_bk_run.step);
+    b.step("xpu-qwen27-backend-build", "Build tf-xpu-qwen27-backend-test without running it").dependOn(&q27_bk_install.step);
+
+    // TEMP (I05 investigation): the 27B engine's queue path vs the reference, to isolate the serve divergence.
+    const q27_qp_module = b.createModule(.{ .root_source_file = b.path("zig/src/q27probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_qp_module.addImport("qwen27_forward", q27_mod);
+    q27_qp_module.addImport("xpu_qwen27_kernels", q27k);
+    q27_qp_module.addImport("lanes", lanes_mod);
+    q27_qp_module.addImport("core", core);
+    const q27_qp_exe = b.addExecutable(.{ .name = "tf-q27probe", .root_module = q27_qp_module });
+    const q27_qp_install = b.addInstallArtifact(q27_qp_exe, .{});
+    const q27_qp_run = b.addRunArtifact(q27_qp_exe);
+    q27_qp_run.step.dependOn(&q27_qp_install.step);
+    b.step("q27probe", "TEMP: 27B engine queue path vs reference").dependOn(&q27_qp_run.step);
 }
