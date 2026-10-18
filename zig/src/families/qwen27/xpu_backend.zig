@@ -190,6 +190,12 @@ pub const Xpu = struct {
     /// One decode token: the recorded-step replay when a step for this cache shape is live, else the eager forward.
     /// Recording costs one eager step, so a shape used once pays nothing extra.
     fn decode(self: *Xpu, e: *Entry, token: u32) !void {
+        // TEMP (I05 investigation): TF_XPU_Q27_NO_REPLAY=1 keeps every decode on the eager path, to tell a replay
+        // defect from a forward/cache defect. Delete with the I05 investigation.
+        if (fwd.getenvBool("TF_XPU_Q27_NO_REPLAY")) {
+            try fwd.run(self.session, self.model, &self.scratch, &e.cache, &.{token}, .{ .head = .last });
+            return;
+        }
         const v: rp.Values = .{ .token = token, .position = @intCast(e.cache.len), .cache_len = @intCast(e.cache.len) };
         if (self.replay.find(1, e.cache.capacity)) |step| {
             if (step.sc == &self.scratch and step.recorded.cache_len + step.replays == v.cache_len) {
