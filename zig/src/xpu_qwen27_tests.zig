@@ -5,4 +5,5 @@ const std = @import("std");
 test {
     _ = @import("families/qwen27/xpu_weights.zig");
     _ = @import("families/qwen27/xpu_state.zig");
+    _ = @import("families/qwen27/xpu_forward.zig");
 }

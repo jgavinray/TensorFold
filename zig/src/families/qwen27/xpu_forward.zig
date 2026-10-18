@@ -142,6 +142,103 @@ pub const Kernels = struct {
     }
 };
 
+/// Every intermediate buffer's width in bf16 elements a row, as the writer that owns it demands. One entry per
+/// `Scratch` buffer, in `Scratch.names` order, so `sizesOf` and the writer table cannot drift apart: the `names`
+/// list and this table are indexed together, and the test below checks every entry against the widest writer.
+pub const widths = struct {
+    /// `pool`: ids (4 B each), conv windows (4 B each) and the `dims` slots (32 B each).
+    pub fn pool(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * 4 + rows * cfg_.conv_kernel * 4 + Scratch.dims_slots * Scratch.slot_bytes;
+    }
+    /// `h`, `x`, `r`, `z`: the residual stream, one `hidden`-wide row each.
+    pub fn hidden(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.hidden * 2;
+    }
+    /// `v`, `y`, `mix`: the GDN value width (`v_heads*dv`), which is wider than `hidden` at 27B.
+    pub fn gdnValue(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * @max(cfg_.hidden, cfg_.gdnValueDim()) * 2;
+    }
+    /// `q`: `head_norm` writes `heads*head_dim` a row; the GDN path offsets it by `gdnValueDim()` a row, so the
+    /// stride is the wider of the two.
+    pub fn q(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * @max(@max(cfg_.hidden, cfg_.heads * cfg_.head_dim), cfg_.gdnValueDim()) * 2;
+    }
+    /// `k` serves two writers: the GDN `gdn_pre` writes `k_heads*dk` a row (2048 at 27B) and attention's k
+    /// projection writes `kvDim()` (`kv_heads*head_dim`, 1024). `hidden` (5120) covers both, so the buffer keeps the
+    /// `hidden` width the original table gave it; sizing it by `kvDim()` alone would overrun at 27B.
+    pub fn k(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * @max(cfg_.hidden, @max(cfg_.kvDim(), cfg_.k_heads * cfg_.dk)) * 2;
+    }
+    /// `queries`: `layout.queries` writes `heads*head_dim` a row, which is the widest writer here (the attention
+    /// path reads it back with the same row stride, so the buffer is `rows_q` wide as the original table had it).
+    pub fn queries(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * @max(cfg_.hidden, cfg_.heads * cfg_.head_dim) * 2;
+    }
+    /// `qkv`: `gdn_pre` reads the conv input `gdnQkvDim()` a row.
+    pub fn qkv(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.gdnQkvDim() * 2;
+    }
+    /// `gate`, `up`, `act`: the MLP's `intermediate` width.
+    pub fn intermediate(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.intermediate * 2;
+    }
+    /// `qraw`: the q projection's output, `qDim()` (`2*heads*head_dim`) a row.
+    pub fn qraw(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.qDim() * 2;
+    }
+    /// `knorm`: `head_norm` writes `kv_heads*head_dim` a row.
+    pub fn knorm(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.kvDim() * 2;
+    }
+    /// `a`, `b`, `beta`: one `v_heads`-wide row each (bf16).
+    pub fn gdnHead(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.v_heads * 2;
+    }
+    /// `g`: the GDN gate, fp32, `v_heads` a row.
+    pub fn gdnGate(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * cfg_.v_heads * 4;
+    }
+    /// `pm`, `pl`: the attention partials, `heads * chunks` fp32 a row.
+    pub fn attnPartial(cfg_: cfgmod.Config, rows: usize, chunks: usize) usize {
+        return rows * cfg_.heads * chunks * 4;
+    }
+    /// `po`: the attention partial outputs, `heads * chunks * head_dim` fp32 a row.
+    pub fn attnPartialOut(cfg_: cfgmod.Config, rows: usize, chunks: usize) usize {
+        return rows * cfg_.heads * chunks * cfg_.head_dim * 4;
+    }
+    /// `logits`: one bf16 row a logit row.
+    pub fn logits(cfg_: cfgmod.Config, logit_rows: usize) usize {
+        return logit_rows * cfg_.vocab * 2;
+    }
+    /// `conv_snap`: the conv tail, `convBytes` a row.
+    pub fn convSnap(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * xs.convBytes(cfg_);
+    }
+};
+
+/// The byte size of every `Scratch` buffer, in `Scratch.names` order. Each entry is the widest writer's width (see
+/// `widths`), never a coincidence of the 2B geometry: at 2B the GDN value width and the query width both happen to
+/// equal `hidden`, so sizing by `hidden` was always enough there and silently 20% short at 27B.
+pub fn sizesOf(config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: usize) [Scratch.names.len]usize {
+    const chunks = (capacity + 127) / 128;
+    const w = widths;
+    return .{
+        w.pool(config, rows),
+        w.hidden(config, rows),      w.hidden(config, rows),      w.hidden(config, rows),
+        w.gdnValue(config, rows),    w.q(config, rows),           w.k(config, rows),
+        w.gdnValue(config, rows),    w.gdnValue(config, rows),    w.gdnValue(config, rows),
+        w.queries(config, rows),
+        w.intermediate(config, rows), w.intermediate(config, rows), w.intermediate(config, rows),
+        w.intermediate(config, rows),
+        w.qraw(config, rows),        w.knorm(config, rows),
+        w.gdnHead(config, rows),     w.gdnHead(config, rows),     w.gdnHead(config, rows),
+        w.gdnGate(config, rows),
+        w.attnPartial(config, rows, chunks), w.attnPartial(config, rows, chunks),
+        w.attnPartialOut(config, rows, chunks),
+        w.logits(config, logit_rows), w.convSnap(config, rows),
+    };
+}
+
 /// Intermediate buffers (device), plus a small host-visible pool for ids, conv windows and kernel `dims` arrays
 /// (every launch gets its own slot, so the whole forward can be queued before the host waits).
 pub const Scratch = struct {
@@ -210,27 +307,7 @@ pub const Scratch = struct {
         out.snaps_delta = @splat(null);
         out.snaps_conv = @splat(null);
         errdefer out.deinit();
-        const chunks = (capacity + 127) / 128;
-        const hid = rows * config.hidden * 2;
-        // Every activation row buffer is sized to the widest writer, not to `hidden`: at 2B the GDN value width
-        // (v_heads*dv) and the query width (heads*head_dim) both happen to equal `hidden`, so `rows*hidden` was
-        // always enough; at 27B they are 6144 vs hidden 5120, and sizing by `hidden` under-allocated `q`, `v`,
-        // `y`, `mix` and `queries` by 20% - a silent device-buffer overrun (and a page-fault risk). The Metal
-        // frame (gpu_frame.zig) sizes by the same maxima; these match them.
-        const mix_w = @max(config.hidden, config.gdnValueDim()); // gdn_post writes rows*v_heads*dv, attention_gate rows*hidden
-        const q_w = @max(config.hidden, config.heads * config.head_dim); // head_norm writes rows*heads*head_dim
-        const v_w = @max(config.hidden, config.gdnValueDim()); // gdn_pre writes rows*v_heads*dv
-        const rows_mix = rows * mix_w * 2;
-        const rows_q = rows * q_w * 2;
-        const rows_v = rows * v_w * 2;
-        const sizes = [_]usize{
-            rows * 4 + rows * config.conv_kernel * 4 + dims_slots * slot_bytes, hid, hid, hid, rows_v, rows_q, hid, rows_v, rows_mix, rows_mix, rows_q,
-            rows * config.intermediate * 2, rows * config.intermediate * 2, rows * config.intermediate * 2, rows * config.intermediate * 2,
-            rows * config.qDim() * 2, rows * config.kvDim() * 2,
-            rows * config.v_heads * 2, rows * config.v_heads * 2, rows * config.v_heads * 2, rows * config.v_heads * 4,
-            rows * config.heads * chunks * 4, rows * config.heads * chunks * 4, rows * config.heads * chunks * config.head_dim * 4,
-            logit_rows * config.vocab * 2, rows * xs.convBytes(config),
-        };
+        const sizes = sizesOf(config, rows, capacity, logit_rows);
         inline for (names, 0..) |n, i| {
             const kind: rt.memory.Kind = if (i == 0) .host else .device;
             @field(out, n) = try Buffer.alloc(&s.ctx, kind, sizes[i]);
@@ -556,4 +633,79 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
     }
     try ru.go(.attention_gate, geo.layout(.attention_gate, T, c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
     try ru.projection(a.o, sc.mix.ptr.?, sc.r.ptr.?, total);
+}
+
+test "every scratch buffer is at least as wide as the widest writer that fills it" {
+    // The 27B geometry. The GDN value width (v_heads*dv = 6144) and the attention query width (heads*head_dim =
+    // 6144) both exceed `hidden` (5120); the GDN key width (k_heads*dk = 2048) exceeds the attention KV width
+    // (kv_heads*head_dim = 1024). Sizing by the wrong one is a device-buffer overrun, so each buffer is checked
+    // against every writer that touches it, at several row counts.
+    const g = cfgmod.Pinned;
+    const config = cfgmod.Config{
+        .hidden = g.hidden,
+        .intermediate = g.intermediate,
+        .layers = g.layers,
+        .vocab = g.vocab,
+        .heads = g.heads,
+        .kv_heads = g.kv_heads,
+        .head_dim = g.head_dim,
+        .k_heads = g.k_heads,
+        .v_heads = g.v_heads,
+        .dk = g.dk,
+        .dv = g.dv,
+        .conv_kernel = g.conv_kernel,
+        .eps = g.eps,
+        .rope_dims = g.rotary_dim,
+        .rope_theta = g.theta,
+    };
+    for ([_]usize{ 1, 16, 128 }) |rows| {
+        const sizes = sizesOf(config, rows, 4096, 16);
+        const w = widths;
+        // Indices are `Scratch.names`: 1 h, 4 z, 5 q, 6 k, 7 v, 8 y, 9 mix, 10 queries, 15 qraw, 16 knorm, 25 conv_snap.
+        const need = .{
+            .{ sizes[1], w.hidden(config, rows) },    .{ sizes[4], w.gdnValue(config, rows) },
+            .{ sizes[5], w.q(config, rows) },         .{ sizes[6], w.k(config, rows) },
+            .{ sizes[7], w.gdnValue(config, rows) },  .{ sizes[8], w.gdnValue(config, rows) },
+            .{ sizes[9], w.gdnValue(config, rows) },  .{ sizes[10], w.queries(config, rows) },
+            .{ sizes[15], w.qraw(config, rows) },     .{ sizes[16], w.knorm(config, rows) },
+            .{ sizes[25], w.convSnap(config, rows) },
+        };
+        inline for (need) |pair| try std.testing.expectEqual(pair[1], pair[0]);
+        // The widths the 27B geometry demands, stated so a future edit cannot quietly narrow a buffer below a writer.
+        try std.testing.expect(sizes[5] >= rows * g.heads * g.head_dim * 2); // q: head_norm's query width
+        try std.testing.expect(sizes[5] >= rows * config.gdnValueDim() * 2); // q: the GDN path's per-row stride
+        try std.testing.expect(sizes[6] >= rows * g.k_heads * g.dk * 2); // k: the GDN key width
+        try std.testing.expect(sizes[6] >= rows * config.kvDim() * 2); // k: the attention k projection
+        try std.testing.expect(sizes[7] >= rows * config.gdnValueDim() * 2); // v: the GDN value width
+        try std.testing.expect(sizes[9] >= rows * config.gdnValueDim() * 2); // mix: gdn_post + attention_gate
+        try std.testing.expect(sizes[10] >= rows * g.heads * g.head_dim * 2); // queries: layout.queries' width
+    }
+}
+
+test "the 2B geometry stays within the same buffer table" {
+    // The 2B's coincidences (gdnValueDim == hidden == heads*head_dim) must keep every buffer exactly at `hidden`
+    // or wider; a table that only fits 27B would break the 2B gates.
+    const config = cfgmod.Config{
+        .hidden = 2048,
+        .intermediate = 6144,
+        .layers = 24,
+        .vocab = 248320,
+        .heads = 8,
+        .kv_heads = 2,
+        .head_dim = 256,
+        .k_heads = 16,
+        .v_heads = 16,
+        .dk = 128,
+        .dv = 128,
+        .conv_kernel = 4,
+        .eps = 1e-6,
+        .rope_dims = 64,
+        .rope_theta = 10000000,
+    };
+    const rows: usize = 16;
+    const sizes = sizesOf(config, rows, 4096, 16);
+    try std.testing.expectEqual(rows * 2048 * 2, sizes[1]);
+    try std.testing.expectEqual(rows * 2048 * 2, sizes[5]);
+    try std.testing.expectEqual(rows * 2048 * 2, sizes[6]);
+    try std.testing.expectEqual(rows * 16 * 128 * 2, sizes[4]);
 }
