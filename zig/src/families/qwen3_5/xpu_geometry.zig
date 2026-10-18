@@ -16,6 +16,11 @@ fn ceilDiv(a: u32, b: u32) u32 {
 pub fn qmm(rows: u32, outputs: u32) Geo {
     return .{ .gx = @max(1, ceilDiv(outputs, 64)) * 256, .gy = rows, .lx = 256 };
 }
+/// qwen35_qmm_pair: two same-shape N-column projections of one row, walked in lockstep. A work-group covers
+/// QW_HALF_TILE = 32 columns of each projection, so the grid is ceil(N/32) work-groups of 256 per row.
+pub fn qmmPair(rows: u32, outputs_per_projection: u32) Geo {
+    return .{ .gx = @max(1, ceilDiv(outputs_per_projection, 32)) * 256, .gy = rows, .lx = 256 };
+}
 /// qwen35_norm / qwen35_norm_nores: one work-group of QW_TPG = hidden/QW_ELEMS per row.
 pub fn norm(rows: u32, hidden: u32) Geo {
     const tpg = hidden / 16; // QW_ELEMS = 16
@@ -76,6 +81,11 @@ test "geometry matches launch.py (2B defaults)" {
     try expect(qmm(1, 2048), 32 * 256, 1, 1, 256);
     try expect(qmm(176, 6144), 96 * 256, 176, 1, 256);
     try expect(qmm(5, 17), 256, 5, 1, 256);
+    // qmm_pair: 32 columns of each projection per 256-work-item group
+    try expect(qmmPair(1, 16), 256, 1, 1, 256);
+    try expect(qmmPair(176, 16), 256, 176, 1, 256);
+    try expect(qmmPair(1, 512), 16 * 256, 1, 1, 256);
+    try expect(qmmPair(1, 2048), 64 * 256, 1, 1, 256);
     // norm/norm_nores: hidden/16 work-items per row
     try expect(normNores(7, 2048), 128, 7, 1, 128);
     try expect(norm(4, 2048), 128, 4, 1, 128);
