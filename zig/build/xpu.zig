@@ -201,6 +201,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
     const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
     q27_mod.addImport("xpu_qwen35_kernels", q27k);
+    // The forward imports its kernels as `xpu_qwen27_kernels` and the weights read safetensors through `core`.
+    q27_mod.addImport("xpu_qwen27_kernels", q27k);
+    q27_mod.addImport("core", core);
     // Phase 6.3: the two 27B tools. tf-xpu-qwen27-logits writes len(tokens) x vocab bf16 logits; tf-xpu-qwen27-greedy
     // prints n greedy token ids. Both share the forward and the 27B kernels above.
     const q27_logits = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_logits.zig"), .target = target, .optimize = .Debug, .link_libc = true });
