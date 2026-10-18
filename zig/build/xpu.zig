@@ -161,8 +161,22 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // default works there; at 27B the z row is 6144 wide against hidden 5120, and passing `hidden` made gdn_post
     // read each row 1024 elements early - heads 40..47 of every GDN layer consumed the next row's z (the last row
     // read past the buffer), which is exactly the row-to-row corruption the smoke gate reported.
-    const q27_defines = b.fmt("-DQW_HIDDEN={d} -DQW_INTERMEDIATE={d} -DQW_HEADS={d} -DQW_Q_HEADS={d} -DQW_KV_HEADS={d} -DQW_NV={d} -DQW_HV={d} -DQW_ZS={d}", .{
-        q27.Pinned.hidden, q27.Pinned.intermediate, q27.Pinned.heads, q27.Pinned.heads, q27.Pinned.kv_heads, q27.Pinned.v_heads, q27.Pinned.v_heads, q27.Pinned.gdn_value_dim,
+    const q27_defines = b.fmt("-DQW_HIDDEN={d} -DQW_INTERMEDIATE={d} -DQW_HEADS={d} -DQW_Q_HEADS={d} -DQW_KV_HEADS={d} -DQW_NV={d} -DQW_HV={d} -DQW_ZS={d} -DQW_QROWS={d} -DQW_OUT_WIDTH={d}", .{
+        q27.Pinned.hidden,
+        q27.Pinned.intermediate,
+        q27.Pinned.heads,
+        q27.Pinned.heads,
+        q27.Pinned.kv_heads,
+        q27.Pinned.v_heads,
+        q27.Pinned.v_heads,
+        q27.Pinned.gdn_value_dim,
+        // QW_QROWS: the `queries` buffer's row stride. The 27B forward allocates it for the whole round
+        // (rows * heads * head_dim) and passes the round's row count here, so layout27.cl strides by the round
+        // and dims[2] carries the segment's base. QW_OUT_WIDTH: attn_merge27.cl's OUT stride, heads*head_dim
+        // (6144), against hidden 5120 - the 2B defaults (rows, 2048) coincide with their own geometry, which is
+        // exactly how the shared sources' defaults would silently mis-stride the 27B.
+        q27.Pinned.hidden, // rows are runtime; this value is only the compile-time fallback for a 0 argument
+        2 * q27.Pinned.heads * q27.Pinned.head_dim,
     });
     // Where the 27B modules come from, same two-source rule as the 2B path above:
     //   * `ocloc` (default when the binary is on PATH): compile the shared sources with the 27B -D set here.
@@ -184,7 +198,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const q27_files = b.addWriteFiles();
     var q27_src: []const u8 = "//! Compiled Qwen kernel binaries for Qwen 3.8 27B, embedded (see zig/build/xpu.zig).\n";
     const q27_opt = b.fmt("-cl-std=CL3.0 {s}", .{q27_defines});
-    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+    inline for (.{ "layout", "layout27", "norm", "norm_nores", "norm_qmm", "qmm", "qmm_pair", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge", "attn_merge27" }) |name| {
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         if (q27_prebuilt) |dir| {
             const src = b.pathJoin(&.{ dir, file });
@@ -200,7 +214,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     }
     const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
     const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
-    q27_mod.addImport("xpu_qwen35_kernels", q27k);
+    q27_mod.addImport("xpu_qwen27_kernels", q27k);
+    // The weights module reads safetensors through the `core` module (its file lives outside this module's root).
+    q27_mod.addImport("core", core);
     // Phase 6.3: the two 27B tools. tf-xpu-qwen27-logits writes len(tokens) x vocab bf16 logits; tf-xpu-qwen27-greedy
     // prints n greedy token ids. Both share the forward and the 27B kernels above.
     const q27_logits = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_logits.zig"), .target = target, .optimize = .Debug, .link_libc = true });
@@ -219,13 +235,21 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // Phase 6.3/6.4: the 27B forward gate binary (gate C greedy vs the fixture, plus the decode-step measurement).
     // Same forward module and 27B kernels as the tools; the run needs a card and the checkpoint.
     const q27_fwd_test = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
-    q27_fwd_test.addImport("xpu_qwen35_kernels", q27k);
+    q27_fwd_test.addImport("xpu_qwen27_kernels", q27k);
     q27_fwd_test.addImport("qwen27_forward", q27_mod);
     const q27_fwd_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-forward-test", .root_module = q27_fwd_test });
     const q27_fwd_install = b.addInstallArtifact(q27_fwd_exe, .{});
     const q27_fwd_run = b.addRunArtifact(q27_fwd_exe);
     q27_fwd_run.step.dependOn(&q27_fwd_install.step);
     b.step("xpu-qwen27-forward-test", "Build and run tf-xpu-qwen27-forward-test: Qwen 3.8 27B forward gate C + decode step on a B70 (opt-in)").dependOn(&q27_fwd_run.step);
+    // S04: the 27B decode-speed tool (recorded-step replay, fused variants, per-kernel GB/s). Build-only by
+    // default: it runs for minutes on a card, so the S04 gate invokes the binary directly.
+    const q27_speed = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_speed.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_speed.addImport("xpu_qwen27_kernels", q27k);
+    q27_speed.addImport("qwen27_forward", q27_mod);
+    const q27_speed_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-speed", .root_module = q27_speed });
+    const q27_speed_install = b.addInstallArtifact(q27_speed_exe, .{});
+    b.step("xpu-qwen27-speed", "Build tf-xpu-qwen27-speed into zig-out/bin (S04 measurement tool)").dependOn(&q27_speed_install.step);
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
     const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
     test_step.dependOn(&geo_run.step);
