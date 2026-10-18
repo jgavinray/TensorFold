@@ -21,6 +21,13 @@ pub fn qmm(rows: u32, outputs: u32) Geo {
 pub fn qmmPair(rows: u32, outputs_per_projection: u32) Geo {
     return .{ .gx = @max(1, ceilDiv(outputs_per_projection, 32)) * 256, .gy = rows, .lx = 256 };
 }
+/// qwen35_norm_qmm: qmm's own grid (each work-group recomputes the row's RMSNorm redundantly), but the local size
+/// must be at least the norm reduction's width QW_TPG = hidden/QW_ELEMS, so the kernel's `work_group_reduce_add`
+/// covers the whole partition. QW_WG (256) is already >= QW_TPG for every Qwen shape (128 at 2B, 320 at 27B).
+pub fn normQmm(rows: u32, outputs: u32, hidden: u32) Geo {
+    const tpg = hidden / 16; // QW_ELEMS = 16
+    return .{ .gx = @max(1, ceilDiv(outputs, 64)) * 256, .gy = rows, .lx = @max(@as(u32, 256), tpg) };
+}
 /// qwen35_norm / qwen35_norm_nores: one work-group of QW_TPG = hidden/QW_ELEMS per row.
 pub fn norm(rows: u32, hidden: u32) Geo {
     const tpg = hidden / 16; // QW_ELEMS = 16
@@ -86,6 +93,10 @@ test "geometry matches launch.py (2B defaults)" {
     try expect(qmmPair(176, 16), 256, 176, 1, 256);
     try expect(qmmPair(1, 512), 16 * 256, 1, 1, 256);
     try expect(qmmPair(1, 2048), 64 * 256, 1, 1, 256);
+    // norm_qmm: qmm's grid, local size = max(QW_WG, QW_TPG). 2B hidden 2048 -> TPG 128 (256 wins);
+    // 27B hidden 5120 -> TPG 320 (the reduction width is the wider one, and must be the local size).
+    try expect(normQmm(1, 2048, 2048), 32 * 256, 1, 1, 256);
+    try expect(normQmm(1, 6144, 5120), 96 * 256, 1, 1, 320);
     // norm/norm_nores: hidden/16 work-items per row
     try expect(normNores(7, 2048), 128, 7, 1, 128);
     try expect(norm(4, 2048), 128, 4, 1, 128);
