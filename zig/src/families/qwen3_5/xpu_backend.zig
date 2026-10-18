@@ -187,12 +187,8 @@ pub const Xpu = struct {
                 e.cache.len += 1;
                 return;
             }
-        }
-        if (stepFor(self.replay, 1, e.cache.capacity)) |step| {
-            if (step.sc != &self.scratch or step.recorded.cache_len != v.cache_len) {
-                step.deinit(self.gpa);
-                step.* = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
-            }
+            step.deinit(self.gpa);
+            step.* = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
             try rp.replayStep(self.session, step, &self.queue, v);
             e.cache.len += 1;
             return;
