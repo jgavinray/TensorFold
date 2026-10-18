@@ -165,6 +165,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     std.log.info("xpu: waiting for a free B70 (the card lock is shared with other jobs)", .{});
     h.session.open(.{}) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "cannot open a B70 ({s}: {s})", .{ @errorName(err), h.session.diag.message() });
+        // A `return null` is not an error return, so the `errdefer`s above do not run: free here.
+        gpa.destroy(h.session);
+        gpa.destroy(h);
         return null;
     };
     errdefer h.session.close();
@@ -184,21 +187,36 @@ fn openQwen35(h: *Host, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, p
     const xb = @import("families/qwen3_5/xpu_backend.zig");
     const config = try cfg.Config.read(gpa, io, o.dir);
     const window: i64 = o.context orelse @min(default_window, @as(i64, @intCast(config.context)));
-    h.weights = .{ .qwen35 = try gpa.create(xw.Weights) };
-    h.weights.qwen35.* = xw.load(gpa, h.session, o.dir, config.tied) catch |err| {
+    const weights = try gpa.create(xw.Weights);
+    var weights_live = false;
+    errdefer {
+        if (weights_live) weights.deinit();
+        gpa.destroy(weights);
+    }
+    weights.* = xw.load(gpa, h.session, o.dir, config.tied) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot load this checkpoint ({s})", .{@errorName(err)});
-        return;
+        return err;
     };
-    h.model = .{ .qwen35 = try gpa.create(fwd.Model) };
-    h.model.qwen35.* = .{ .weights = h.weights.qwen35, .kernels = undefined };
-    h.model.qwen35.kernels.load(h.session, gpa) catch |err| {
+    weights_live = true;
+    h.weights = .{ .qwen35 = weights };
+    const model = try gpa.create(fwd.Model);
+    var model_live = false;
+    errdefer {
+        if (model_live) model.kernels.deinit();
+        gpa.destroy(model);
+    }
+    model.* = .{ .weights = weights, .kernels = undefined };
+    model.kernels.load(h.session, gpa) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen kernels did not load ({s})", .{@errorName(err)});
-        return;
+        return err;
     };
+    model_live = true;
+    h.model = .{ .qwen35 = model };
     h.xpu = .{ .qwen35 = xb.Xpu.init(gpa, h.session, h.model.qwen35, .{ .capacity = @intCast(window), .chunk = chunk }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen backend did not start ({s})", .{@errorName(err)});
-        return;
+        return err;
     } };
+    errdefer h.xpu.qwen35.deinit();
     h.config = try lanes.Config.init(gpa, h.xpu.qwen35.facts(), xb.window_rows, xb.window_rows - 1);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.xpu.qwen35.backend(), h.clock.clock());
@@ -214,20 +232,34 @@ fn openQwen27(h: *Host, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, p
     const xb = @import("families/qwen27/xpu_backend.zig");
     const config = try cfg.Config.read(gpa, io, o.dir);
     const window: i64 = o.context orelse @min(default_window, @as(i64, @intCast(config.max_position)));
-    h.weights = .{ .qwen27 = try gpa.create(xw.Weights) };
-    h.weights.qwen27.* = xw.load(gpa, h.session, o.dir, config) catch |err| {
+    const weights = try gpa.create(xw.Weights);
+    var weights_live = false;
+    errdefer {
+        if (weights_live) weights.deinit();
+        gpa.destroy(weights);
+    }
+    weights.* = xw.load(gpa, h.session, o.dir, config) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot load this checkpoint ({s})", .{@errorName(err)});
-        return;
+        return err;
     };
-    h.model = .{ .qwen27 = try gpa.create(fwd.Model) };
-    h.model.qwen27.* = .{ .weights = h.weights.qwen27, .kernels = undefined };
-    h.model.qwen27.kernels.load(h.session, gpa) catch |err| {
+    weights_live = true;
+    h.weights = .{ .qwen27 = weights };
+    const model = try gpa.create(fwd.Model);
+    var model_live = false;
+    errdefer {
+        if (model_live) model.kernels.deinit();
+        gpa.destroy(model);
+    }
+    model.* = .{ .weights = weights, .kernels = undefined };
+    model.kernels.load(h.session, gpa) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen kernels did not load ({s})", .{@errorName(err)});
-        return;
+        return err;
     };
+    model_live = true;
+    h.model = .{ .qwen27 = model };
     h.xpu = .{ .qwen27 = xb.Xpu.init(gpa, h.session, h.model.qwen27, config, .{ .capacity = @intCast(window), .chunk = chunk }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen backend did not start ({s})", .{@errorName(err)});
-        return;
+        return err;
     } };
     h.config = try lanes.Config.init(gpa, h.xpu.qwen27.facts(), xb.window_rows, xb.window_rows - 1);
     h.clock = .{ .io = io };
