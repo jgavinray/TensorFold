@@ -79,6 +79,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer m_act.unload();
     var m_ad = try rt.module.Module.load(&s.ctx, &kbins.mlp_act_down, &log);
     defer m_ad.unload();
+    var m_pair = try rt.module.Module.load(&s.ctx, &kbins.qmm_pair, &log);
+    defer m_pair.unload();
 
     var k_norm = try m_norm.kernel("qwen35_norm");
     defer k_norm.deinit();
@@ -90,6 +92,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer k_act.deinit();
     var k_ad = try m_ad.kernel("qwen35_mlp_act_down");
     defer k_ad.deinit();
+    var k_pair = try m_pair.kernel("qwen35_qmm_pair");
+    defer k_pair.deinit();
 
     const h: u32 = cfg.hidden;
     const inter: u32 = cfg.intermediate;
@@ -240,6 +244,37 @@ pub fn main(init: std.process.Init) !u8 {
             x.ptr, @as(i32, 1), w.ptr(d.a.weight), w.ptr(d.a.scales), w.ptr(d.a.biases), out32.ptr, @as(i32, 32), @as(i32, cfg.hidden),
         }, c32, &k_qmm, .{});
         std.debug.print("a+b pair: two N=16 launches {d:.2} us, one N=32 launch {d:.2} us, saving {d:.2} us\n", .{
+            two / 1e3, one / 1e3, (two - one) / 1e3,
+        });
+    }
+    // ---- Case 5: the mlp gate/up pair (both N=6144 K=2048, same x): two launches vs one pair launch.
+    // Same total work-groups either way; the win, if any, is one launch's overhead per layer. ----
+    {
+        var x2 = try Buffer.alloc(&s.ctx, .device, h * 2);
+        defer x2.free();
+        var out64 = try Buffer.alloc(&s.ctx, .device, blk.gate.outputs * 2);
+        defer out64.free();
+        const N: i32 = @intCast(blk.gate.outputs);
+        const gq = geo.qmm(1, @intCast(blk.gate.outputs));
+        const cq = rt.launch.Config{ .global = .{ .x = gq.gx, .y = gq.gy }, .local = .{ .x = gq.lx } };
+        const gp = geo.qmmPair(1, @intCast(blk.gate.outputs));
+        const cp = rt.launch.Config{ .global = .{ .x = gp.gx, .y = gp.gy }, .local = .{ .x = gp.lx } };
+        const ga = blk.gate;
+        const ua = blk.up;
+
+        const two = try ctx.pair(true, cq, &k_qmm, .{
+            x2.ptr, @as(i32, 1), w.ptr(ga.weight), w.ptr(ga.scales), w.ptr(ga.biases), out64.ptr, N, @as(i32, h),
+        }, cq, &k_qmm, .{
+            x2.ptr, @as(i32, 1), w.ptr(ua.weight), w.ptr(ua.scales), w.ptr(ua.biases), out64.ptr, N, @as(i32, h),
+        });
+        const one = try ctx.pair(false, cp, &k_pair, .{
+            x2.ptr,            @as(i32, 1),
+            w.ptr(ga.weight),  w.ptr(ga.scales), w.ptr(ga.biases),
+            w.ptr(ua.weight),  w.ptr(ua.scales), w.ptr(ua.biases),
+            out64.ptr,         out64.ptr,
+            N,                 @as(i32, h),
+        }, cp, &k_pair, .{});
+        std.debug.print("gate+up pair: two launches {d:.2} us, one pair launch {d:.2} us, saving {d:.2} us\n", .{
             two / 1e3, one / 1e3, (two - one) / 1e3,
         });
     }
