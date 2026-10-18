@@ -25,7 +25,12 @@ VARIANTS = [
             (
                 "#define QW_QGATE_STRIDE (2 * QW_HEADS * QW_HEAD_DIM) // q_proj row stride: query + gate per head",
                 "#define QW_QGATE_STRIDE (2 * QW_HEADS * QW_HEAD_DIM) // q_proj row stride: query + gate per head\n"
-                "#define QW_QROWS 0                // rows the `queries` buffer is strided by (0 = this launch's rows)",
+                "#ifndef QW_QROWS\n"
+                "// Head stride of the `queries` buffer: 0 means \"read dims[1]\", the round's row count. A nonzero\n"
+                "// value overrides that stride at compile time; it must be the round's row count, never a model\n"
+                "// width, or the kernel writes past the buffer.\n"
+                "#define QW_QROWS 0\n"
+                "#endif",
             ),
             # `queries` writes at out[(h*dims[1] + m)*D + d]. The 2B geometry passed dims[1] = T, which is the
             # 27B's own bug: the buffer is strided by the whole round's rows (QW_QROWS), and the segment's base
@@ -43,7 +48,10 @@ VARIANTS = [
             (
                 "#define D    QW_HEAD_DIM",
                 "#ifndef QW_OUT_WIDTH\n"
-                "#define QW_OUT_WIDTH (QW_Q_HEADS * QW_HEAD_DIM)\n"
+                "// OUT's per-row stride in heads, not in elements: the index below is (w*QW_OUT_WIDTH + qh) * D,\n"
+                "// so the leading factor is the head count. The parent hard-codes QW_Q_HEADS there; a variant that\n"
+                "// set this to heads*head_dim would multiply by D twice and run 6144x past the buffer.\n"
+                "#define QW_OUT_WIDTH QW_Q_HEADS\n"
                 "#endif\n\n"
                 "#define D    QW_HEAD_DIM",
             ),

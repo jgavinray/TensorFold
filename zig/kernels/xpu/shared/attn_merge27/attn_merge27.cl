@@ -26,7 +26,10 @@
 #endif
 
 #ifndef QW_OUT_WIDTH
-#define QW_OUT_WIDTH (QW_Q_HEADS * QW_HEAD_DIM)
+// OUT's per-row stride in heads, not in elements: the index below is (w*QW_OUT_WIDTH + qh) * D,
+// so the leading factor is the head count. The parent hard-codes QW_Q_HEADS there; a variant that
+// set this to heads*head_dim would multiply by D twice and run 6144x past the buffer.
+#define QW_OUT_WIDTH QW_Q_HEADS
 #endif
 
 #define D    QW_HEAD_DIM

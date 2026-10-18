@@ -52,7 +52,12 @@
 #define QW_EMBED_BYTES (QW_HIDDEN / 2)      // 1024 bytes per embedding row (two nibbles per byte)
 #define QW_EMBED_GROUPS (QW_HIDDEN / 64)    // 32 affine groups per row (group size 64)
 #define QW_QGATE_STRIDE (2 * QW_HEADS * QW_HEAD_DIM) // q_proj row stride: query + gate per head
-#define QW_QROWS 0                // rows the `queries` buffer is strided by (0 = this launch's rows)
+#ifndef QW_QROWS
+// Head stride of the `queries` buffer: 0 means "read dims[1]", the round's row count. A nonzero
+// value overrides that stride at compile time; it must be the round's row count, never a model
+// width, or the kernel writes past the buffer.
+#define QW_QROWS 0
+#endif
 
 static inline float bf16_to_f32(ushort u) {
   return intel_convert_as_bfloat16_float(u);

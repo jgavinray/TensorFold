@@ -170,13 +170,15 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
         q27.Pinned.v_heads,
         q27.Pinned.v_heads,
         q27.Pinned.gdn_value_dim,
-        // QW_QROWS: the `queries` buffer's row stride. The 27B forward allocates it for the whole round
-        // (rows * heads * head_dim) and passes the round's row count here, so layout27.cl strides by the round
-        // and dims[2] carries the segment's base. QW_OUT_WIDTH: attn_merge27.cl's OUT stride, heads*head_dim
-        // (6144), against hidden 5120 - the 2B defaults (rows, 2048) coincide with their own geometry, which is
-        // exactly how the shared sources' defaults would silently mis-stride the 27B.
-        q27.Pinned.hidden, // rows are runtime; this value is only the compile-time fallback for a 0 argument
-        2 * q27.Pinned.heads * q27.Pinned.head_dim,
+        // QW_QROWS: the `queries` buffer's head stride. Zero means "read dims[1]", the round's row count the
+        // forward passes; the buffer is `rows * heads * head_dim` laid out [head][row], so its head stride is
+        // exactly that row count. A nonzero value here must be that row count, never a model width: `hidden`
+        // (5120) is neither, and layout27.cl would then index to h*5120 + row, far past the buffer's end.
+        // QW_OUT_WIDTH: attn_merge27's OUT row stride in *heads*, because its index is (w*QW_OUT_WIDTH + qh) *
+        // QW_HEAD_DIM. The old value here, 2*heads*head_dim, multiplied by the head width twice and stored
+        // ~4.7x past the buffer - the out-of-bounds write that page-faulted the card.
+        0,
+        q27.Pinned.heads,
     });
     // Where the 27B modules come from, same two-source rule as the 2B path above:
     //   * `ocloc` (default when the binary is on PATH): compile the shared sources with the 27B -D set here.

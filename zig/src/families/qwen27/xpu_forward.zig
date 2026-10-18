@@ -638,10 +638,10 @@ fn attention(ru: Run, a: xw.Attention, cache: *xs.Attention, len: usize, capacit
     try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.heads), c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.qraw.ptr, w.ptr(a.q_norm), sc.q.ptr, qn });
     const kn = sc.dims([4]u32{ T, c.kv_heads, c.kv_heads * c.head_dim, c.head_dim });
     try ru.go(.head_norm, geo.layout(.head_norm, @intCast(total * c.kv_heads), c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.k.ptr, w.ptr(a.k_norm), sc.knorm.ptr, kn });
-    // `queries` is strided by the whole round's rows (dims[1]) and this segment's base is dims[2]: the kernel's
-    // QW_QROWS carries the round's row count (the launch geometry's y axis is heads*rows). The 2B passed its own
-    // rows here, which is only correct while a round is a single segment; at 27B the same call would stride the
-    // buffer by one row and every head but the first would read another head's query.
+    // `queries` holds this run's rows laid out [head][row], so its head stride is the run's row count T; the
+    // kernel reads that stride from dims[1] (QW_QROWS = 0) and the segment's base from dims[2]. One run is one
+    // segment here, so the base is 0. attn_partial reads the same buffer with QROWS = dims[5] = T and QOFF =
+    // dims[6] = 0, so producer and consumer agree on the layout.
     try ru.go(.queries, geo.layout(.queries, T, c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(len), T, 0, 0 }) });
     try ru.go(.keys, geo.layout(.keys, T, c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(len), @intCast(capacity), 0, 0 }) });
     const nch: usize = (len + total + 127) / 128;
