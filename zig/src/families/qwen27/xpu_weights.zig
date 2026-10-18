@@ -284,13 +284,16 @@ pub fn load(gpa: std.mem.Allocator, s: *rt.session.Session, dir: []const u8, c: 
         .embed = try idx.projection("language_model.model.embed_tokens", c.vocab, c.hidden, g),
         .head = try idx.projection("language_model.lm_head", c.vocab, c.hidden, g),
         .norm = try idx.tensor("language_model.model.", "norm.weight", .bf16, &.{c.hidden}),
-        .layers = try a.alloc(Layer, c.layers),
+        // `gpa`, not the loader's scratch arena: `load` frees that arena before it returns, and `Weights.deinit`
+        // frees `layers` with `gpa`. Allocating it from the arena left `w.layers` dangling (the a1 segfault).
+        .layers = try gpa.alloc(Layer, c.layers),
         .ledger = &.{},
         .total_bytes = idx.total,
         .shards = n_shards,
         .load_ns = 0,
         .gpa = gpa,
     };
+    errdefer gpa.free(w.layers);
     for (w.layers, 0..) |*layer, i| {
         var buf: [128]u8 = undefined;
         const p = std.fmt.bufPrint(&buf, "language_model.model.layers.{d}.", .{i}) catch unreachable;

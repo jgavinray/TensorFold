@@ -4,6 +4,9 @@
 
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
+/// The pinned Qwen 3.8 27B geometry, the source of the -D flags the 27B kernels are compiled with. Reading the
+/// module here (not a copy) keeps one definition; it has no imports beyond std, so the build can host it.
+const q27 = @import("../src/families/qwen27/config.zig");
 
 /// Whether the named ocloc binary is on PATH, so the default kernel source can follow it.
 fn oclocAvailable(b: *std.Build, name: []const u8) bool {
@@ -135,7 +138,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
     // ocloc takes compile options as one string after -options, so the -D flags belong there, not as bare args.
     const opt_string = b.fmt("-cl-std=CL3.0 {s}", .{shape_defines});
-    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+    inline for (.{ "layout", "norm", "norm_nores", "qmm", "qmm_pair", "norm_qmm", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         if (prebuilt) |dir| {
             const src = b.pathJoin(&.{ dir, file });
@@ -150,6 +153,79 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
         qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
     }
     const qk = b.createModule(.{ .root_source_file = qk_files.add("xpu_qwen35_kernels.zig", qk_src) });
+    // Phase 6: Qwen 3.8 27B. One more compilation of the same shared sources with the 27B shape defines, embedded
+    // under the same module name (`xpu_qwen35_kernels`), so `families/qwen27/xpu_forward.zig` reads them by key.
+    // The defines are the pinned geometry of families/qwen27/config.zig; the 2B build's empty default keeps its own.
+    // QW_ZS is gdn_post.cl's in_proj_z row stride, i.e. the value projection's width QW_NV*QW_DV = v_heads*dv
+    // (6144 at 27B), NOT `hidden`. The two coincide on the 2B (16*128 = 2048 = hidden), which is why the kernel's
+    // default works there; at 27B the z row is 6144 wide against hidden 5120, and passing `hidden` made gdn_post
+    // read each row 1024 elements early - heads 40..47 of every GDN layer consumed the next row's z (the last row
+    // read past the buffer), which is exactly the row-to-row corruption the smoke gate reported.
+    const q27_defines = b.fmt("-DQW_HIDDEN={d} -DQW_INTERMEDIATE={d} -DQW_HEADS={d} -DQW_Q_HEADS={d} -DQW_KV_HEADS={d} -DQW_NV={d} -DQW_HV={d} -DQW_ZS={d}", .{
+        q27.Pinned.hidden, q27.Pinned.intermediate, q27.Pinned.heads, q27.Pinned.heads, q27.Pinned.kv_heads, q27.Pinned.v_heads, q27.Pinned.v_heads, q27.Pinned.gdn_value_dim,
+    });
+    // Where the 27B modules come from, same two-source rule as the 2B path above:
+    //   * `ocloc` (default when the binary is on PATH): compile the shared sources with the 27B -D set here.
+    //   * `prebuilt` (default when ocloc is absent, or `-Dqwen27-kernels=prebuilt:<dir>`): @embedFile the
+    //     <dir>/<key>_bmg.bin committed under zig/kernels/xpu/prebuilt-27b/, so `zig build xpu-qwen27-tools`
+    //     works on a host without intel-ocloc. Those modules were compiled from the same sources with these
+    //     defines; the 2B-default modules under zig/kernels/xpu/prebuilt/ are NOT a substitute (they carry the
+    //     -cl-std=CL3.0 defaults only, so a 27B forward linked against them would run 2B shapes).
+    const q27_kernels = b.option([]const u8, "qwen27-kernels", "ocloc | prebuilt[:<dir>]: where the Qwen 3.8 27B kernel modules come from") orelse if (oclocAvailable(b, ocloc)) "ocloc" else "prebuilt";
+    const q27_prebuilt: ?[]const u8 = if (std.mem.eql(u8, q27_kernels, "prebuilt"))
+        "zig/kernels/xpu/prebuilt-27b"
+    else if (std.mem.startsWith(u8, q27_kernels, "prebuilt:"))
+        q27_kernels["prebuilt:".len..]
+    else
+        null;
+    if (q27_prebuilt == null and !std.mem.eql(u8, q27_kernels, "ocloc")) {
+        std.debug.panic("qwen27-kernels must be `ocloc`, `prebuilt` or `prebuilt:<dir>`, got {s}", .{q27_kernels});
+    }
+    const q27_files = b.addWriteFiles();
+    var q27_src: []const u8 = "//! Compiled Qwen kernel binaries for Qwen 3.8 27B, embedded (see zig/build/xpu.zig).\n";
+    const q27_opt = b.fmt("-cl-std=CL3.0 {s}", .{q27_defines});
+    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+        const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
+        if (q27_prebuilt) |dir| {
+            const src = b.pathJoin(&.{ dir, file });
+            _ = q27_files.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
+        } else {
+            const cc = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", q27_opt, "-file" });
+            cc.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
+            cc.addArg("-out_dir");
+            const out = cc.addOutputDirectoryArg("qwen27-" ++ name ++ "-out");
+            _ = q27_files.addCopyFile(out.path(b, file), file);
+        }
+        q27_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ q27_src, name, file });
+    }
+    const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
+    const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    q27_mod.addImport("xpu_qwen35_kernels", q27k);
+    // Phase 6.3: the two 27B tools. tf-xpu-qwen27-logits writes len(tokens) x vocab bf16 logits; tf-xpu-qwen27-greedy
+    // prints n greedy token ids. Both share the forward and the 27B kernels above.
+    const q27_logits = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_logits.zig"), .target = target, .optimize = .Debug, .link_libc = true });
+    q27_logits.addImport("xpu_qwen35_kernels", q27k);
+    q27_logits.addImport("qwen27_forward", q27_mod);
+    const logits_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-logits", .root_module = q27_logits });
+    const logits_install = b.addInstallArtifact(logits_exe, .{});
+    const greedy = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_greedy.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    greedy.addImport("xpu_qwen35_kernels", q27k);
+    greedy.addImport("qwen27_forward", q27_mod);
+    const greedy_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-greedy", .root_module = greedy });
+    const greedy_install = b.addInstallArtifact(greedy_exe, .{});
+    const tools = b.step("xpu-qwen27-tools", "Build tf-xpu-qwen27-logits and tf-xpu-qwen27-greedy into zig-out/bin");
+    tools.dependOn(&logits_install.step);
+    tools.dependOn(&greedy_install.step);
+    // Phase 6.3/6.4: the 27B forward gate binary (gate C greedy vs the fixture, plus the decode-step measurement).
+    // Same forward module and 27B kernels as the tools; the run needs a card and the checkpoint.
+    const q27_fwd_test = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward_test.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_fwd_test.addImport("xpu_qwen35_kernels", q27k);
+    q27_fwd_test.addImport("qwen27_forward", q27_mod);
+    const q27_fwd_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-forward-test", .root_module = q27_fwd_test });
+    const q27_fwd_install = b.addInstallArtifact(q27_fwd_exe, .{});
+    const q27_fwd_run = b.addRunArtifact(q27_fwd_exe);
+    q27_fwd_run.step.dependOn(&q27_fwd_install.step);
+    b.step("xpu-qwen27-forward-test", "Build and run tf-xpu-qwen27-forward-test: Qwen 3.8 27B forward gate C + decode step on a B70 (opt-in)").dependOn(&q27_fwd_run.step);
     const geo_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/xpu_geometry.zig"), .target = b.graph.host });
     const geo_run = b.addRunArtifact(b.addTest(.{ .name = "xpu-qwen35-geometry", .root_module = geo_module }));
     test_step.dependOn(&geo_run.step);
@@ -162,6 +238,48 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const f_run = b.addRunArtifact(f_exe);
     f_run.step.dependOn(&f_install.step);
     b.step("xpu-qwen35-forward-test", "Build and run tf-xpu-qwen35-forward-test: Qwen3.5-2B forward gates A-C on a B70 (opt-in)").dependOn(&f_run.step);
+
+    // TEMP (S02 investigation): per-shape qmm bench probe; delete with zig/src/xpu_bench_probe.zig.
+    const bp_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_bench_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    bp_module.addImport("xpu_qwen35_kernels", qk);
+    bp_module.addImport("core", core);
+    const bp_exe = b.addExecutable(.{ .name = "tf-xpu-bench-probe", .root_module = bp_module });
+    const bp_install = b.addInstallArtifact(bp_exe, .{});
+    const bp_run = b.addRunArtifact(bp_exe);
+    bp_run.step.dependOn(&bp_install.step);
+    b.step("xpu-bench-probe", "TEMP: per-shape qmm timing probe").dependOn(&bp_install.step);
+
+    // TEMP (S02 investigation): fused norm_qmm vs norm+qmm correctness probe.
+    const nq_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_normqmm_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    nq_module.addImport("xpu_qwen35_kernels", qk);
+    nq_module.addImport("core", core);
+    const nq_exe = b.addExecutable(.{ .name = "tf-xpu-normqmm-probe", .root_module = nq_module });
+    const nq_install = b.addInstallArtifact(nq_exe, .{});
+    b.step("xpu-normqmm-probe", "TEMP: fused norm_qmm vs norm+qmm bit-exactness probe").dependOn(&nq_install.step);
+
+    // TEMP (S02 investigation): fused mlp_act_down vs mlp_act+qmm correctness probe.
+    const ad_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_actdown_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    ad_module.addImport("xpu_qwen35_kernels", qk);
+    ad_module.addImport("core", core);
+    const ad_exe = b.addExecutable(.{ .name = "tf-xpu-actdown-probe", .root_module = ad_module });
+    const ad_install = b.addInstallArtifact(ad_exe, .{});
+    b.step("xpu-actdown-probe", "TEMP: fused mlp_act_down vs mlp_act+qmm bit-exactness probe").dependOn(&ad_install.step);
+
+    // TEMP (S02 investigation): device-time comparison of fused vs unfused pairs, batched (no per-launch sync).
+    const fp_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_fusion_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    fp_module.addImport("xpu_qwen35_kernels", qk);
+    fp_module.addImport("core", core);
+    const fp_exe = b.addExecutable(.{ .name = "tf-xpu-fusion-probe", .root_module = fp_module });
+    const fp_install = b.addInstallArtifact(fp_exe, .{});
+    b.step("xpu-fusion-probe", "TEMP: fused vs unfused device-time comparison (batched)").dependOn(&fp_install.step);
+
+    // TEMP (S02 investigation): qmm_pair vs two qmm calls on the real a/b weights, bit-exactness + device time.
+    const pairprobe_module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qmmpair_probe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    pairprobe_module.addImport("xpu_qwen35_kernels", qk);
+    pairprobe_module.addImport("core", core);
+    const pairprobe_exe = b.addExecutable(.{ .name = "tf-xpu-qmmpair-probe", .root_module = pairprobe_module });
+    const pairprobe_install = b.addInstallArtifact(pairprobe_exe, .{});
+    b.step("xpu-qmmpair-probe", "TEMP: qmm_pair vs two qmm calls (bit-exact + device time)").dependOn(&pairprobe_install.step);
 
     // Phase 4.4-4.5: `Xpu` behind the lane engine's backend interface + qualify, on card (opt-in, needs a card).
     const lanes_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
@@ -217,15 +335,15 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     ep_run.step.dependOn(&ep_install.step);
     b.step("eprobe", "TEMP: serve path on a long prompt").dependOn(&ep_run.step);
 
-    const bp_module = b.createModule(.{ .root_source_file = b.path("zig/src/bprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
-    bp_module.addImport("xpu_qwen35_kernels", qk);
-    bp_module.addImport("lanes", lanes_mod);
-    bp_module.addImport("core", core);
-    const bp_exe = b.addExecutable(.{ .name = "tf-bprobe", .root_module = bp_module });
-    const bp_install = b.addInstallArtifact(bp_exe, .{});
-    const bp_run = b.addRunArtifact(bp_exe);
-    bp_run.step.dependOn(&bp_install.step);
-    b.step("bprobe", "TEMP: the bench 16K cell through the served prefill path").dependOn(&bp_run.step);
+    const bpr_module = b.createModule(.{ .root_source_file = b.path("zig/src/bprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    bpr_module.addImport("xpu_qwen35_kernels", qk);
+    bpr_module.addImport("lanes", lanes_mod);
+    bpr_module.addImport("core", core);
+    const bpr_exe = b.addExecutable(.{ .name = "tf-bprobe", .root_module = bpr_module });
+    const bpr_install = b.addInstallArtifact(bpr_exe, .{});
+    const bpr_run = b.addRunArtifact(bpr_exe);
+    bpr_run.step.dependOn(&bpr_install.step);
+    b.step("bprobe", "TEMP: the bench 16K cell through the served prefill path").dependOn(&bpr_run.step);
 
     const sp_module = b.createModule(.{ .root_source_file = b.path("zig/src/sprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
     sp_module.addImport("xpu_qwen35_kernels", qk);

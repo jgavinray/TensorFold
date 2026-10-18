@@ -151,7 +151,7 @@ pub fn recordStep(
     const recorded: Values = .{ .token = tokens[0], .position = @intCast(cache.len), .cache_len = @intCast(cache.len) };
     var slots: std.ArrayList(DimsSlot) = .empty;
     errdefer slots.deinit(gpa);
-    try fwd.recordDecode(&rec, m, sc, cache, tokens, recorded.position, &slots);
+    try fwd.recordDecode(s, &rec, m, sc, cache, tokens, recorded.position, &slots);
     const list = try Recorded.take(&rec);
     const owned = try slots.toOwnedSlice(gpa);
     return .{ .list = list, .sc = sc, .slots = owned, .recorded = recorded };

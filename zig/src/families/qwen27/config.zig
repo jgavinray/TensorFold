@@ -5,6 +5,55 @@ pub const Kind = enum { linear, attention };
 pub const max_layers = 128;
 pub const max_eos = 8;
 
+/// The pinned geometry of the Qwen 3.8 27B MLX affine checkpoint the XPU forward is built for: the values
+/// `zig/build/xpu.zig` passes to ocloc as -D flags (`qwen-shape-defines`) and the launch geometry's shape
+/// arguments (families/qwen3_5/xpu_geometry.zig). `Config.parse` below admits a checkpoint against them.
+pub const Pinned = struct {
+    pub const hidden = 5120;
+    pub const vocab = 248320;
+    pub const layers = 64;
+    pub const intermediate = 17408;
+    pub const heads = 24;
+    pub const kv_heads = 4;
+    pub const head_dim = 256;
+    pub const rotary_dim = 64;
+    pub const k_heads = 16;
+    pub const v_heads = 48;
+    pub const dk = 128;
+    pub const dv = 128;
+    pub const conv_kernel = 4;
+    pub const group = 64;
+    pub const eps: f32 = 1e-6;
+    pub const theta: f64 = 10000000;
+
+    /// The GatedDeltaNet convolution's channel count: 2*QW_NK*QW_DK + QW_NV*QW_DV (gdn_pre.cl's QW_CC).
+    pub const gdn_qkv_dim = 2 * k_heads * dk + v_heads * dv;
+    /// The value projection's width (in_proj_z / out_proj row count): QW_NV * QW_DV.
+    pub const gdn_value_dim = v_heads * dv;
+};
+
+/// The pinned geometry at module scope, under the names the XPU forward and the build use
+/// (`c.xpu_hidden`, `c.xpu_vocab`, ...). Prefixed so they cannot shadow `Config.parse`'s own locals
+/// (`heads`, `layers`, `intermediate`, ...), which the parser needs to read the checkpoint's values.
+pub const xpu_hidden = Pinned.hidden;
+pub const xpu_vocab = Pinned.vocab;
+pub const xpu_layers = Pinned.layers;
+pub const xpu_intermediate = Pinned.intermediate;
+pub const xpu_heads = Pinned.heads;
+pub const xpu_kv_heads = Pinned.kv_heads;
+pub const xpu_head_dim = Pinned.head_dim;
+pub const xpu_rotary_dim = Pinned.rotary_dim;
+pub const xpu_k_heads = Pinned.k_heads;
+pub const xpu_v_heads = Pinned.v_heads;
+pub const xpu_dk = Pinned.dk;
+pub const xpu_dv = Pinned.dv;
+pub const xpu_conv_kernel = Pinned.conv_kernel;
+pub const xpu_group = Pinned.group;
+pub const xpu_eps: f32 = Pinned.eps;
+pub const xpu_theta: f64 = Pinned.theta;
+pub const xpu_gdn_qkv_dim = Pinned.gdn_qkv_dim;
+pub const xpu_gdn_value_dim = Pinned.gdn_value_dim;
+
 pub const Config = struct {
     hidden: usize,
     intermediate: usize,

@@ -187,17 +187,16 @@ pub const Xpu = struct {
                 e.cache.len += 1;
                 return;
             }
-        }
-        if (self.replay.stepFor(1, e.cache.capacity)) |step| {
-            if (step.sc != &self.scratch or step.recorded.cache_len != v.cache_len) {
-                step.deinit(self.gpa);
-                step.* = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
-            }
+            step.deinit(self.gpa);
+            step.* = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
             try rp.replayStep(self.session, step, &self.queue, v);
             e.cache.len += 1;
             return;
         }
-        // No step for this shape yet: run the token eagerly and record the same launches for the next token.
+        // No step for this shape yet: record this token's launches (captured at the current cache length), then run
+        // the token eagerly so this call still produces logits. Every later token of the shape replays the list.
+        const step = try rp.recordStep(self.session, self.model, &self.scratch, &e.cache, &.{token}, self.gpa);
+        try self.replay.put(1, e.cache.capacity, step);
         try fwd.run(self.session, self.model, &self.scratch, &e.cache, &.{token}, .{ .head = .last });
         _ = stream;
     }
