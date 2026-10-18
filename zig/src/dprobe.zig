@@ -246,5 +246,46 @@ pub fn main(init: std.process.Init) !u8 {
     // 3) Per-layer walk: run every layer over the full prompt (one-shot reference) and over the served chunks,
     //    comparing the residual stream after each layer, to find the first layer that diverges.
     std.debug.print("== per-layer residual comparison ==\n", .{});
+    ref_cache.len = 0;
+    served_cache.len = 0;
+    var diverged: ?usize = null;
+    for (0..c.layers) |li| {
+        try layer(&s, &m.kernels, &w, &ref_sc, &ref_cache, li, ids, 0);
+        try layerTail(&s, &m.kernels, &w, &ref_sc, li, ids.len);
+        try servedPrefillLayer(&s, &m.kernels, &w, &served_sc, &served_cache, li, ids);
+        if (try reportLayer(li, ref_sc.h, served_sc.h, &s)) |_| {
+            diverged = li;
+            break;
+        }
+    }
+    if (diverged) |li| std.debug.print("first divergent layer: {d}\n", .{li}) else std.debug.print("no layer diverged\n", .{});
     return 0;
+}
+
+/// Reports a layer's residual mismatch by name; null when they agree.
+fn reportLayer(li: usize, ref: rt.memory.Buffer, got: rt.memory.Buffer, s: *rt.session.Session) !?usize {
+    const n = @min(ref.len, got.len);
+    const a = try gpa.alloc(u8, n);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u8, n);
+    defer gpa.free(b);
+    try pull(s, ref, a);
+    try pull(s, got, b);
+    if (firstDiff(a, b)) |i| {
+        std.debug.print("  layer {d} DIVERGES: first diff at byte {d} of {d} (ref {x} vs got {x})\n", .{ li, i, n, a[i], b[i] });
+        return i;
+    }
+    std.debug.print("  layer {d} ok ({d} bytes)\n", .{ li, n });
+    return null;
+}
+
+/// The served chunked path for one layer, over the whole prompt.
+fn servedPrefillLayer(s: *rt.session.Session, k: *Kernels, w: *const xw.Weights, sc: *Scratch, cache: *xs.Cache, layer_i: usize, ids: []const u32) !void {
+    var at: usize = 0;
+    while (at < ids.len) {
+        const end = @min(ids.len, at + chunk);
+        try layer(s, k, w, sc, cache, layer_i, ids[at..end], at);
+        try layerTail(s, k, w, sc, layer_i, end - at);
+        at = end;
+    }
 }
