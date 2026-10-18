@@ -30,7 +30,7 @@ pub const Session = struct {
 
     pub fn open(self: *Session, opts: Options) OpenError!void {
         self.diag = .{};
-        self.held = try lock.acquireOf(opts.lock_dir, opts.prefer, opts.only, opts.wait_ms);
+        self.held = try lock.acquireOfPaths(opts.lock_dir, opts.prefer, opts.only, opts.wait_ms, opts.paths);
         errdefer self.held.release();
         try preflight.check(opts.paths, self.held.bdf(), &self.diag);
         self.rt = try runtime.Runtime.openPath(opts.loader);

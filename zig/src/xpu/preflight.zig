@@ -56,8 +56,9 @@ pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
     }
 }
 
-/// Whether the card has a driver bound: a card with no `driver` symlink cannot be opened, so it is not usable.
-fn isBound(p: Paths, card: []const u8) bool {
+/// Whether the card has a driver bound: a card with no `driver` symlink cannot be opened, so it is not usable. The
+/// lock and the pool sweep both use this so a parked card is never handed out or swept.
+pub fn isBound(p: Paths, card: []const u8) bool {
     var path: [160]u8 = undefined;
     const driver = sys.zfmt(&path, "{s}/{s}/driver", .{ p.pci_root, card }) orelse return false;
     return sys.exists(driver);
