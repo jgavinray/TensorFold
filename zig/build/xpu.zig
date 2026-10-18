@@ -365,6 +365,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     cp_run.step.dependOn(&cp_install.step);
     b.step("cprobe", "TEMP: capacity sweep at a fixed long prompt").dependOn(&cp_run.step);
 
+    const dp_module = b.createModule(.{ .root_source_file = b.path("zig/src/dprobe.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    dp_module.addImport("xpu_qwen35_kernels", qk);
+    dp_module.addImport("lanes", lanes_mod);
+    dp_module.addImport("core", core);
+    const dp_exe = b.addExecutable(.{ .name = "tf-dprobe", .root_module = dp_module });
+    const dp_install = b.addInstallArtifact(dp_exe, .{});
+    const dp_run = b.addRunArtifact(dp_exe);
+    dp_run.step.dependOn(&dp_install.step);
+    b.step("dprobe", "TEMP: chunked served prefill vs one-shot reference, per-stage byte compare").dependOn(&dp_run.step);
+
     // Phase 5: `zig build xpu-native` -> zig-out/xpu/bin/tensorfold-native: the HTTP server over `Xpu` (serve --backend xpu).
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native_xpu.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes_mod }, .{ .name = "core", .module = core } } });

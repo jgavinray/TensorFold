@@ -92,7 +92,7 @@ pub const Kernels = struct {
         self.loaded = 0;
     }
 
-    fn get(self: *Kernels, id: KernelId) *Kernel {
+    pub fn get(self: *Kernels, id: KernelId) *Kernel {
         return &self.list[@intFromEnum(id)];
     }
     /// One line per module (kept for parity with the profiler output).
@@ -291,10 +291,10 @@ pub const Scratch = struct {
         self.made = 0;
     }
 
-    fn ids(self: *Scratch) []u32 {
+    pub fn ids(self: *Scratch) []u32 {
         return @as([*]u32, @ptrCast(@alignCast(self.pool.ptr.?)))[0..self.rows];
     }
-    fn windows(self: *Scratch) []i32 {
+    pub fn windows(self: *Scratch) []i32 {
         return @as([*]i32, @ptrCast(@alignCast(@as([*]u8, @ptrCast(self.pool.ptr.?)) + self.rows * 4)))[0 .. self.rows * c.conv_taps];
     }
     fn dimsBase(self: *Scratch) [*]u8 {
@@ -302,7 +302,7 @@ pub const Scratch = struct {
     }
     /// Copies `vals` into a fresh slot of the pool and returns its device-visible address. With a recorder active the
     /// slot's index is appended to `record_slots` so the replay can rewrite the per-token scalars inside it.
-    fn dims(self: *Scratch, vals: anytype) *anyopaque {
+    pub fn dims(self: *Scratch, vals: anytype) *anyopaque {
         const bytes = std.mem.asBytes(&vals);
         std.debug.assert(bytes.len <= slot_bytes and self.dims_used < dims_slots);
         const p: [*]u8 = self.dimsBase() + self.dims_used * slot_bytes;
