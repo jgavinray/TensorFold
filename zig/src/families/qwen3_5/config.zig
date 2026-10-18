@@ -85,7 +85,7 @@ pub const Geometry = struct {
         return false;
     }
 
-    fn eql(self: Geometry, other: Geometry) bool {
+    pub fn eql(self: Geometry, other: Geometry) bool {
         return self.hidden == other.hidden and self.vocab == other.vocab and self.layers == other.layers and
             self.intermediate == other.intermediate and self.linear_heads == other.linear_heads and
             self.linear_value_heads == other.linear_value_heads and self.linear_dim == other.linear_dim and
@@ -106,13 +106,34 @@ pub const Config = struct {
     layers: usize,
     intermediate: usize,
     linear_heads: usize,
+    linear_value_heads: usize,
     linear_dim: usize,
+    linear_value_dim: usize,
     conv_taps: usize,
     query_heads: usize,
     kv_heads: usize,
     head_dim: usize,
     /// Layers between two full-attention layers: layer `i` is full attention when `(i + 1) % interval == 0`.
     full_attention_interval: usize,
+
+    /// The checkpoint's geometry as a `Geometry`, so callers can compare whole layouts (the family router does).
+    pub fn geometry(self: Config) Geometry {
+        return .{
+            .hidden = self.hidden,
+            .vocab = self.vocab,
+            .layers = self.layers,
+            .intermediate = self.intermediate,
+            .linear_heads = self.linear_heads,
+            .linear_value_heads = self.linear_value_heads,
+            .linear_dim = self.linear_dim,
+            .linear_value_dim = self.linear_value_dim,
+            .conv_taps = self.conv_taps,
+            .query_heads = self.query_heads,
+            .kv_heads = self.kv_heads,
+            .head_dim = self.head_dim,
+            .full_attention_interval = self.full_attention_interval,
+        };
+    }
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -246,7 +267,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .layers = g.layers,
         .intermediate = g.intermediate,
         .linear_heads = g.linear_heads,
+        .linear_value_heads = g.linear_value_heads,
         .linear_dim = g.linear_dim,
+        .linear_value_dim = g.linear_value_dim,
         .conv_taps = g.conv_taps,
         .query_heads = g.query_heads,
         .kv_heads = g.kv_heads,

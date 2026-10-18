@@ -110,9 +110,28 @@ const Family = enum {
         qwen27: *@import("families/qwen27/xpu_backend.zig").Xpu,
     };
 
-    fn of(model_type: []const u8) ?Family {
-        if (std.mem.eql(u8, model_type, "qwen3_5")) return .qwen35;
-        if (std.mem.eql(u8, model_type, "qwen27")) return .qwen27;
+    /// The family a checkpoint belongs to. Both the 2B and the 27B report `model_type` `qwen3_5`, so `model_type`
+    /// alone cannot tell them apart: the 27B's `text_config` is a different geometry, and running it through the 2B
+    /// family's forward (compiled for the 2B constants) is not a shape error the kernels can report - it reads the
+    /// wrong buffers. The config decides: the 27B layout (`Geometry.qwen27`) selects `qwen27`, the 2B layout
+    /// (`Geometry.qwen35`) selects `qwen35`; a checkpoint whose layout is neither is refused with `problem` set.
+    fn route(a: Allocator, gpa: Allocator, io: std.Io, model_type: []const u8, dir: []const u8, problem: *[]const u8) !?Family {
+        const cfg = @import("families/qwen3_5/config.zig");
+        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+        defer gpa.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22)) catch {
+            problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot read {s}/config.json", .{dir});
+            return null;
+        };
+        defer gpa.free(bytes);
+        const config = cfg.parse(gpa, bytes) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot read this checkpoint's config ({s})", .{@errorName(err)});
+            return null;
+        };
+        const geometry = config.geometry();
+        if (geometry.eql(cfg.Geometry.qwen27)) return .qwen27;
+        if (geometry.eql(cfg.Geometry.qwen35)) return .qwen35;
+        problem.* = try std.fmt.allocPrint(a, "--backend xpu serves Qwen3.5-2B (qwen3_5) and Qwen3.8-27B (qwen27) only, not {s}", .{model_type});
         return null;
     }
 
@@ -127,10 +146,7 @@ const Family = enum {
 };
 
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
-    const family = Family.of(o.model_type) orelse {
-        problem.* = try std.fmt.allocPrint(a, "--backend xpu serves Qwen3.5-2B (qwen3_5) and Qwen3.8-27B (qwen27) only, not {s}", .{o.model_type});
-        return null;
-    };
+    const family = try Family.route(a, gpa, io, o.model_type, o.dir, problem) orelse return null;
     const context: i64 = @intCast(family.context(gpa, io, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen engine cannot read this checkpoint's config ({s})", .{@errorName(err)});
         return null;
