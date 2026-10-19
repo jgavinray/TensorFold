@@ -42,7 +42,8 @@ pub const Entry = struct {
             const row = last.base + path.len - 1;
             var rec: [c.max_layers]?*const anyopaque = @splat(null);
             var cv: [c.max_layers]?*const anyopaque = @splat(null);
-            for (&rec, &cv, 0..) |*r, *v, i| if (self.cache.c.kind(i) == .linear) {
+            const n_layers = self.cache.c.layers;
+            for (rec[0..n_layers], cv[0..n_layers], 0..) |*r, *v, i| if (self.cache.c.kind(i) == .linear) {
                 r.* = sc.snapDelta(i, row);
                 v.* = sc.snapConv(i, row);
             };
@@ -119,7 +120,8 @@ pub const Xpu = struct {
     }
 
     pub fn facts(self: *const Xpu) lanes.Model {
-        return .{ .exact_width = self.width, .hidden_rows = self.width > 1, .batch_rows = xs.max_segments * window_rows, .max_streams = self.options.streams, .streams_exact = true };
+        // A shared round records a snapshot per row, and the scratch holds `snap_rows` of them (see Scratch.snapshot_rows).
+        return .{ .exact_width = self.width, .hidden_rows = self.width > 1, .batch_rows = @min(xs.max_segments * window_rows, self.scratch.snap_rows), .max_streams = self.options.streams, .streams_exact = true };
     }
 
     pub fn backend(self: *Xpu) be.Backend {
