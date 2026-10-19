@@ -307,6 +307,7 @@ pub fn load(gpa: std.mem.Allocator, s: *rt.session.Session, dir: []const u8, c: 
                 .out = try idx.projection(try nameJoin(a, p, "linear_attn.out_proj"), c.hidden, c.gdnValueDim(), g),
                 .conv = try idx.tensor(p, "linear_attn.conv1d.weight", .bf16, &.{ c.gdnQkvDim(), c.conv_kernel, 1 }),
                 .norm = try idx.tensor(p, "linear_attn.norm.weight", .bf16, &.{c.dv}),
+                // bf16 in the 27B checkpoint (fp32 in the 2B's): gdn_pre.cl reads it as bf16 under -DQW_ALOG_BF16 (zig/build/xpu.zig).
                 .a_log = try idx.tensor(p, "linear_attn.A_log", .bf16, &.{c.v_heads}),
                 .dt_bias = try idx.tensor(p, "linear_attn.dt_bias", .bf16, &.{c.v_heads}),
             } },

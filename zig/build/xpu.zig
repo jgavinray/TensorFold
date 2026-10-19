@@ -161,7 +161,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // default works there; at 27B the z row is 6144 wide against hidden 5120, and passing `hidden` made gdn_post
     // read each row 1024 elements early - heads 40..47 of every GDN layer consumed the next row's z (the last row
     // read past the buffer), which is exactly the row-to-row corruption the smoke gate reported.
-    const q27_defines = b.fmt("-DQW_HIDDEN={d} -DQW_INTERMEDIATE={d} -DQW_HEADS={d} -DQW_Q_HEADS={d} -DQW_KV_HEADS={d} -DQW_NV={d} -DQW_HV={d} -DQW_ZS={d}", .{
+    // QW_ALOG_BF16: the 27B checkpoint stores linear_attn.A_log as bf16 (the 2B's is fp32, gdn_pre.cl's default);
+    // xpu_weights.zig loads it as .bf16 and uploads the raw bytes, so the kernel must read bf16.
+    const q27_defines = b.fmt("-DQW_HIDDEN={d} -DQW_INTERMEDIATE={d} -DQW_HEADS={d} -DQW_Q_HEADS={d} -DQW_KV_HEADS={d} -DQW_NV={d} -DQW_HV={d} -DQW_ZS={d} -DQW_ALOG_BF16", .{
         q27.Pinned.hidden, q27.Pinned.intermediate, q27.Pinned.heads, q27.Pinned.heads, q27.Pinned.kv_heads, q27.Pinned.v_heads, q27.Pinned.v_heads, q27.Pinned.gdn_value_dim,
     });
     // Where the 27B modules come from, same two-source rule as the 2B path above:
@@ -211,6 +213,12 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     q27_logits.addImport("qwen27_forward", q27_mod);
     const logits_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-logits", .root_module = q27_logits });
     const logits_install = b.addInstallArtifact(logits_exe, .{});
+    // Diagnostics: per-layer residual stream at chosen positions (exp/ref/mlx_positions.py compares layer by layer).
+    const q27_hidden = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_hidden.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_hidden.addImport("xpu_qwen35_kernels", q27k);
+    q27_hidden.addImport("qwen27_forward", q27_mod);
+    const hidden_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-hidden", .root_module = q27_hidden });
+    b.step("xpu-qwen27-hidden", "Build tf-xpu-qwen27-hidden (27B per-layer residual stream at chosen positions)").dependOn(&b.addInstallArtifact(hidden_exe, .{}).step);
     const greedy = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_greedy.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
     greedy.addImport("xpu_qwen35_kernels", q27k);
     greedy.addImport("qwen27_forward", q27_mod);
