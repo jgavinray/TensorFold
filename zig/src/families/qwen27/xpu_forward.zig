@@ -64,12 +64,12 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, qmm_split, qmm_q8, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_split, qmm_q8, qmm_q8x, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
-            .qmm_xmx, .qmm_xsum, .qmm_split, .qmm_q8 => .qmm,
+            .qmm_split, .qmm_q8, .qmm_q8x => .qmm,
             .attn_partial_gqa => .attn_partial,
             inline else => |t| @field(Module, @tagName(t)),
         };
@@ -217,10 +217,6 @@ pub const widths = struct {
     pub fn convSnap(cfg_: cfgmod.Config, rows: usize) usize {
         return rows * xs.convBytes(cfg_);
     }
-    /// `xsum`: the XMX prefill matmul's per-(row, quantization group) input sums (fp32), for the widest input.
-    pub fn xsum(cfg_: cfgmod.Config, rows: usize) usize {
-        return rows * (@max(cfg_.intermediate, @max(cfg_.hidden, cfg_.gdnValueDim())) / 64) * 4;
-    }
     /// `xq`: the decode matmul's int8 activations (qwen35_qmm_split), 2 x 64 bytes per (row, group), widest input.
     pub fn xq(cfg_: cfgmod.Config, rows: usize) usize {
         return rows * (@max(cfg_.intermediate, @max(cfg_.hidden, cfg_.gdnValueDim())) / 64) * 128;
@@ -250,7 +246,7 @@ pub fn sizesOf(config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: 
         w.gdnGate(config, rows),
         w.attnPartial(config, rows, chunks), w.attnPartial(config, rows, chunks),
         w.attnPartialOut(config, rows, chunks),
-        w.logits(config, logit_rows), w.convSnap(config, rows), w.xsum(config, rows),
+        w.logits(config, logit_rows), w.convSnap(config, rows),
         w.xq(config, rows),          w.xscale(config, rows),
     };
 }
@@ -361,7 +357,6 @@ pub const Scratch = struct {
     po: Buffer,
     logits: Buffer,
     conv_snap: Buffer,
-    xsum: Buffer,
     xq: Buffer,
     xscale: Buffer,
     /// Optional per-kernel device timing; see `Profile`. Never set in serving.
@@ -379,7 +374,7 @@ pub const Scratch = struct {
     /// Allocator for `record_slots` appends; the caller's, since the scratch does not own one otherwise.
     gpa: std.mem.Allocator = undefined,
 
-    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "xsum", "xq", "xscale" };
+    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "xq", "xscale" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
     /// Recurrence-snapshot rows (a recording round's row budget). Each row costs one recurrence snapshot per linear layer:
@@ -543,52 +538,47 @@ const Run = struct {
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
     }
-    /// Prefill on the XMX engines: 5-7x the scalar kernel on the 27B shapes at the bf16 accuracy floor
-    /// (exp/kernels/qmm_xmx/xmx_check.py). Narrow outputs (the GDN a/b heads) keep the scalar kernel.
+    /// Prefill chunks on the int8 XMX engines (`q8x`, W4A8x2): 2.7-4.9x the bf16 XMX kernel on the big 27B shapes at
+    /// the same accuracy (exp/kernels/qmm_q8x/q8x_check.py). Narrow outputs (the GDN a/b heads) stay on q8.
     fn xmx(self: Run, l: xw.Linear, rows: usize) bool {
         return self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64;
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
-        // The XMX kernel reads X with 2D block reads, which need a 64-byte-aligned base; any other X takes q8.
-        if (self.xmx(l, rows) and @intFromPtr(x) % 64 == 0) {
-            try self.go(.qmm_xsum, geo.qmmXsum(@intCast(rows), @intCast(l.inputs / 64)), .{
-                x, @as(i32, @intCast(rows)), self.sc.xsum.ptr, @as(i32, @intCast(l.inputs)),
-            });
-            try self.goShape(.qmm_xmx, Profile.shapeKey(l.outputs, l.inputs), geo.qmmXmx(@intCast(rows), @intCast(l.outputs)), .{
-                x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)), self.sc.xsum.ptr,
-            });
-            return;
-        }
-        try self.q8(&.{.{ .l = l, .y = y }}, x, rows);
+        try self.projections(&.{.{ .l = l, .y = y }}, x, rows);
     }
     const Proj = struct { l: xw.Linear, y: *anyopaque };
-    /// Up to four projections of one input `x` (same `inputs`), narrow ones listed first. Those the XMX path takes go
-    /// one by one; the rest share one `q8` launch. A narrow projection alone is a few work-groups at latency (GDN a/b:
-    /// ~55 us each, 96 per token); dispatched first inside its wide siblings' launch it costs nothing extra.
+    /// Up to four projections of one input `x` (same `inputs`), narrow ones listed first. `x` is split into int8 once
+    /// (qwen35_qmm_split): the wide ones of a prefill chunk run on the int8 XMX engines one by one (`q8x`), the rest share
+    /// one `q8` launch. A narrow projection alone is a few work-groups at latency (GDN a/b: ~55 us each, 96 per token);
+    /// dispatched first inside its wide siblings' launch it costs nothing extra.
     fn projections(self: Run, ps: []const Proj, x: *anyopaque, rows: usize) rt.Error!void {
-        std.debug.assert(ps.len <= 4);
-        var rest: [4]Proj = undefined;
-        var n: usize = 0;
-        for (ps) |p| {
-            std.debug.assert(p.l.inputs == ps[0].l.inputs);
-            if (self.xmx(p.l, rows) and @intFromPtr(x) % 64 == 0) {
-                try self.projection(p.l, x, p.y, rows);
-            } else {
-                rest[n] = p;
-                n += 1;
-            }
-        }
-        if (n > 0) try self.q8(rest[0..n], x, rows);
-    }
-    /// The decode matmul: W4A8x2 on dp4a (qwen35_qmm_split + qwen35_qmm_q8, shared/qmm/qmm.cl). At the 100 W cap decode is
-    /// energy-bound and this does the math for ~0.4x the scalar kernel's energy: 281 vs 193 GB/s sustained on the widest
-    /// projection, rms error 0.50x the bf16 floor (exp/kernels/qmm_dp4a, exp/kernels/power). Rows are independent.
-    fn q8(self: Run, ps: []const Proj, x: *anyopaque, rows: usize) rt.Error!void {
         std.debug.assert(ps.len >= 1 and ps.len <= 4 and self.sc.cfg.group == 64);
         const k = ps[0].l.inputs;
         try self.go(.qmm_split, geo.qmmSplit(@intCast(rows), @intCast(k / 64)), .{
             x, @as(i32, @intCast(rows)), self.sc.xq.ptr, self.sc.xscale.ptr, @as(i32, @intCast(k)),
         });
+        var rest: [4]Proj = undefined;
+        var n: usize = 0;
+        for (ps) |p| {
+            std.debug.assert(p.l.inputs == k);
+            if (self.xmx(p.l, rows)) {
+                try self.goShape(.qmm_q8x, Profile.shapeKey(p.l.outputs, k), geo.qmmQ8x(@intCast(rows), @intCast(p.l.outputs)), .{
+                    self.sc.xq.ptr, self.sc.xscale.ptr, @as(i32, @intCast(rows)), self.wp(p.l.weight), self.wp(p.l.scales), self.wp(p.l.biases),
+                    p.y,            @as(i32, @intCast(p.l.outputs)), @as(i32, @intCast(k)),
+                });
+            } else {
+                rest[n] = p;
+                n += 1;
+            }
+        }
+        if (n > 0) try self.q8(rest[0..n], rows);
+    }
+    /// The decode matmul: W4A8x2 on dp4a (qwen35_qmm_split + qwen35_qmm_q8, shared/qmm/qmm.cl). At the 100 W cap decode is
+    /// energy-bound and this does the math for ~0.4x the scalar kernel's energy: 281 vs 193 GB/s sustained on the widest
+    /// projection, rms error 0.50x the bf16 floor (exp/kernels/qmm_dp4a, exp/kernels/power). Rows are independent.
+    /// Reads the int8 activations `projections` split.
+    fn q8(self: Run, ps: []const Proj, rows: usize) rt.Error!void {
+        const k = ps[0].l.inputs;
         var seg: [4]Proj = undefined;
         var outs: [4]u32 = @splat(0);
         var nn: [4]i32 = @splat(0);

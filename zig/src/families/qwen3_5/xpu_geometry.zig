@@ -22,20 +22,14 @@ pub fn qmmQ8(rows: u32, outputs: [4]u32) Geo {
     for (outputs) |o| tiles += ceilDiv(o, 64);
     return .{ .gx = @max(1, tiles) * 256, .gy = rows, .lx = 256 };
 }
-/// qwen35_qmm_xmx (shared/qmm, XMX prefill matmul): 64-work-item groups = 4 sub-groups x QX_NT (2) column tiles of 16
-/// = 128 columns, by QX_ROWS (16) rows. Must match the kernel's QX_ROWS / QX_NT defaults.
-pub const qmm_xmx_rows: u32 = 16;
-pub const qmm_xmx_cols: u32 = 128;
-pub fn qmmXmx(rows: u32, outputs: u32) Geo {
-    return .{ .gx = ceilDiv(outputs, qmm_xmx_cols) * 64, .gy = ceilDiv(rows, qmm_xmx_rows), .lx = 64 };
+/// qwen35_qmm_q8x (prefill matmul, int8 XMX): 64-item work-groups = 4 sub-groups x 16 columns (Q8X_NT = 1) by 16 rows
+/// (Q8X_RB = 2 row blocks of 8). Must match the kernel's Q8X_NT / Q8X_RB defaults.
+pub fn qmmQ8x(rows: u32, outputs: u32) Geo {
+    return .{ .gx = ceilDiv(outputs, 64) * 64, .gy = ceilDiv(rows, 16), .lx = 64 };
 }
 /// qwen35_qmm_split: one 64-item work-group per (quantization group, row).
 pub fn qmmSplit(rows: u32, groups: u32) Geo {
     return .{ .gx = groups * 64, .gy = rows, .lx = 64 };
-}
-/// qwen35_qmm_xsum: one work-item per (quantization group, row).
-pub fn qmmXsum(rows: u32, groups: u32) Geo {
-    return .{ .gx = ceilDiv(groups, 16) * 16, .gy = rows, .lx = 16 };
 }
 /// qwen35_qmm_pair: two same-shape N-column projections of one row, walked in lockstep. A work-group covers
 /// QW_HALF_TILE = 32 columns of each projection, so the grid is ceil(N/32) work-groups of 256 per row.

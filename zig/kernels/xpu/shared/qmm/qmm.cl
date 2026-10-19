@@ -285,112 +285,102 @@ __kernel void qwen35_qmm_q8(__global const uint* XQ, __global const float* XS, c
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// qwen35_qmm_xmx: the same affine int4 matmul on the XMX matrix engines, for prefill chunks (R >> 1).
-//
-// The scalar kernel is compute-bound at ~1.7 TFLOPS (int4 unpack + fp32 fma); the B70 sustains 121 TFLOPS bf16 on
-// `dpas` at the 100 W cap (exp/capability/BUDGET-27B.md). Per quantization group g (QW_GROUP inputs), column n:
-//     OUT += SC[n][g] * sum_k q x  +  BI[n][g] * sum_k x
-// - the scalar kernel's formula. Weights enter dpas as bf16(128 + q) = 0x4300 | q (exact; no float conversion), so
-// dpas yields sum (128+q) x and sum q x = that - 128 * sum x. sum_k x per (row, group) comes from
-// qwen35_qmm_xsum (one pass over X). Products are exact in fp32; only summation order differs from the scalar kernel
-// (not byte-identical: prefill only - decode and verify windows stay scalar, so the startup qualify is unaffected).
-// Tiles: a 16-lane sub-group owns 16 columns (lane = column) x QX_ROWS rows (QX_ROWS/8 dpas row blocks).
-// dpas layout (bf16, M8 K16 N16, SIMD16) verified on the card: exp/kernels/qmm_xmx/layout_check.py.
+// qwen35_qmm_q8x: prefill matmul as W4A8x2 on the int8 XMX engines (intel_sub_group_i8_i8_matrix_mad_k32).
+// Activations come from qwen35_qmm_split (per row and 64-input group: int8 hi and lo with x/s = hi + lo/254, in the
+// permuted order x0 x2 x4 x6 | x1 x3 x5 x7 per 8-input word, plus s and the exact group sum), so the int4 weights
+// unpack with two masks per word: e = w & 0x0F0F0F0F (nibbles 0,2,4,6), o = (w >> 4) & 0x0F0F0F0F (1,3,5,7), and the
+// B operand of a 32-input half group h is (e[4h], o[4h], e[4h+1], o[4h+1], ...) - 3 ALU ops per 8 weights where the
+// bf16 kernel spends ~16 (qx_pair). int8 dpas layout (exp/kernels/qmv_i8/layout_i8.py): A lane l holds K 2l, 2l+1
+// of 8 rows (short8), B lane n holds column n with int i = K 4i..4i+3, C lane n holds rows 0..7 as int32 - exact.
+// Each A operand is one 2D block read of the int8 activation rows (rows >= R read 0). Per group, column and row the
+// q8 formula: OUT += SC * (s * (sum q*hi + sum q*lo / 254)) + BI * sum x.
+// Tiles: a sub-group owns Q8X_NT x 16 columns x Q8X_RB x 8 rows; a work-group is 4 sub-groups across columns (geometry:
+// xpu_geometry.qmmQ8x). 1 x 2 measured best: 2.7-4.9x the bf16 XMX kernel this replaces on the big 27B shapes at
+// R = 128, rms 0.50x the bf16 floor (exp/kernels/qmm_q8x/q8x_check.py). Prefill only (not byte-identical to q8).
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 #pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
-#ifndef QX_ROWS
-#define QX_ROWS 16
+#ifndef Q8X_NT
+#define Q8X_NT 1
 #endif
-#define QX_RB (QX_ROWS / 8)
-inline int qx_pair(uint w, int j) {             // nibbles 2j, 2j+1 of w as two bf16 (128 + q), low half first
-    const uint t = (w >> (8 * j)) & 0xFFu;
-    return (int)((t & 0xFu) | ((t >> 4) << 16) | 0x43004300u);
-}
-// XS[r][g] = sum of X[r][k] over group g (fp32), the bias term's input. Grid: (G, R).
-__kernel void qwen35_qmm_xsum(__global const ushort* X, const int R, __global float* XS, const int K) {
-    const int g = get_global_id(0), r = get_global_id(1), G = K / QW_GROUP;
-    if (g >= G || r >= R) return;
-    const __global ushort* x = X + (size_t)r * K + (size_t)g * QW_GROUP;
-    float s = 0.0f;
-    for (int k = 0; k < QW_GROUP; ++k) s += intel_convert_as_bfloat16_float(x[k]);
-    XS[(size_t)r * G + g] = s;
-}
-#ifndef QX_NT
-#define QX_NT 2            // 16-column tiles per sub-group: one A load feeds QX_NT dpas
+#ifndef Q8X_RB
+#define Q8X_RB 2
 #endif
 __attribute__((intel_reqd_sub_group_size(16)))
-__kernel void qwen35_qmm_xmx(__global const ushort* X,   // bf16 bits, R x K
-                             const int R,
-                             __global const uint* W,     // N x (K/8) uint32, 8 int4 per word
-                             __global const ushort* SC,  // bf16 bits, N x (K/QW_GROUP)
-                             __global const ushort* BI,  // bf16 bits, N x (K/QW_GROUP)
-                             __global ushort* OUT,       // bf16 bits, R x N
-                             const int N, const int K,
-                             __global const float* XS) { // R x G, from qwen35_qmm_xsum
+__kernel void qwen35_qmm_q8x(__global const uint* XQ, __global const float* XS, const int R, __global const uint* W,
+                             __global const ushort* SC, __global const ushort* BI, __global ushort* OUT, const int N,
+                             const int K) {
     const int G = K / QW_GROUP;
     const int l = get_sub_group_local_id();
-    const int nbase = (get_global_id(0) / 16) * (16 * QX_NT);   // first column of this sub-group
-    const int r0 = get_global_id(1) * QX_ROWS;
-    int nc[QX_NT];
+    const int nbase = (get_global_id(0) / 16) * (16 * Q8X_NT);
+    const int r0 = get_global_id(1) * (8 * Q8X_RB);
+    const int rowb = G * (QW_GROUP * 2);       // bytes per XQ row (hi 64 + lo 64 per group)
+    int nc[Q8X_NT];
     #pragma unroll
-    for (int t = 0; t < QX_NT; ++t) nc[t] = min(nbase + 16 * t + l, N - 1);
-
-    float8 acc[QX_NT][QX_RB];
+    for (int t = 0; t < Q8X_NT; ++t) nc[t] = min(nbase + 16 * t + l, N - 1);
+    float8 acc[Q8X_NT][Q8X_RB];
     #pragma unroll
-    for (int t = 0; t < QX_NT; ++t)
+    for (int t = 0; t < Q8X_NT; ++t)
         #pragma unroll
-        for (int rb = 0; rb < QX_RB; ++rb) acc[t][rb] = (float8)(0.0f);
+        for (int rb = 0; rb < Q8X_RB; ++rb) acc[t][rb] = (float8)(0.0f);
 
     for (int g = 0; g < G; ++g) {
-        uint8 wg[QX_NT];
+        uint8 wg[Q8X_NT];
         #pragma unroll
-        for (int t = 0; t < QX_NT; ++t) wg[t] = vload8(g, W + (size_t)nc[t] * (K >> 3));
-        float8 cq[QX_NT][QX_RB];
+        for (int t = 0; t < Q8X_NT; ++t) wg[t] = vload8(g, W + (size_t)nc[t] * (K >> 3));
+        int8 hs[Q8X_NT][Q8X_RB], ls[Q8X_NT][Q8X_RB];
         #pragma unroll
-        for (int t = 0; t < QX_NT; ++t)
+        for (int t = 0; t < Q8X_NT; ++t)
             #pragma unroll
-            for (int rb = 0; rb < QX_RB; ++rb) cq[t][rb] = (float8)(0.0f);
+            for (int rb = 0; rb < Q8X_RB; ++rb) { hs[t][rb] = (int8)(0); ls[t][rb] = (int8)(0); }
         #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) {
-            int8 b[QX_NT];
+        for (int h = 0; h < 2; ++h) {
+            int8 b[Q8X_NT];
             #pragma unroll
-            for (int t = 0; t < QX_NT; ++t) {
-                const uint w0 = ((uint*)&wg[t])[2 * kk], w1 = ((uint*)&wg[t])[2 * kk + 1];
-                b[t] = (int8)(qx_pair(w0, 0), qx_pair(w0, 1), qx_pair(w0, 2), qx_pair(w0, 3),
-                              qx_pair(w1, 0), qx_pair(w1, 1), qx_pair(w1, 2), qx_pair(w1, 3));
-            }
-            const int k0 = g * QW_GROUP + kk * 16;
-            #pragma unroll
-            for (int rb = 0; rb < QX_RB; ++rb) {
-                // Rows r0+rb*8 .. +7, inputs k0 .. k0+15 in ONE 2D block read: lane l receives X[row m][k0 + l], m = 0..7,
-                // which is the dpas A layout (exp/kernels/block2d/layout2d.py); rows >= R read 0 (the hardware checks
-                // the height). Eight 1-row block reads per tile made the kernel latency-bound: 1.7-4.7x on every 27B
-                // shape at R = 128 (exp/kernels/qmm_xmx2/xmx2_check.py). X must be 64-byte aligned (projection checks).
-                short8 a;
-                intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)X, K * 2, R, K * 2, (int2)(k0, r0 + rb * 8), (__private ushort*)&a);
+            for (int t = 0; t < Q8X_NT; ++t) {
+                const uint* w = (const uint*)&wg[t];
                 #pragma unroll
-                for (int t = 0; t < QX_NT; ++t) cq[t][rb] = intel_sub_group_bf16_bf16_matrix_mad_k16(a, b[t], cq[t][rb]);
+                for (int j = 0; j < 4; ++j) {
+                    const uint wj = w[4 * h + j];
+                    ((int*)&b[t])[2 * j] = (int)(wj & 0x0F0F0F0Fu);
+                    ((int*)&b[t])[2 * j + 1] = (int)((wj >> 4) & 0x0F0F0F0Fu);
+                }
+            }
+            #pragma unroll
+            for (int rb = 0; rb < Q8X_RB; ++rb) {
+                short8 ah, al;
+                const int xh = (g * (QW_GROUP * 2) + 32 * h) / 2, y = r0 + rb * 8;   // 16-bit element index, row
+                intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)XQ, rowb, R, rowb, (int2)(xh, y), (__private ushort*)&ah);
+                intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)XQ, rowb, R, rowb, (int2)(xh + QW_GROUP / 2, y), (__private ushort*)&al);
+                #pragma unroll
+                for (int t = 0; t < Q8X_NT; ++t) {
+                    hs[t][rb] = intel_sub_group_i8_i8_matrix_mad_k32(ah, b[t], hs[t][rb]);
+                    ls[t][rb] = intel_sub_group_i8_i8_matrix_mad_k32(al, b[t], ls[t][rb]);
+                }
             }
         }
         #pragma unroll
-        for (int rb = 0; rb < QX_RB; ++rb) {
-            float8 sx;
+        for (int rb = 0; rb < Q8X_RB; ++rb) {
+            float8 sv, sm;
             #pragma unroll
-            for (int m = 0; m < 8; ++m) ((float*)&sx)[m] = XS[(size_t)min(r0 + rb * 8 + m, R - 1) * G + g];
+            for (int m = 0; m < 8; ++m) {
+                const float2 ss = vload2((size_t)min(r0 + rb * 8 + m, R - 1) * G + g, XS);
+                ((float*)&sv)[m] = ss.x; ((float*)&sm)[m] = ss.y;
+            }
             #pragma unroll
-            for (int t = 0; t < QX_NT; ++t) {
+            for (int t = 0; t < Q8X_NT; ++t) {
                 const float sc = intel_convert_as_bfloat16_float(SC[(size_t)nc[t] * G + g]);
                 const float bi = intel_convert_as_bfloat16_float(BI[(size_t)nc[t] * G + g]);
-                acc[t][rb] = fma(bi, sx, fma(sc, cq[t][rb] - 128.0f * sx, acc[t][rb]));
+                const float8 sq = fma(convert_float8(ls[t][rb]), (float8)(1.0f / 254.0f), convert_float8(hs[t][rb])) * sv;
+                acc[t][rb] = fma((float8)(bi), sm, fma((float8)(sc), sq, acc[t][rb]));
             }
         }
     }
     #pragma unroll
-    for (int t = 0; t < QX_NT; ++t) {
+    for (int t = 0; t < Q8X_NT; ++t) {
         const int n = nbase + 16 * t + l;
         if (n < N) {
             #pragma unroll
-            for (int rb = 0; rb < QX_RB; ++rb)
+            for (int rb = 0; rb < Q8X_RB; ++rb)
                 #pragma unroll
                 for (int m = 0; m < 8; ++m) {
                     const int r = r0 + rb * 8 + m;
