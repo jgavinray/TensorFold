@@ -29,7 +29,7 @@ fn lockPath(buf: []u8, dir: []const u8, bdf: []const u8) ?[:0]u8 {
 /// Tries to lock one specific card without waiting. A card with no driver bound cannot be opened, so it is skipped
 /// (`null`): the lock pool is the usable cards, matching xpu_harness.py, which moves on when a card's preflight fails.
 pub fn tryCard(dir: []const u8, index: usize, paths: preflight.Paths) Error!?Held {
-    if (!preflight.isBound(paths, device.cards[index])) return null;
+    if (!preflight.isUsable(paths, device.cards[index])) return null;
     var buf: [256]u8 = undefined;
     const path = lockPath(&buf, dir, device.cards[index]) orelse return error.Invalid;
     const f = sys.File.openLock(path) orelse return error.CannotOpenLock;
@@ -84,7 +84,10 @@ test "locks exclude one another, free on release, and a pool of two serves two h
     defer std.testing.allocator.free(real);
     // The lock pool is the driver-bound cards, so the fixture marks both bound under a fake sysfs root.
     var d: [96]u8 = undefined;
-    for (device.cards) |card| try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "pci/{s}/driver", .{card}));
+    for (device.cards) |card| {
+        try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "pci/{s}/driver", .{card}));
+        try preflight.markIntelDisplay(&tmp, "pci", card);
+    }
     var root: [200]u8 = undefined;
     const rl = (try std.fmt.bufPrint(&root, "{s}/pci", .{real})).len;
     const paths: preflight.Paths = .{ .pci_root = root[0..rl] };
@@ -109,6 +112,7 @@ test "the lock pool skips a card with no driver bound" {
     // Only the second card is bound: both `acquire`s must land on it (the first is skipped, never handed out).
     var d: [96]u8 = undefined;
     try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "pci/{s}/driver", .{device.cards[1]}));
+    for (device.cards) |card| try preflight.markIntelDisplay(&tmp, "pci", card);
     var root: [200]u8 = undefined;
     const rl = (try std.fmt.bufPrint(&root, "{s}/pci", .{real})).len;
     const paths: preflight.Paths = .{ .pci_root = root[0..rl] };

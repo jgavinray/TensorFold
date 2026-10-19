@@ -17,7 +17,7 @@ fn open(s: *Session, card: usize) !void {
 /// lock pool, so `only` would wait out `wait_ms` and time out. This suite tests the usable cards; the host may
 /// legitimately hold a parked one.
 fn openCard(s: *Session, card: usize) !bool {
-    if (!rt.preflight.isBound(.{}, rt.device.cards[card])) {
+    if (!rt.preflight.isUsable(.{}, rt.device.cards[card])) {
         std.debug.print("card {d} ({s}) has no driver bound; skipped\n", .{ card, rt.device.cards[card] });
         return false;
     }
@@ -78,7 +78,7 @@ test "xpu req2: preflight on the live host reads 100 W caps and 24 GiB" {
     var d: rt.preflight.Diag = .{};
     // Every bound card must pass preflight; a parked card is skipped by the sweep, so it is not asserted.
     for (rt.device.cards) |card| {
-        if (!rt.preflight.isBound(.{}, card)) {
+        if (!rt.preflight.isUsable(.{}, card)) {
             std.debug.print("card {s} has no driver bound; skipped\n", .{card});
             continue;
         }
