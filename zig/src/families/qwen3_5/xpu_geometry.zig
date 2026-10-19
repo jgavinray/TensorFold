@@ -16,8 +16,8 @@ fn ceilDiv(a: u32, b: u32) u32 {
 pub fn qmm(rows: u32, outputs: u32) Geo {
     return .{ .gx = @max(1, ceilDiv(outputs, 64)) * 256, .gy = rows, .lx = 256 };
 }
-/// qwen35_qmm_multi: up to four projections in one launch, each its own run of QW_TILE = 64-column work-groups.
-pub fn qmmMulti(rows: u32, outputs: [4]u32) Geo {
+/// qwen35_qmm_q8 (decode matmul): up to four projections in one launch, each its own run of QW_TILE = 64-column work-groups.
+pub fn qmmQ8(rows: u32, outputs: [4]u32) Geo {
     var tiles: u32 = 0;
     for (outputs) |o| tiles += ceilDiv(o, 64);
     return .{ .gx = @max(1, tiles) * 256, .gy = rows, .lx = 256 };
@@ -98,9 +98,9 @@ test "geometry matches launch.py (2B defaults)" {
     try expect(qmm(1, 2048), 32 * 256, 1, 1, 256);
     try expect(qmm(176, 6144), 96 * 256, 176, 1, 256);
     try expect(qmm(5, 17), 256, 5, 1, 256);
-    // qmm_multi: the segments' 64-column tiles back to back (27B GDN a, b, qkv, z: 1 + 1 + 160 + 96)
-    try expect(qmmMulti(1, .{ 48, 48, 10240, 6144 }), 258 * 256, 1, 1, 256);
-    try expect(qmmMulti(3, .{ 1024, 1024, 12288, 0 }), 224 * 256, 3, 1, 256);
+    // qmm_q8: the segments' 64-column tiles back to back (27B GDN a, b, qkv, z: 1 + 1 + 160 + 96)
+    try expect(qmmQ8(1, .{ 48, 48, 10240, 6144 }), 258 * 256, 1, 1, 256);
+    try expect(qmmQ8(3, .{ 1024, 1024, 12288, 0 }), 224 * 256, 3, 1, 256);
     // qmm_pair: 32 columns of each projection per 256-work-item group
     try expect(qmmPair(1, 16), 256, 1, 1, 256);
     try expect(qmmPair(176, 16), 256, 176, 1, 256);

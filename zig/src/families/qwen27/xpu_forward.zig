@@ -64,12 +64,12 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, qmm_multi, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, qmm_split, qmm_q8, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
-            .qmm_xmx, .qmm_xsum, .qmm_multi => .qmm,
+            .qmm_xmx, .qmm_xsum, .qmm_split, .qmm_q8 => .qmm,
             inline else => |t| @field(Module, @tagName(t)),
         };
     }
@@ -220,6 +220,14 @@ pub const widths = struct {
     pub fn xsum(cfg_: cfgmod.Config, rows: usize) usize {
         return rows * (@max(cfg_.intermediate, @max(cfg_.hidden, cfg_.gdnValueDim())) / 64) * 4;
     }
+    /// `xq`: the decode matmul's int8 activations (qwen35_qmm_split), 2 x 64 bytes per (row, group), widest input.
+    pub fn xq(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * (@max(cfg_.intermediate, @max(cfg_.hidden, cfg_.gdnValueDim())) / 64) * 128;
+    }
+    /// `xscale`: the decode matmul's per-(row, group) int8 scale and exact input sum, fp32 each.
+    pub fn xscale(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * (@max(cfg_.intermediate, @max(cfg_.hidden, cfg_.gdnValueDim())) / 64) * 8;
+    }
 };
 
 /// The byte size of every `Scratch` buffer, in `Scratch.names` order. Each entry is the widest writer's width (see
@@ -242,6 +250,7 @@ pub fn sizesOf(config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: 
         w.attnPartial(config, rows, chunks), w.attnPartial(config, rows, chunks),
         w.attnPartialOut(config, rows, chunks),
         w.logits(config, logit_rows), w.convSnap(config, rows), w.xsum(config, rows),
+        w.xq(config, rows),          w.xscale(config, rows),
     };
 }
 
@@ -352,6 +361,8 @@ pub const Scratch = struct {
     logits: Buffer,
     conv_snap: Buffer,
     xsum: Buffer,
+    xq: Buffer,
+    xscale: Buffer,
     /// Optional per-kernel device timing; see `Profile`. Never set in serving.
     prof: ?Profile = null,
     /// Per-layer window snapshots for shared rounds, indexed by the absolute scratch row of the segment's last row.
@@ -367,7 +378,7 @@ pub const Scratch = struct {
     /// Allocator for `record_slots` appends; the caller's, since the scratch does not own one otherwise.
     gpa: std.mem.Allocator = undefined,
 
-    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "xsum" };
+    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "xsum", "xq", "xscale" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
     /// Recurrence-snapshot rows (a recording round's row budget). Each row costs one recurrence snapshot per linear layer:
@@ -530,20 +541,16 @@ const Run = struct {
             });
             return;
         }
-        try self.goShape(.qmm, Profile.shapeKey(l.outputs, l.inputs), geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
-            x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
-        });
+        try self.q8(&.{.{ .l = l, .y = y }}, x, rows);
     }
     const Proj = struct { l: xw.Linear, y: *anyopaque };
     /// Up to four projections of one input `x` (same `inputs`), narrow ones listed first. Those the XMX path takes go
-    /// one by one; the rest share one `qmm_multi` launch, every column bit-identical to `qmm`'s. A narrow projection
-    /// alone is a few work-groups at latency (GDN a/b: ~55 us each, 96 per token); dispatched first inside its wide
-    /// siblings' launch it costs nothing extra (exp/kernels/qmm_multi/multi_check.py: -12.6 ms per 27B token).
+    /// one by one; the rest share one `q8` launch. A narrow projection alone is a few work-groups at latency (GDN a/b:
+    /// ~55 us each, 96 per token); dispatched first inside its wide siblings' launch it costs nothing extra.
     fn projections(self: Run, ps: []const Proj, x: *anyopaque, rows: usize) rt.Error!void {
         std.debug.assert(ps.len <= 4);
         var rest: [4]Proj = undefined;
         var n: usize = 0;
-        var outputs: u32 = 0;
         for (ps) |p| {
             std.debug.assert(p.l.inputs == ps[0].l.inputs);
             if (self.xmx(p.l, rows)) {
@@ -551,23 +558,33 @@ const Run = struct {
             } else {
                 rest[n] = p;
                 n += 1;
-                outputs += @intCast(p.l.outputs);
             }
         }
-        if (n == 0) return;
-        if (n == 1) return self.projection(rest[0].l, x, rest[0].y, rows);
-        var outs: [4]u32 = @splat(0);
+        if (n > 0) try self.q8(rest[0..n], x, rows);
+    }
+    /// The decode matmul: W4A8x2 on dp4a (qwen35_qmm_split + qwen35_qmm_q8, shared/qmm/qmm.cl). At the 100 W cap decode is
+    /// energy-bound and this does the math for ~0.4x the scalar kernel's energy: 281 vs 193 GB/s sustained on the widest
+    /// projection, rms error 0.50x the bf16 floor (exp/kernels/qmm_dp4a, exp/kernels/power). Rows are independent.
+    fn q8(self: Run, ps: []const Proj, x: *anyopaque, rows: usize) rt.Error!void {
+        std.debug.assert(ps.len >= 1 and ps.len <= 4 and self.sc.cfg.group == 64);
+        const k = ps[0].l.inputs;
+        try self.go(.qmm_split, geo.qmmXsum(@intCast(rows), @intCast(k / 64)), .{
+            x, @as(i32, @intCast(rows)), self.sc.xq.ptr, self.sc.xscale.ptr, @as(i32, @intCast(k)),
+        });
         var seg: [4]Proj = undefined;
+        var outs: [4]u32 = @splat(0);
         var nn: [4]i32 = @splat(0);
+        var total: u32 = 0;
         for (0..4) |i| {
-            seg[i] = rest[if (i < n) i else 0]; // absent segments: N = 0, pointers never read
-            if (i < n) {
-                outs[i] = @intCast(rest[i].l.outputs);
-                nn[i] = @intCast(rest[i].l.outputs);
+            seg[i] = ps[if (i < ps.len) i else 0]; // absent segments: N = 0, pointers never read
+            if (i < ps.len) {
+                outs[i] = @intCast(ps[i].l.outputs);
+                nn[i] = @intCast(ps[i].l.outputs);
+                total += outs[i];
             }
         }
-        try self.goShape(.qmm_multi, Profile.shapeKey(outputs, rest[0].l.inputs), geo.qmmMulti(@intCast(rows), outs), .{
-            x,                                          @as(i32, @intCast(rows)),  @as(i32, @intCast(rest[0].l.inputs)),
+        try self.goShape(.qmm_q8, Profile.shapeKey(total, k), geo.qmmQ8(@intCast(rows), outs), .{
+            self.sc.xq.ptr,                                          self.sc.xscale.ptr,  @as(i32, @intCast(rows)), @as(i32, @intCast(k)),
             self.wp(seg[0].l.weight), self.wp(seg[0].l.scales), self.wp(seg[0].l.biases), seg[0].y, nn[0],
             self.wp(seg[1].l.weight), self.wp(seg[1].l.scales), self.wp(seg[1].l.biases), seg[1].y, nn[1],
             self.wp(seg[2].l.weight), self.wp(seg[2].l.scales), self.wp(seg[2].l.biases), seg[2].y, nn[2],
