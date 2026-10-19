@@ -28,6 +28,12 @@ pub fn qmmQ8(rows: u32, outputs: [4]u32) Geo {
 pub fn qmmQ8x(rows: u32, outputs: u32) Geo {
     return .{ .gx = ceilDiv(outputs, 32) * 256, .gy = ceilDiv(rows, 128), .lx = 256 };
 }
+/// qwen35_qmm_q8xs (decode/verify rows, int8 XMX, byte-identical to q8): 256-item work-groups = 16 sub-groups that
+/// split the 32 lane classes of the work-group's 32 columns (Q8XS_NT = 2 tiles of 16) x 8 rows. Must match the kernel's
+/// Q8XS_NT / Q8XS_SG.
+pub fn qmmQ8xs(rows: u32, outputs: u32) Geo {
+    return .{ .gx = ceilDiv(outputs, 32) * 256, .gy = ceilDiv(rows, 8), .lx = 256 };
+}
 /// qwen35_qmm_split: one 64-item work-group per (quantization group, row).
 pub fn qmmSplit(rows: u32, groups: u32) Geo {
     return .{ .gx = groups * 64, .gy = rows, .lx = 64 };
@@ -149,5 +155,8 @@ test "geometry scales to the 27B shapes" {
     // q8x: 32 columns x 128 rows per 256-item work-group (17408 outputs, a 128-row chunk; a 37-row tail)
     try expect(qmmQ8x(128, 17408), 544 * 256, 1, 1, 256);
     try expect(qmmQ8x(37, 48), 2 * 256, 1, 1, 256);
+    // q8xs: 32 columns x 8 rows per 256-item work-group (the lm_head, a 2-row window; 8 streams x 2 rows)
+    try expect(qmmQ8xs(2, 248320), 7760 * 256, 1, 1, 256);
+    try expect(qmmQ8xs(16, 5120), 160 * 256, 2, 1, 256);
     try expect(attnMerge(4, 24), 32, 24, 4, 32);
 }
