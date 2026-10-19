@@ -170,7 +170,8 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
 // Up to four projections of the same input in one launch (work-groups numbered segment by segment in argument
 // order, so callers list narrow projections first: alone, a 48-output projection is one work-group at latency;
 // dispatched first it finishes under its wide siblings' traffic). An absent segment has N = 0. Each row is computed
-// alone, so a row's bits do not depend on R (decode and verify windows agree byte for byte).
+// alone, so a row's bits do not depend on R (decode and verify windows agree byte for byte). Per column, lane l
+// accumulates groups l, l+32, ... and the 32 lane partials are summed in lane order (qwen35_qmm_q8xs relies on it).
 
 // One 64-item work-group per (group, row): item k owns input k; max and sum are work-group reductions.
 __attribute__((reqd_work_group_size(QW_GROUP, 1, 1)))
@@ -247,16 +248,12 @@ inline void q8_tile(__global const uint* XQ, __global const float* XS, const int
     #pragma unroll
     for (int i = 0; i < 8; ++i) red[s][i][l] = acc[i];
     barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int st = QW_LANES / 2; st > 0; st >>= 1) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i)
-            if (l < st) red[s][i][l] += red[s][i][l + st];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (l == 0) {
-        for (int i = 0; i < nl; ++i)
-            OUT[(size_t)r * N + n0 + i] = intel_convert_bfloat16_as_ushort(red[s][i][0]);
+    // Lane i sums column i's 32 lane partials in lane order - the order qwen35_qmm_q8xs replays, so the two kernels
+    // agree byte for byte.
+    if (l < nl) {
+        float v = red[s][l][0];
+        for (int j = 1; j < QW_LANES; ++j) v += red[s][l][j];
+        OUT[(size_t)r * N + n0 + l] = intel_convert_bfloat16_as_ushort(v);
     }
 }
 
@@ -393,5 +390,106 @@ __kernel void qwen35_qmm_q8x(__global const uint* XQ, __global const float* XS, 
                     if (r < R) OUT[(size_t)r * N + n] = intel_convert_bfloat16_as_ushort(((float*)&acc[t][rb])[m]);
                 }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// qwen35_qmm_q8xs: qwen35_qmm_q8 on the int8 XMX engines for decode and verify rows - weights leave DRAM once per 8
+// rows instead of once per row - and byte-identical to it per row, so the engine picks either by speed. Per group,
+// row and column both kernels hold the same exact integer sums (dp4a there, dpas here) and apply the same fp32
+// formula; the fp32 order across groups is q8's: per lane class c (groups c, c+32, ...) a partial with q8's per-lane
+// chain, the 32 class partials summed in class order. A work-group owns Q8XS_NT x 16 columns x 8 rows (rows >= R read
+// 0); its 16 sub-groups split the classes, sub-group s taking 2s and 2s+1 - the two halves of the same 64-byte weight
+// lines - and leave the partials in local memory, where each work-item sums one (column, row) in class order. Few
+// wide work-groups keep the weights being read at once compact: with one sub-group a work-group, ~2000 resident
+// work-groups walked ~170 MB of weights at once and the lm_head ran at 24-43 GB/s (exp/kernels/qmm_q8xs).
+#ifndef Q8XS_NT
+#define Q8XS_NT 2
+#endif
+#define Q8XS_SG 16
+__attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(16 * Q8XS_SG, 1, 1)))
+__kernel void qwen35_qmm_q8xs(__global const uint* XQ, __global const float* XS, const int R, __global const uint* W,
+                              __global const ushort* SC, __global const ushort* BI, __global ushort* OUT, const int N,
+                              const int K) {
+    __local float part[QW_LANES][8][16 * Q8XS_NT];   // [class][row][column]
+    const int G = K / QW_GROUP;
+    const int l = get_sub_group_local_id();
+    const int sg = get_local_id(0) / 16;
+    const int nbase = get_group_id(0) * (16 * Q8XS_NT);
+    const int r0 = get_group_id(1) * 8;
+    const int rows = min(8, R - r0);
+    const int rowb = G * (QW_GROUP * 2);
+    int nc[Q8XS_NT];
+    #pragma unroll
+    for (int t = 0; t < Q8XS_NT; ++t) nc[t] = min(nbase + 16 * t + l, N - 1);
+    #pragma unroll
+    for (int cc = 0; cc < QW_LANES / Q8XS_SG; ++cc) {
+        const int c = sg * (QW_LANES / Q8XS_SG) + cc;
+        float8 p[Q8XS_NT];
+        #pragma unroll
+        for (int t = 0; t < Q8XS_NT; ++t) p[t] = (float8)(0.0f);
+        for (int g = c; g < G; g += QW_LANES) {
+            uint8 wg[Q8XS_NT];
+            #pragma unroll
+            for (int t = 0; t < Q8XS_NT; ++t) wg[t] = vload8(g, W + (size_t)nc[t] * (K >> 3));
+            int8 hs[Q8XS_NT], ls[Q8XS_NT];
+            #pragma unroll
+            for (int t = 0; t < Q8XS_NT; ++t) { hs[t] = (int8)(0); ls[t] = (int8)(0); }
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                int8 b[Q8XS_NT];
+                #pragma unroll
+                for (int t = 0; t < Q8XS_NT; ++t) {
+                    const uint* w = (const uint*)&wg[t];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint wj = w[4 * h + j];
+                        ((int*)&b[t])[2 * j] = (int)(wj & 0x0F0F0F0Fu);
+                        ((int*)&b[t])[2 * j + 1] = (int)((wj >> 4) & 0x0F0F0F0Fu);
+                    }
+                }
+                short8 ah, al;
+                const int xh = (g * (QW_GROUP * 2) + 32 * h) / 2;
+                intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)XQ, rowb, R, rowb, (int2)(xh, r0), (__private ushort*)&ah);
+                intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)XQ, rowb, R, rowb, (int2)(xh + QW_GROUP / 2, r0), (__private ushort*)&al);
+                #pragma unroll
+                for (int t = 0; t < Q8XS_NT; ++t) {
+                    hs[t] = intel_sub_group_i8_i8_matrix_mad_k32(ah, b[t], hs[t]);
+                    ls[t] = intel_sub_group_i8_i8_matrix_mad_k32(al, b[t], ls[t]);
+                }
+            }
+            float sc[Q8XS_NT], bi[Q8XS_NT];
+            #pragma unroll
+            for (int t = 0; t < Q8XS_NT; ++t) {
+                sc[t] = intel_convert_as_bfloat16_float(SC[(size_t)nc[t] * G + g]);
+                bi[t] = intel_convert_as_bfloat16_float(BI[(size_t)nc[t] * G + g]);
+            }
+            // the epilogue only for the rows that exist (uniform branch): at the 100 W cap its ALU is speed
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                if (m < rows) {
+                    const float2 ss = vload2((size_t)(r0 + m) * G + g, XS);
+                    #pragma unroll
+                    for (int t = 0; t < Q8XS_NT; ++t) {
+                        const float sq = fma((float)((int*)&ls[t])[m], 1.0f / 254.0f, (float)((int*)&hs[t])[m]) * ss.x;
+                        ((float*)&p[t])[m] = fma(bi[t], ss.y, fma(sc[t], sq, ((float*)&p[t])[m]));
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < Q8XS_NT; ++t)
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) part[c][m][16 * t + l] = ((float*)&p[t])[m];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // work-item i sums (column i % (16 NT), row i / (16 NT)) over the classes in order, as q8's lane 0..31 sum does
+    for (int i = get_local_id(0); i < 8 * 16 * Q8XS_NT; i += 16 * Q8XS_SG) {
+        const int col = i % (16 * Q8XS_NT), m = i / (16 * Q8XS_NT);
+        const int n = nbase + col, r = r0 + m;
+        float v = part[0][m][col];
+        for (int c = 1; c < QW_LANES; ++c) v += part[c][m][col];
+        if (n < N && r < R) OUT[(size_t)r * N + n] = intel_convert_bfloat16_as_ushort(v);
     }
 }

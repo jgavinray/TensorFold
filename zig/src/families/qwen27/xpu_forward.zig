@@ -64,12 +64,12 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_split, qmm_q8, qmm_q8x, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_split, qmm_q8, qmm_q8x, qmm_q8xs, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
-            .qmm_split, .qmm_q8, .qmm_q8x => .qmm,
+            .qmm_split, .qmm_q8, .qmm_q8x, .qmm_q8xs => .qmm,
             .attn_partial_gqa => .attn_partial,
             inline else => |t| @field(Module, @tagName(t)),
         };
@@ -543,6 +543,12 @@ const Run = struct {
     fn xmx(self: Run, l: xw.Linear, rows: usize) bool {
         return self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64;
     }
+    /// Verify windows and shared rounds (2+ rows, not prefill) on the int8 XMX engines (`q8xs`): weights leave DRAM once
+    /// per 8 rows instead of once per row, and every row's bits equal q8's (exp/kernels/qmm_q8xs/q8xs_check.py), so the
+    /// startup qualify's window == solo rule holds. One row stays on q8, the faster of the two there.
+    fn xmxRows(self: Run, l: xw.Linear, rows: usize) bool {
+        return !self.prefill and rows >= 2 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64;
+    }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
         try self.projections(&.{.{ .l = l, .y = y }}, x, rows);
     }
@@ -563,6 +569,11 @@ const Run = struct {
             std.debug.assert(p.l.inputs == k);
             if (self.xmx(p.l, rows)) {
                 try self.goShape(.qmm_q8x, Profile.shapeKey(p.l.outputs, k), geo.qmmQ8x(@intCast(rows), @intCast(p.l.outputs)), .{
+                    self.sc.xq.ptr, self.sc.xscale.ptr, @as(i32, @intCast(rows)), self.wp(p.l.weight), self.wp(p.l.scales), self.wp(p.l.biases),
+                    p.y,            @as(i32, @intCast(p.l.outputs)), @as(i32, @intCast(k)),
+                });
+            } else if (self.xmxRows(p.l, rows)) {
+                try self.goShape(.qmm_q8xs, Profile.shapeKey(p.l.outputs, k), geo.qmmQ8xs(@intCast(rows), @intCast(p.l.outputs)), .{
                     self.sc.xq.ptr, self.sc.xscale.ptr, @as(i32, @intCast(rows)), self.wp(p.l.weight), self.wp(p.l.scales), self.wp(p.l.biases),
                     p.y,            @as(i32, @intCast(p.l.outputs)), @as(i32, @intCast(k)),
                 });
