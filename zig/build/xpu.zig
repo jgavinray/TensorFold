@@ -21,6 +21,27 @@ fn oclocAvailable(b: *std.Build, name: []const u8) bool {
     return false;
 }
 
+/// The shared Qwen kernel modules (zig/kernels/xpu/shared/<key>/<key>.cl) the 2B and the 27B builds embed.
+const q2_keys = [_][]const u8{ "layout", "norm", "norm_nores", "qmm", "qmm_pair", "norm_qmm", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" };
+const q27_keys = [_][]const u8{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" };
+
+/// ocloc's module for one shared Qwen kernel: <key>_<device>.bin compiled with `options`.
+fn oclocQwen(b: *std.Build, ocloc: []const u8, device: []const u8, options: []const u8, comptime key: []const u8, tag: []const u8) std.Build.LazyPath {
+    const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", device, "-options", options, "-file" });
+    c.addFileArg(b.path("zig/kernels/xpu/shared/" ++ key ++ "/" ++ key ++ ".cl"));
+    c.addArg("-out_dir");
+    return c.addOutputDirectoryArg(b.fmt("{s}-{s}-out", .{ tag, key })).path(b, b.fmt("{s}_{s}.bin", .{ key, device }));
+}
+
+/// check-prebuilt `mode` (check | write) over one committed prebuilt dir; runs from the build root.
+fn prebuiltManifest(b: *std.Build, tool: *std.Build.Step.Compile, mode: []const u8, dir: []const u8, options: []const u8, keys: []const []const u8) *std.Build.Step.Run {
+    const run = b.addRunArtifact(tool);
+    run.setCwd(b.path("."));
+    run.addArgs(&.{ mode, dir, options });
+    run.addArgs(keys);
+    return run;
+}
+
 /// xpu-host-test (part of `test`), xpu-test (build + run on the card), xpu-gpu-build, xpu-kernel-exact (CLI install).
 /// The Qwen kernel sources under zig/kernels/xpu/shared/ carry the 2B shape values as preprocessor defaults; a 27B
 /// build overrides them by passing `-Dqwen-shape-defines="-DQW_HIDDEN=5120 -D..."` (see the defines at the top of each
@@ -51,6 +72,11 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const xpu_device = b.option([]const u8, "xpu-device", "ocloc device name for the XPU test kernels") orelse "bmg";
     // Extra -D flags for the shared Qwen kernels (27B: the model-shape overrides; empty = 2B defaults).
     const shape_defines = b.option([]const u8, "qwen-shape-defines", "space-separated -D flags for the shared Qwen kernels (empty = 2B defaults)") orelse "";
+    // The committed prebuilt Qwen modules are checked against their sources before they are embedded, so an edited
+    // kernel without a refreshed module fails the build (zig/build/check_prebuilt.zig); `xpu-prebuilt-refresh` below
+    // rebuilds them. A `prebuilt:<dir>` from an earlier build is the caller's own and is not checked.
+    const check_tool = b.addExecutable(.{ .name = "check-prebuilt", .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_prebuilt.zig"), .target = b.graph.host }) });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_prebuilt.zig"), .target = b.graph.host }) })).step);
 
     // Test kernels, compiled to native binaries: <name>_<device>.bin. The path is passed to the tests as a build option.
     // `-Dtest-kernels=prebuilt[:<dir>]` embeds modules built earlier on a host without ocloc (same fallback the Qwen
@@ -138,17 +164,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     // A 27B build supplies the model-shape -D overrides (space-separated); empty keeps the 2B defaults.
     // ocloc takes compile options as one string after -options, so the -D flags belong there, not as bare args.
     const opt_string = b.fmt("-cl-std=CL3.0 {s}", .{shape_defines});
-    inline for (.{ "layout", "norm", "norm_nores", "qmm", "qmm_pair", "norm_qmm", "mlp_act", "mlp_act_down", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+    if (std.mem.eql(u8, qwen_kernels, "prebuilt")) qk_files.step.dependOn(&prebuiltManifest(b, check_tool, "check", "zig/kernels/xpu/prebuilt", opt_string, &q2_keys).step);
+    inline for (q2_keys) |name| {
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         if (prebuilt) |dir| {
             const src = b.pathJoin(&.{ dir, file });
             _ = qk_files.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
         } else {
-            const c = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", opt_string, "-file" });
-            c.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
-            c.addArg("-out_dir");
-            const out = c.addOutputDirectoryArg("qwen35-" ++ name ++ "-out");
-            _ = qk_files.addCopyFile(out.path(b, file), file);
+            _ = qk_files.addCopyFile(oclocQwen(b, ocloc, xpu_device, opt_string, name, "qwen35"), file);
         }
         qk_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ qk_src, name, file });
     }
@@ -186,19 +209,27 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     const q27_files = b.addWriteFiles();
     var q27_src: []const u8 = "//! Compiled Qwen kernel binaries for Qwen 3.8 27B, embedded (see zig/build/xpu.zig).\n";
     const q27_opt = b.fmt("-cl-std=CL3.0 {s}", .{q27_defines});
-    inline for (.{ "layout", "norm", "norm_nores", "qmm", "mlp_act", "gdn_pre", "gdn_chain", "gdn_post", "attn_partial", "attn_merge" }) |name| {
+    if (std.mem.eql(u8, q27_kernels, "prebuilt")) q27_files.step.dependOn(&prebuiltManifest(b, check_tool, "check", "zig/kernels/xpu/prebuilt-27b", q27_opt, &q27_keys).step);
+    inline for (q27_keys) |name| {
         const file = b.fmt("{s}_{s}.bin", .{ name, xpu_device });
         if (q27_prebuilt) |dir| {
             const src = b.pathJoin(&.{ dir, file });
             _ = q27_files.addCopyFile(if (std.fs.path.isAbsolute(src)) b.graph.cwdRelativePath(src) else b.path(src), file);
         } else {
-            const cc = b.addSystemCommand(&.{ ocloc, "compile", "-device", xpu_device, "-options", q27_opt, "-file" });
-            cc.addFileArg(b.path("zig/kernels/xpu/shared/" ++ name ++ "/" ++ name ++ ".cl"));
-            cc.addArg("-out_dir");
-            const out = cc.addOutputDirectoryArg("qwen27-" ++ name ++ "-out");
-            _ = q27_files.addCopyFile(out.path(b, file), file);
+            _ = q27_files.addCopyFile(oclocQwen(b, ocloc, xpu_device, q27_opt, name, "qwen27"), file);
         }
         q27_src = b.fmt("{s}pub const {s} align(64) = @embedFile(\"{s}\").*;\n", .{ q27_src, name, file });
+    }
+    // `zig build xpu-prebuilt-refresh` (needs ocloc): recompile every committed prebuilt Qwen module from the current
+    // sources (2B defaults, 27B defines) into zig/kernels/xpu/prebuilt{,-27b}/ and rewrite their SOURCES manifests.
+    const refresh = b.step("xpu-prebuilt-refresh", "Recompile the committed prebuilt Qwen kernel modules with ocloc and rewrite their SOURCES");
+    const q2_opt = "-cl-std=CL3.0 ";
+    inline for (.{ .{ "zig/kernels/xpu/prebuilt", q2_opt, &q2_keys, "refresh-qwen35" }, .{ "zig/kernels/xpu/prebuilt-27b", q27_opt, &q27_keys, "refresh-qwen27" } }) |r| {
+        const copy = b.addUpdateSourceFiles();
+        inline for (r[2]) |name| copy.addCopyFileToSource(oclocQwen(b, ocloc, xpu_device, r[1], name, r[3]), b.fmt("{s}/{s}_{s}.bin", .{ r[0], name, xpu_device }));
+        const write = prebuiltManifest(b, check_tool, "write", r[0], r[1], r[2]);
+        write.step.dependOn(&copy.step);
+        refresh.dependOn(&write.step);
     }
     const q27k = b.createModule(.{ .root_source_file = q27_files.add("xpu_qwen27_kernels.zig", q27_src) });
     const q27_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_forward.zig"), .target = target, .optimize = .Debug, .link_libc = true });
