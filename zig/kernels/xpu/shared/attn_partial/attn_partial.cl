@@ -274,3 +274,158 @@ __kernel void qwen35_attn_partial_gqa(__global const ushort* Q, __global const u
         PO[po + (size_t)(dv * DPT + i)] = acc;
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// qwen35_attn_prefill_xmx: causal attention of a prefill segment on the XMX engines (bf16 dpas, fp32 accumulation),
+// final output directly (no flash-decoding partials, no merge). Checked by exp/kernels/attn_xmx/xmx_check.py.
+//
+// out[w][qh][:] = sum_j softmax_j(scale * <q_w, K_j>) V_j over keys j = 0..P+w, written as bf16 like attn_merge.
+// Inputs as qwen35_attn_partial_gqa: Q [QW_Q_HEADS][QROWS][D] (rows QOFF..QOFF+W-1 are this segment), K/V
+// [QW_KV_HEADS][CAP][D] with rows 0..P+W-1 written, dims = [P, W, CAP, NCH(unused), 0, QROWS, QOFF, 0].
+//
+// Geometry: global (16 * XA_RG * XA_DS, QW_Q_HEADS * ceil(W / (8 * XA_RG))), local (16 * XA_RG * XA_DS, 1). One
+// work-group = one query head x 8*XA_RG consecutive window rows. Sub-group (rg, ds): rows w0..w0+7 (one dpas M=8 block)
+// and output dims [ds*XA_DSW, +XA_DSW). Every sub-group computes its rows' full scores (QK^T over all D dims, 16 dpas
+// per 16 keys); the XA_DS sub-groups of a row group do so redundantly instead of exchanging scores, so there are no
+// barriers and no local memory. K/V tiles are shared by the work-group's sub-groups through L1.
+//
+// Bits per row depend only on that row's query and keys: key blocks are 16 keys at absolute positions (k0 = 0, 16,
+// ...), dpas rows are independent, and a block past a row's last key is an exact no-op for that row (p = 0, a = 1,
+// V rows past the written length load as 0). So the result does not depend on which rows share a launch.
+// P = exp(s - m) enters the PV dpas as bf16 hi + bf16 lo (two dpas): ~16 mantissa bits instead of bf16's 8.
+#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
+#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
+
+#ifndef XA_RG
+#define XA_RG 4                 // row groups (8 window rows each) per work-group
+#endif
+#ifndef XA_DS
+#define XA_DS 4                 // output dim slices per row group
+#endif
+#define XA_DSW (D / XA_DS)      // output dims per sub-group
+#define XA_NB (XA_DSW / 16)     // dpas column blocks per sub-group
+#define XA_ROWS (8 * XA_RG)     // window rows per work-group
+#ifndef XA_QREG
+#define XA_QREG 1               // 1: the query tile lives in registers; 0: re-read (L1) for every key block
+#endif
+#ifndef XA_B2D
+#define XA_B2D 1                // 1: 2D block reads (rows past the surface height read 0); 0: per-lane loads
+#endif
+#ifndef XA_KU
+#define XA_KU 4                 // unroll of the QK^T loop over the 16 dim blocks
+#endif
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void qwen35_attn_prefill_xmx(__global const ushort* Q, __global const ushort* K, __global const ushort* V,
+                                      const float scale, __global const int* dims, __global ushort* OUT)
+{
+    const int l  = (int)get_sub_group_local_id();
+    const int sg = (int)get_local_id(0) / 16;
+    const int rg = sg / XA_DS, ds = sg % XA_DS;
+    const int P = dims[0], W = dims[1], CAP = dims[2], QROWS = dims[5], QOFF = dims[6];
+    const int nwb = (W + XA_ROWS - 1) / XA_ROWS;
+    const int y  = (int)get_group_id(1);
+    const int qh = y / nwb, w0 = (y % nwb) * XA_ROWS + rg * 8;
+    if (w0 >= W) return;                      // uniform per sub-group; no barriers follow
+    const int h = qh / QW_Q_PER_KV;
+    const int valid = P + W;                  // cache rows written: keys 0..P+W-1
+    const int last = P + min(w0 + 7, W - 1);  // this row group's last key
+
+    const __global ushort* qb = Q + ((size_t)qh * QROWS + (size_t)(QOFF + w0)) * D;
+    const __global ushort* q0 = Q + ((size_t)qh * QROWS + (size_t)QOFF) * D;
+#if XA_QREG
+    short8 qa[D / 16];                        // A operands: lane k holds dims kb*16 + k of rows w0..w0+7
+#pragma unroll
+    for (int kb = 0; kb < D / 16; ++kb) {
+#if XA_B2D
+        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)q0, D * 2, W, D * 2, (int2)(kb * 16, w0), (__private ushort*)&qa[kb]);
+#else
+#pragma unroll
+        for (int m = 0; m < 8; ++m)
+            qa[kb][m] = (w0 + m < W) ? (short)qb[(size_t)m * D + (size_t)(kb * 16 + l)] : (short)0;
+#endif
+    }
+#endif
+    float8 o[XA_NB];
+#pragma unroll
+    for (int nb = 0; nb < XA_NB; ++nb) o[nb] = (float8)(0.0f);
+    float8 mrow = (float8)(-INFINITY), lrow = (float8)(0.0f);
+    const __global ushort* kh = K + (size_t)h * CAP * D;
+    const __global ushort* vh = V + (size_t)h * CAP * D + (size_t)(ds * XA_DSW + l);
+
+    for (int k0 = 0; k0 <= last; k0 += 16) {
+        const int key = k0 + l;               // this lane's key: its score column and its P column
+        const __global uint* kr = (const __global uint*)(kh + (size_t)min(key, valid - 1) * D);
+        float8 s = (float8)(0.0f);
+#pragma unroll XA_KU
+        for (int kb = 0; kb < D / 16; ++kb) {
+#if XA_B2D
+            int8 b;                           // K^T: lane n = key k0+n, int j = dims kb*16+2j (low), +1 (high)
+            intel_sub_group_2d_block_read_transpose_32b_16r8x1c((__global void*)kh, D * 2, valid, D * 2, (int2)(kb * 8, k0), (__private uint*)&b);
+#else
+            const int8 b = key < valid ? as_int8(vload8(kb, kr)) : (int8)(0);
+#endif
+#if XA_QREG
+            s = intel_sub_group_bf16_bf16_matrix_mad_k16(qa[kb], b, s);
+#else
+            short8 a;
+#if XA_B2D
+            intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)q0, D * 2, W, D * 2, (int2)(kb * 16, w0), (__private ushort*)&a);
+#else
+#pragma unroll
+            for (int m = 0; m < 8; ++m) a[m] = (w0 + m < W) ? (short)qb[(size_t)m * D + (size_t)(kb * 16 + l)] : (short)0;
+#endif
+            s = intel_sub_group_bf16_bf16_matrix_mad_k16(a, b, s);
+#endif
+        }
+        float8 a, p;
+        short8 ph, pl;
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+#ifdef XA_BAD_MASK
+            const float sc = key <= P + w0 + m + 1 && key < valid ? s[m] * scale : -INFINITY;  // bad control: one key too many
+#else
+            const float sc = key <= P + w0 + m ? s[m] * scale : -INFINITY;
+#endif
+            const float mnew = fmax(mrow[m], sub_group_reduce_max(sc));
+            a[m] = exp(mrow[m] - mnew);
+            p[m] = exp(sc - mnew);
+            lrow[m] = fma(lrow[m], a[m], sub_group_reduce_add(p[m]));
+            mrow[m] = mnew;
+            const ushort hi = intel_convert_bfloat16_as_ushort(p[m]);
+            ph[m] = (short)hi;
+#ifdef XA_NO_LO
+            pl[m] = 0;
+#else
+            pl[m] = (short)intel_convert_bfloat16_as_ushort(p[m] - intel_convert_as_bfloat16_float(hi));
+#endif
+        }
+#pragma unroll
+        for (int nb = 0; nb < XA_NB; ++nb) {
+            int8 vb;                          // B operand: lane n = dim, int j packs keys k0+2j (low), k0+2j+1 (high)
+#if XA_B2D
+            intel_sub_group_2d_block_read_transform_16b_16r16x1c((__global void*)(V + (size_t)h * CAP * D), D * 2, valid, D * 2,
+                                                                 (int2)(ds * XA_DSW + nb * 16, k0), (__private uint*)&vb);
+#else
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int ka = k0 + 2 * j, kc = ka + 1;
+                const uint lo = ka < valid ? (uint)vh[(size_t)ka * D + (size_t)(nb * 16)] : 0u;
+                const uint hi = kc < valid ? (uint)vh[(size_t)kc * D + (size_t)(nb * 16)] : 0u;
+                vb[j] = (int)(lo | (hi << 16));
+            }
+#endif
+            o[nb] *= a;
+            o[nb] = intel_sub_group_bf16_bf16_matrix_mad_k16(ph, vb, o[nb]);
+            o[nb] = intel_sub_group_bf16_bf16_matrix_mad_k16(pl, vb, o[nb]);
+        }
+    }
+    __global ushort* ob = OUT + (size_t)qh * D + (size_t)(ds * XA_DSW + l);
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        if (w0 + m >= W) break;
+#pragma unroll
+        for (int nb = 0; nb < XA_NB; ++nb)
+            ob[(size_t)(w0 + m) * QW_Q_HEADS * D + (size_t)(nb * 16)] = intel_convert_bfloat16_as_ushort(o[nb][m] / lrow[m]);
+    }
+}

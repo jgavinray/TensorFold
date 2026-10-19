@@ -64,13 +64,13 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_split, qmm_q8, qmm_q8x, qmm_q8xs, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_split, qmm_q8, qmm_q8x, qmm_q8xs, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_prefill_xmx, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
             .qmm_split, .qmm_q8, .qmm_q8x, .qmm_q8xs => .qmm,
-            .attn_partial_gqa => .attn_partial,
+            .attn_partial_gqa, .attn_prefill_xmx => .attn_partial,
             inline else => |t| @field(Module, @tagName(t)),
         };
     }
@@ -543,6 +543,11 @@ const Run = struct {
     fn xmx(self: Run, l: xw.Linear, rows: usize) bool {
         return self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64;
     }
+    /// Prefill segments of 8+ rows run attention on the XMX engines (qwen35_attn_prefill_xmx); fewer rows, decode steps
+    /// and verify windows keep the flash-decoding partials (an eager decode row must equal its replayed graph).
+    fn xmxAttention(self: Run, rows: usize) bool {
+        return self.prefill and rows >= 8;
+    }
     /// Verify windows and shared rounds (2+ rows, not prefill) on the int8 XMX engines (`q8xs`): weights leave DRAM once
     /// per 8 rows instead of once per row, and every row's bits equal q8's (exp/kernels/qmm_q8xs/q8xs_check.py), so the
     /// startup qualify's window == solo rule holds. One row stays on q8, the faster of the two there.
@@ -837,6 +842,15 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
         // every key past that chunk boundary.)
         const nch: usize = if (ru.rec != null) (seg.cache.capacity + 127) / 128 else (seg.cache.len + seg.rows + 127) / 128;
         const dims = try sc.dimsMoving([8]i32{ @intCast(seg.cache.len), @intCast(seg.rows), @intCast(seg.cache.capacity), @intCast(nch), 0, @intCast(total), @intCast(base), 0 }, null, 0);
+        // Prefill segments on the XMX engines (flash attention, final output, no partials): per-row bits do not depend
+        // on which rows share the launch. Decode steps and verify windows keep the partial kernel (replay == eager).
+        if (ru.xmxAttention(seg.rows)) {
+            try ru.go(.attn_prefill_xmx, geo.attnPrefillXmx(rows, c.heads), .{
+                sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, off(sc.y, base * c.gdnValueDim() * 2),
+            });
+            base += seg.rows;
+            continue;
+        }
         try ru.go(.attn_partial_gqa, geo.attnPartialGqa(@intCast(nch), rows, c.kv_heads, c.heads / c.kv_heads), .{
             sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
         });

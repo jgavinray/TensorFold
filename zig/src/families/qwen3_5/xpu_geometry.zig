@@ -80,6 +80,11 @@ pub fn attnPartial(nch: u32, w: u32, qheads: u32) Geo {
 pub fn attnPartialGqa(nch: u32, w: u32, kv_heads: u32, q_per_kv: u32) Geo {
     return .{ .gx = 16 * 4 * q_per_kv, .gy = kv_heads * w, .gz = nch, .lx = 16 * 4 * q_per_kv };
 }
+/// qwen35_attn_prefill_xmx: one 256-item work-group (4 row groups of 8 rows x 4 dim slices) per query head and 32 window
+/// rows.
+pub fn attnPrefillXmx(w: u32, qheads: u32) Geo {
+    return .{ .gx = 256, .gy = qheads * ceilDiv(w, 32), .lx = 256 };
+}
 /// qwen35_attn_merge: 32 dim slices over qheads x W.
 pub fn attnMerge(rows: u32, qheads: u32) Geo {
     return .{ .gx = 32, .gy = qheads, .gz = rows, .lx = 32 };
@@ -159,4 +164,7 @@ test "geometry scales to the 27B shapes" {
     try expect(qmmQ8xs(2, 248320), 7760 * 256, 1, 1, 256);
     try expect(qmmQ8xs(16, 5120), 160 * 256, 2, 1, 256);
     try expect(attnMerge(4, 24), 32, 24, 4, 32);
+    // attn_prefill_xmx: 24 heads x 4 blocks of 32 rows (a 128-row chunk); a 37-row tail needs 2 blocks per head
+    try expect(attnPrefillXmx(128, 24), 256, 96, 1, 256);
+    try expect(attnPrefillXmx(37, 24), 256, 48, 1, 256);
 }
