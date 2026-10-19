@@ -32,6 +32,7 @@ pub const stype = struct {
     pub const module_desc: u32 = 0x1b;
     pub const command_list_desc: u32 = 0x19;
     pub const kernel_desc: u32 = 0x1d;
+    pub const device_memory_properties: u32 = 0x7;
     pub const pci_ext_properties: u32 = 0x10008;
 };
 
@@ -65,6 +66,17 @@ pub const DeviceProperties = extern struct {
     timestampValidBits: u32 = 0,
     kernelTimestampValidBits: u32 = 0,
     uuid: [16]u8 = @splat(0),
+    name: [256]u8 = @splat(0),
+};
+
+/// ze_device_memory_properties_t: one per memory region of a device (a B70 has one, its VRAM).
+pub const DeviceMemoryProperties = extern struct {
+    stype: u32 = stype.device_memory_properties,
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    maxClockRate: u32 = 0,
+    maxBusWidth: u32 = 0,
+    totalSize: u64 = 0,
     name: [256]u8 = @splat(0),
 };
 
@@ -139,6 +151,7 @@ comptime {
     std.debug.assert(@sizeOf(QueueGroupProperties) == 40);
     std.debug.assert(@sizeOf(QueueDesc) == 40 and @sizeOf(EventDesc) == 32 and @sizeOf(ModuleDesc) == 56);
     std.debug.assert(@sizeOf(EventPoolDesc) == 24 and @sizeOf(DeviceMemDesc) == 24 and @sizeOf(TimestampResult) == 32);
+    std.debug.assert(@sizeOf(DeviceMemoryProperties) == 296 and @offsetOf(DeviceMemoryProperties, "totalSize") == 32);
 }
 
 const C = std.builtin.CallingConvention.c;
@@ -150,6 +163,7 @@ pub const Api = struct {
     zeDeviceGet: *const fn (Driver, *u32, ?[*]Device) callconv(C) Result,
     zeDeviceGetProperties: *const fn (Device, *DeviceProperties) callconv(C) Result,
     zeDevicePciGetPropertiesExt: *const fn (Device, *PciExtProperties) callconv(C) Result,
+    zeDeviceGetMemoryProperties: *const fn (Device, *u32, ?[*]DeviceMemoryProperties) callconv(C) Result,
     zeDeviceGetCommandQueueGroupProperties: *const fn (Device, *u32, ?[*]QueueGroupProperties) callconv(C) Result,
     zeContextCreate: *const fn (Driver, *const ContextDesc, *Context) callconv(C) Result,
     zeContextDestroy: *const fn (Context) callconv(C) Result,

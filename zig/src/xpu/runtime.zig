@@ -14,7 +14,7 @@ pub const launch = @import("launch.zig");
 pub const event = @import("event.zig");
 pub const session = @import("session.zig");
 
-pub const Error = error{ DriverUnavailable, MissingSymbol, ZeFailed, Invalid, ForbiddenCard, NoSuchDevice };
+pub const Error = error{ DriverUnavailable, MissingSymbol, ZeFailed, Invalid, ForbiddenCard, NoSuchDevice, OutOfDeviceMemory };
 pub const loader_name = "libze_loader.so.1";
 
 /// ze_result_t of the most recent failed call on this thread, for logs.

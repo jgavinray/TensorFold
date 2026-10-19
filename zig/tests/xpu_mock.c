@@ -44,6 +44,10 @@ R zeDeviceGetCommandQueueGroupProperties(void *dev, uint32_t *n, void *g) {
   if (g) { memset(g, 0, 80); *(uint32_t *)((uint8_t *)g + 40 + 16) = 1; *(uint32_t *)((uint8_t *)g + 16) = 2; } // group 0: copy-only, group 1: compute
   *n = 2; return 0;
 }
+R zeDeviceGetMemoryProperties(void *dev, uint32_t *n, void *p) { // one 32 GiB region (ze_device_memory_properties_t)
+  if (p) { uint64_t total = 32ull << 30; memset((uint8_t *)p + 16, 0, 280); memcpy((uint8_t *)p + 32, &total, 8); }
+  *n = 1; return 0;
+}
 R zeContextCreate(void *d, const void *desc, void **c) { *c = (void *)0x200; return 0; }
 R zeContextDestroy(void *c) { return 0; }
 R zeMemAllocDevice(void *c, const void *d, size_t s, size_t a, void *dev, void **p) { return 0x78000001; }
