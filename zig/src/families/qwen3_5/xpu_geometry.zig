@@ -29,6 +29,10 @@ pub const qmm_xmx_cols: u32 = 128;
 pub fn qmmXmx(rows: u32, outputs: u32) Geo {
     return .{ .gx = ceilDiv(outputs, qmm_xmx_cols) * 64, .gy = ceilDiv(rows, qmm_xmx_rows), .lx = 64 };
 }
+/// qwen35_qmm_split: one 64-item work-group per (quantization group, row).
+pub fn qmmSplit(rows: u32, groups: u32) Geo {
+    return .{ .gx = groups * 64, .gy = rows, .lx = 64 };
+}
 /// qwen35_qmm_xsum: one work-item per (quantization group, row).
 pub fn qmmXsum(rows: u32, groups: u32) Geo {
     return .{ .gx = ceilDiv(groups, 16) * 16, .gy = rows, .lx = 16 };
@@ -69,6 +73,11 @@ pub fn gdnChain(linear_dim: u32, heads: u32) Geo {
 /// qwen35_attn_partial: NCH key chunks over W window rows, query heads folded into y as qheads*W.
 pub fn attnPartial(nch: u32, w: u32, qheads: u32) Geo {
     return .{ .gx = 16, .gy = qheads * w, .gz = nch, .lx = 16 };
+}
+/// qwen35_attn_partial_gqa: one work-group per (kv head, window row, chunk) = q_per_kv query heads x 4 key slices,
+/// 16 items each (QA_SPLIT = 4 in attn_partial.cl).
+pub fn attnPartialGqa(nch: u32, w: u32, kv_heads: u32, q_per_kv: u32) Geo {
+    return .{ .gx = 16 * 4 * q_per_kv, .gy = kv_heads * w, .gz = nch, .lx = 16 * 4 * q_per_kv };
 }
 /// qwen35_attn_merge: 32 dim slices over qheads x W.
 pub fn attnMerge(rows: u32, qheads: u32) Geo {
@@ -139,5 +148,8 @@ test "geometry scales to the 27B shapes" {
     try expect(gdnPost(4, 48), 32, 48, 4, 32);
     try expect(gdnChain(128, 48), 16 * 48 * 128, 1, 1, 128);
     try expect(attnPartial(2, 16, 24), 16, 384, 2, 16);
+    // 27B: 4 kv heads x 6 query heads each, 4 key slices
+    try expect(attnPartialGqa(4, 1, 4, 6), 384, 4, 4, 384);
+    try expect(qmmSplit(3, 80), 80 * 64, 3, 1, 64);
     try expect(attnMerge(4, 24), 32, 24, 4, 32);
 }

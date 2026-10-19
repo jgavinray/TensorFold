@@ -1,8 +1,9 @@
 //! tf-xpu-qwen27-logits <model dir> <tokens.npy> <out.bf16>: teacher-forced logits of Qwen 3.8 27B on a B70.
 //! Writes len(tokens) x vocab bf16 words (raw, little-endian) to <out.bf16>, one row per input token, in order.
 //! Tokens come from a .npy of uint32 (the fixture format the gates use); every id must be < vocab.
-//! The forward is families/qwen27/xpu_forward.zig with head = .all and one prefill segment, so the row of token i is
-//! the logits that predict token i+1 (the teacher-forced layout the reference uses).
+//! The forward is families/qwen27/xpu_forward.zig with head = .all, prefilled in `chunk`-row pieces as the server
+//! prefills (any length: the state capacity is sized to the input), so the row of token i is the logits that predict
+//! token i+1 (the teacher-forced layout the reference uses).
 //! Exit status 0 only when the file was written; errors go to stderr with a nonzero status.
 const std = @import("std");
 // "qwen27_forward" (zig/src/xpu_qwen27_forward.zig) re-exports the runtime, config, weights and state modules,
@@ -16,9 +17,9 @@ const xs = fwd.xs;
 
 const gpa = std.heap.page_allocator;
 
-/// Capacity of the KV/recurrence state: a teacher-forced pass needs exactly len(tokens) rows, but the state is
-/// allocated once and the cache may hold more, so a fixed generous capacity costs nothing measurable here.
-const capacity = 512;
+/// Rows per forward: the server's prefill chunk. A single forward over thousands of rows would size every scratch
+/// buffer (attention partials: rows x heads x chunks x head_dim fp32) by the whole input.
+const chunk = 128;
 
 fn readNpyU32(path: [*:0]const u8) ![]u32 {
     const bytes = sys.readFileAlloc(gpa, path, 1 << 30) orelse {
@@ -85,28 +86,35 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("kernels loaded\n", .{});
 
     const rows = ids.len;
-    std.debug.print("scratch: rows {d}, capacity {d}\n", .{ rows, capacity });
-    var sc = try fwd.Scratch.init(&s, config, rows, capacity, rows);
+    // The KV/recurrence state holds the whole input; at least 512 as before.
+    const capacity = @max(512, (rows + 127) / 128 * 128);
+    const step = @min(rows, chunk);
+    std.debug.print("scratch: rows {d}, capacity {d}\n", .{ step, capacity });
+    var sc = try fwd.Scratch.init(&s, config, step, capacity, step);
     defer sc.deinit();
     std.debug.print("scratch ok ({d} buffers)\n", .{sc.made});
     var cache = try xs.Cache.init(gpa, &s, config, capacity);
     defer cache.deinit();
     std.debug.print("cache ok ({d} buffers)\n", .{cache.bufferCount()});
 
+    // Every row's bf16 logits, then one raw file of len(tokens) x vocab words.
+    const words = rows * config.vocab;
+    const logits = try gpa.alloc(u16, words);
+    defer gpa.free(logits);
     const t0 = sys.nowNs();
     std.debug.print("forward...\n", .{});
-    try fwd.run(&s, &m, &sc, &cache, ids, .{ .head = .all });
+    var at: usize = 0;
+    while (at < rows) : (at += step) {
+        const end = @min(rows, at + step);
+        try fwd.run(&s, &m, &sc, &cache, ids[at..end], .{ .head = .all });
+        try sc.logits.download(&s.queue, 0, std.mem.sliceAsBytes(logits[at * config.vocab .. end * config.vocab]));
+    }
     std.debug.print("forward {d} tokens in {d:.2} s ({d:.2} tokens/s teacher-forced)\n", .{
         rows,
         @as(f64, @floatFromInt(sys.nowNs() - t0)) / 1e9,
         @as(f64, @floatFromInt(rows)) / (@as(f64, @floatFromInt(sys.nowNs() - t0)) / 1e9),
     });
 
-    // Every row's bf16 logits, then one raw file of len(tokens) x vocab words.
-    const words = rows * config.vocab;
-    const logits = try gpa.alloc(u16, words);
-    defer gpa.free(logits);
-    try sc.logits.download(&s.queue, 0, std.mem.sliceAsBytes(logits));
     var finite = true;
     for (logits) |w16| {
         const f: f32 = @bitCast(@as(u32, w16) << 16);
