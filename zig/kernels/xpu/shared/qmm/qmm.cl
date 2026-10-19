@@ -149,3 +149,127 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
             OUT[(size_t)r * N + n0 + i] = intel_convert_bfloat16_as_ushort(red[s][i][0]);
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// qwen35_qmm_rows: the same matmul for R > 1 (prefill chunks, verify windows), QW_RB rows per work-group.
+//
+// qwen35_qmm streams a column tile's W once PER ROW, so a 128-row prefill chunk reads the whole weight set 128
+// times and 27B prefill ran at decode speed (~15 tok/s, 2026-10-19). Here a work-group owns the same 64 columns for
+// QW_RB rows: each W word is loaded once and applied to every row of the block.
+//
+// Bit-exact with qwen35_qmm for every (row, column): each accumulator - sx[rb], sqx[rb][i], acc[rb][i] - receives
+// exactly the same operations in exactly the same order as the R = 1 kernel (word j = 0..7 within a group, groups
+// l, l+QW_LANES, ..., the same local-memory tree, one round-to-nearest-even store). Only the interleaving between
+// DIFFERENT accumulators changes, which cannot change any of them. The startup qualify (window rows == one-row
+// execution, byte for byte) checks this on the card every server start.
+// Registers: the R = 1 kernel holds all 16 W words of a group (64 registers); here one word per column is live at a
+// time (8 registers) so QW_RB rows of accumulators fit.
+#ifndef QW_RB
+#define QW_RB 4
+#endif
+__kernel void qwen35_qmm_rows(__global const ushort* X,   // bf16 bits, R x K
+                              const int R,
+                              __global const uint* W,     // N x (K/8) uint32, 8 int4 per word
+                              __global const ushort* SC,  // bf16 bits, N x (K/QW_GROUP)
+                              __global const ushort* BI,  // bf16 bits, N x (K/QW_GROUP)
+                              __global ushort* OUT,       // bf16 bits, R x N
+                              const int N, const int K) {
+    const int G = K / QW_GROUP;
+    const int tid = get_local_id(0);
+    const int s = tid / QW_LANES;
+    const int l = tid % QW_LANES;
+    const int n0 = get_group_id(0) * QW_TILE + s * 8;
+    const int r0 = get_group_id(1) * QW_RB;            // first row of this work-group's block
+    const int nr = min(QW_RB, R - r0);                 // live rows in the block (uniform over the work-group)
+    const bool live = n0 < N;                          // a dead set still joins every barrier below
+    const int nl = live ? min(8, N - n0) : 0;
+
+    float acc[QW_RB][8];
+    #pragma unroll
+    for (int rb = 0; rb < QW_RB; ++rb)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[rb][i] = 0.0f;
+
+    if (live) {
+        for (int g = l; g < G; g += QW_LANES) {
+            const int xb = 8 * g;
+            float sqx[QW_RB][8];
+            float sx[QW_RB];
+            #pragma unroll
+            for (int rb = 0; rb < QW_RB; ++rb) {
+                sx[rb] = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) sqx[rb][i] = 0.0f;
+            }
+            // Word j of the group: W words of the 8 columns (one uint each), then every row of the block.
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                uint comp[8];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int nc = min(n0 + i, N - 1);
+                    comp[i] = W[(size_t)nc * (K >> 3) + 8 * g + j];
+                }
+                #pragma unroll
+                for (int rb = 0; rb < QW_RB; ++rb) {
+                    if (rb < nr) {
+                        const uint4 xj = ((const __global uint4*)(X + (size_t)(r0 + rb) * K))[xb + j];
+                        const float f0 = bf16_to_f32((ushort)xj.x);
+                        const float f1 = bf16_to_f32((ushort)(xj.x >> 16));
+                        const float f2 = bf16_to_f32((ushort)xj.y);
+                        const float f3 = bf16_to_f32((ushort)(xj.y >> 16));
+                        const float f4 = bf16_to_f32((ushort)xj.z);
+                        const float f5 = bf16_to_f32((ushort)(xj.z >> 16));
+                        const float f6 = bf16_to_f32((ushort)xj.w);
+                        const float f7 = bf16_to_f32((ushort)(xj.w >> 16));
+                        sx[rb] += ((f0 + f1) + (f2 + f3)) + ((f4 + f5) + (f6 + f7));
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const uint w = comp[i];
+                            float t = ((float)((w >> 28) & 0xFu)) * f7;
+                            t = fma((float)((w >> 24) & 0xFu), f6, t);
+                            t = fma((float)((w >> 20) & 0xFu), f5, t);
+                            t = fma((float)((w >> 16) & 0xFu), f4, t);
+                            t = fma((float)((w >> 12) & 0xFu), f3, t);
+                            t = fma((float)((w >> 8) & 0xFu), f2, t);
+                            t = fma((float)((w >> 4) & 0xFu), f1, t);
+                            t = fma((float)(w & 0xFu), f0, t);
+                            sqx[rb][i] += t;
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int nc = min(n0 + i, N - 1);
+                const float sc = bf16_to_f32(SC[(size_t)nc * G + g]);
+                const float bi = bf16_to_f32(BI[(size_t)nc * G + g]);
+                #pragma unroll
+                for (int rb = 0; rb < QW_RB; ++rb)
+                    acc[rb][i] = fma(bi, sx[rb], fma(sc, sqx[rb][i], acc[rb][i]));
+            }
+        }
+    }
+
+    // The R = 1 kernel's reduction tree, once per row of the block (same order, same barriers for every set).
+    __local float red[8][8][32];
+    for (int rb = 0; rb < QW_RB; ++rb) {
+        if (rb >= nr) break;                           // uniform: nr is the same for the whole work-group
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) red[s][i][l] = acc[rb][i];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int st = 16; st > 0; st >>= 1) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (l < st) red[s][i][l] += red[s][i][l + st];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (l == 0) {
+            for (int i = 0; i < nl; ++i)
+                OUT[(size_t)(r0 + rb) * N + n0 + i] = intel_convert_bfloat16_as_ushort(red[s][i][0]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);                  // red is rewritten by the next row
+    }
+}

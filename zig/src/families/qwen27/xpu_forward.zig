@@ -64,11 +64,12 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_rows, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
+            .qmm_rows => .qmm,
             inline else => |t| @field(Module, @tagName(t)),
         };
     }
@@ -423,7 +424,11 @@ const Run = struct {
         return self.w.ptr(t);
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
-        try self.go(.qmm, geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
+        // Several rows (prefill chunks, verify windows): the row-block kernel reads each W word once per block of
+        // rows instead of once per row, bit-identical per (row, column) to the one-row kernel (shared/qmm/qmm.cl).
+        const id: KernelId = if (rows > 1) .qmm_rows else .qmm;
+        const g = if (rows > 1) geo.qmmRows(@intCast(rows), @intCast(l.outputs)) else geo.qmm(@intCast(rows), @intCast(l.outputs));
+        try self.go(id, g, .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
         });
     }

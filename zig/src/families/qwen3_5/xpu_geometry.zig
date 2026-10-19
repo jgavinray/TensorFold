@@ -16,6 +16,12 @@ fn ceilDiv(a: u32, b: u32) u32 {
 pub fn qmm(rows: u32, outputs: u32) Geo {
     return .{ .gx = @max(1, ceilDiv(outputs, 64)) * 256, .gy = rows, .lx = 256 };
 }
+/// qwen35_qmm_rows (shared/qmm): the same 64-column work-groups, each covering `qmm_row_block` rows, so every W word
+/// is read once per block instead of once per row. Must match the kernel's QW_RB.
+pub const qmm_row_block: u32 = 4;
+pub fn qmmRows(rows: u32, outputs: u32) Geo {
+    return .{ .gx = @max(1, ceilDiv(outputs, 64)) * 256, .gy = ceilDiv(rows, qmm_row_block), .lx = 256 };
+}
 /// qwen35_qmm_pair: two same-shape N-column projections of one row, walked in lockstep. A work-group covers
 /// QW_HALF_TILE = 32 columns of each projection, so the grid is ceil(N/32) work-groups of 256 per row.
 pub fn qmmPair(rows: u32, outputs_per_projection: u32) Geo {
