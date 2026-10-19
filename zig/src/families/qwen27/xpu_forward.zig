@@ -549,7 +549,8 @@ const Run = struct {
         return self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64;
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
-        if (self.xmx(l, rows)) {
+        // The XMX kernel reads X with 2D block reads, which need a 64-byte-aligned base; any other X takes q8.
+        if (self.xmx(l, rows) and @intFromPtr(x) % 64 == 0) {
             try self.go(.qmm_xsum, geo.qmmXsum(@intCast(rows), @intCast(l.inputs / 64)), .{
                 x, @as(i32, @intCast(rows)), self.sc.xsum.ptr, @as(i32, @intCast(l.inputs)),
             });
@@ -570,7 +571,7 @@ const Run = struct {
         var n: usize = 0;
         for (ps) |p| {
             std.debug.assert(p.l.inputs == ps[0].l.inputs);
-            if (self.xmx(p.l, rows)) {
+            if (self.xmx(p.l, rows) and @intFromPtr(x) % 64 == 0) {
                 try self.projection(p.l, x, p.y, rows);
             } else {
                 rest[n] = p;

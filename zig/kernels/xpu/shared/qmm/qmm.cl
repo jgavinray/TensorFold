@@ -297,6 +297,7 @@ __kernel void qwen35_qmm_q8(__global const uint* XQ, __global const float* XS, c
 // Tiles: a 16-lane sub-group owns 16 columns (lane = column) x QX_ROWS rows (QX_ROWS/8 dpas row blocks).
 // dpas layout (bf16, M8 K16 N16, SIMD16) verified on the card: exp/kernels/qmm_xmx/layout_check.py.
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
+#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
 #ifndef QX_ROWS
 #define QX_ROWS 16
 #endif
@@ -361,12 +362,12 @@ __kernel void qwen35_qmm_xmx(__global const ushort* X,   // bf16 bits, R x K
             const int k0 = g * QW_GROUP + kk * 16;
             #pragma unroll
             for (int rb = 0; rb < QX_RB; ++rb) {
+                // Rows r0+rb*8 .. +7, inputs k0 .. k0+15 in ONE 2D block read: lane l receives X[row m][k0 + l], m = 0..7,
+                // which is the dpas A layout (exp/kernels/block2d/layout2d.py); rows >= R read 0 (the hardware checks
+                // the height). Eight 1-row block reads per tile made the kernel latency-bound: 1.7-4.7x on every 27B
+                // shape at R = 128 (exp/kernels/qmm_xmx2/xmx2_check.py). X must be 64-byte aligned (projection checks).
                 short8 a;
-                #pragma unroll
-                for (int m = 0; m < 8; ++m) {
-                    const int r = min(r0 + rb * 8 + m, R - 1);
-                    ((ushort*)&a)[m] = intel_sub_group_block_read_us(X + (size_t)r * K + k0);
-                }
+                intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)X, K * 2, R, K * 2, (int2)(k0, r0 + rb * 8), (__private ushort*)&a);
                 #pragma unroll
                 for (int t = 0; t < QX_NT; ++t) cq[t][rb] = intel_sub_group_bf16_bf16_matrix_mad_k16(a, b[t], cq[t][rb]);
             }

@@ -106,20 +106,34 @@ pub fn main(init: std.process.Init) !u8 {
     const prompt = try gpa.alloc(u32, plen);
     defer gpa.free(prompt);
     for (prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 50000);
-    const t0 = sys.nowNs();
-    var at: usize = 0;
-    while (at < plen) : (at += chunk) {
-        const end = @min(plen, at + chunk);
-        try fwd.run(&s, &m, &sc, &cache, prompt[at..end], .{});
-    }
-    try s.queue.synchronize();
-    std.debug.print("prefill {d} tokens: {d:.1} ms ({d:.1} tok/s)\n", .{ plen, @as(f64, @floatFromInt(sys.nowNs() - t0)) / 1e6,
-        @as(f64, @floatFromInt(plen)) * 1e9 / @as(f64, @floatFromInt(sys.nowNs() - t0)) });
-
     const row = try gpa.alloc(u16, config.vocab);
     defer gpa.free(row);
     var prof = try fwd.Profile.init(&s, gpa, 4096);
     defer prof.deinit(gpa);
+
+    // Prefill in the server's 128-row chunks: wall time for all of them, device time per kernel for every full chunk
+    // after the first (one chunk's ~950 launches fit the event pool; collected after each).
+    const t0 = sys.nowNs();
+    var at: usize = 0;
+    var pchunks: usize = 0;
+    prof.clear();
+    while (at < plen) : (at += chunk) {
+        const end = @min(plen, at + chunk);
+        const profiled = at > 0 and end - at == chunk;
+        sc.prof = if (profiled) prof else null;
+        try fwd.run(&s, &m, &sc, &cache, prompt[at..end], .{});
+        if (profiled) {
+            prof = sc.prof.?;
+            try prof.collect(gpa);
+            pchunks += 1;
+        }
+        sc.prof = null;
+    }
+    try s.queue.synchronize();
+    const pre_ns = sys.nowNs() - t0;
+    std.debug.print("prefill {d} tokens: {d:.1} ms ({d:.1} tok/s)\n", .{ plen, @as(f64, @floatFromInt(pre_ns)) / 1e6,
+        @as(f64, @floatFromInt(plen)) * 1e9 / @as(f64, @floatFromInt(pre_ns)) });
+    if (pchunks > 0) report("prefill (per 128-row chunk; wall is all chunks, profiled ones included)", &prof, pchunks, pre_ns * pchunks / ((plen + chunk - 1) / chunk));
     var tok: u32 = 1000;
     inline for (.{ Mode.verify, Mode.plain }) |mode| {
         prof.clear();
