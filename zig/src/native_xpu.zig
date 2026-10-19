@@ -271,6 +271,7 @@ fn openQwen27(h: *Host, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, p
         problem.* = try std.fmt.allocPrint(a, "the XPU Qwen backend did not start ({s})", .{@errorName(err)});
         return err;
     } };
+    h.xpu.qwen27.measure(io) catch |err| std.log.warn("Qwen window costs not timed ({s}): every proposal runs whole", .{@errorName(err)});
     h.config = try lanes.Config.init(gpa, h.xpu.qwen27.facts(), xb.window_rows, xb.window_rows - 1);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.xpu.qwen27.backend(), h.clock.clock());

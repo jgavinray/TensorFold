@@ -67,6 +67,10 @@ pub const Xpu = struct {
     replay: rp.Replay,
     queue: rt.cmdlist.Queue,
     width: u32 = 1,
+    /// A window's ms by rows (verify + keep, one stream) and shared rounds' ms by total rows, timed by `measure`.
+    window_costs: [window_rows]lanes.config.Cost = undefined,
+    shared_costs: [shared_points.len]lanes.config.Cost = undefined,
+    timed: bool = false,
     entries: std.AutoHashMapUnmanaged(*lanes.Stream, *Entry) = .empty,
     row: []u16, // host copy of one logits row
     rows: []u16, // host copy of a window's logits
@@ -121,8 +125,98 @@ pub const Xpu = struct {
 
     pub fn facts(self: *const Xpu) lanes.Model {
         // A shared round records a snapshot per row, and the scratch holds `snap_rows` of them (see Scratch.snapshot_rows).
-        return .{ .exact_width = self.width, .hidden_rows = self.width > 1, .batch_rows = @min(xs.max_segments * window_rows, self.scratch.snap_rows), .max_streams = self.options.streams, .streams_exact = true };
+        return .{
+            .exact_width = self.width,
+            .hidden_rows = self.width > 1,
+            .batch_rows = @min(xs.max_segments * window_rows, self.scratch.snap_rows),
+            .max_streams = self.options.streams,
+            .streams_exact = true,
+            .window_costs = if (self.timed) &self.window_costs else &.{},
+            .shared_costs = if (self.timed) &self.shared_costs else &.{},
+        };
     }
+
+    /// Shared rounds timed at load: (streams, rows each). Totals between and past them are interpolated by the lanes
+    /// config (alloc.extendCosts).
+    const shared_points = [_][2]u32{ .{ 3, 8 }, .{ 4, 8 } };
+    const Costs = struct { window: [window_rows]lanes.config.Cost, shared: [shared_points.len]lanes.config.Cost };
+
+    /// Each window width's ms (verify + keep, a served round) on a scratch stream, and shared rounds' ms by total rows,
+    /// for `facts`: the lanes allocator then trims copied drafts to the most expected tokens a ms. Untimed it prices
+    /// every width alike and runs every proposal whole - 2026-10-19 on 4bf6ec55, text that copies nothing ran ~1.5 rows
+    /// a round at 11.6 tok/s when one-row rounds made 18.6. Kept per build, card and model (lanes.cost_cache).
+    pub fn measure(self: *Xpu, io: std.Io) !void {
+        if (self.width <= 1) return;
+        const parts = [_][]const u8{ "qwen27-xpu-lanes", self.session.ctx.dev.name(), "v1" };
+        const k = lanes.cost_cache.key(self.gpa, io, &parts) catch null;
+        if (k) |key| if (lanes.cost_cache.load(Costs, self.gpa, io, key)) |kept| {
+            self.window_costs = kept.window;
+            self.shared_costs = kept.shared;
+            self.timed = true;
+            return;
+        };
+        var ids: [64]u32 = undefined;
+        for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % cfg.xpu_vocab);
+        var streams: [4]lanes.Stream = undefined;
+        var made: usize = 0;
+        defer for (streams[0..made]) |*st| {
+            releaseFn(self, st);
+            st.deinit(self.gpa);
+        };
+        // every timed round keeps one row, so each scratch stream has room for a few hundred rounds
+        for (&streams) |*st| {
+            st.* = try lanes.Stream.init(self.gpa, .{ .id = "timing", .prompt = &ids, .max_new = 1024 });
+            made += 1;
+            try prefillFn(self, st);
+        }
+        var ptrs: [4]*lanes.Stream = undefined;
+        for (&ptrs, &streams) |*p, *st| p.* = st;
+        const one: RoundTimer = .{ .x = self, .streams = ptrs[0..1], .per = 0 };
+        for (0..5) |_| _ = try one.time(window_rows - 1); // the widest window first, while the clocks ramp up
+        var ms: [window_rows]f64 = undefined;
+        for (&ms, 0..) |*m, i| m.* = try lanes.cost_rule.fastest(one, i);
+        try lanes.cost_rule.smooth(one, &ms);
+        for (&self.window_costs, ms, 0..) |*cost, m, i| cost.* = .{ .width = @intCast(i + 1), .ms = m };
+        for (&self.shared_costs, shared_points) |*cost, pt| {
+            const shared: RoundTimer = .{ .x = self, .streams = ptrs[0..pt[0]], .per = pt[1] };
+            cost.* = .{ .width = pt[0] * pt[1], .ms = try lanes.cost_rule.fastest(shared, 0) };
+        }
+        self.timed = true;
+        if (k) |key| lanes.cost_cache.save(Costs, self.gpa, io, key, .{ .window = self.window_costs, .shared = self.shared_costs });
+    }
+
+    /// One served round on the scratch streams: each a window of `per` rows (0: `i + 1`), verified then kept to one row.
+    const RoundTimer = struct {
+        x: *Xpu,
+        streams: []const *lanes.Stream,
+        per: u32,
+
+        pub fn time(t: RoundTimer, i: usize) !f64 {
+            const rows: usize = if (t.per != 0) t.per else i + 1;
+            const drafts: [window_rows]u32 = @splat(1);
+            var positions: [4][window_rows]u64 = undefined;
+            var sampled: [4][window_rows]u32 = undefined;
+            var echoed: [4][window_rows]u32 = undefined;
+            var windows: [4]be.Window = undefined;
+            var out: [4]be.Verified = undefined;
+            const path = [_]u32{0};
+            var paths: [4][]const u32 = undefined;
+            for (t.streams, 0..) |st, k| {
+                const e = try t.x.entryOf(st);
+                if (e.cache.len + rows > e.cache.capacity) return error.ContextFull;
+                for (positions[k][0..rows], 0..) |*p, r| p.* = e.cache.len + r + 1;
+                windows[k] = .{ .stream = st, .pending = 1, .held = 0, .tokens = drafts[0 .. rows - 1], .parents = null, .positions = positions[k][0..rows] };
+                out[k] = .{ .sampled = sampled[k][0..rows], .drafts = echoed[k][0 .. rows - 1] };
+                paths[k] = &path;
+            }
+            const n = t.streams.len;
+            const t0 = fwd.sys.nowNs();
+            try verifyFn(t.x, windows[0..n], out[0..n]);
+            try keepFn(t.x, windows[0..n], paths[0..n]);
+            try t.x.session.queue.synchronize();
+            return @as(f64, @floatFromInt(fwd.sys.nowNs() - t0)) / 1e6;
+        }
+    };
 
     pub fn backend(self: *Xpu) be.Backend {
         return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn } };
