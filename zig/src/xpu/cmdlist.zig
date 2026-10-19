@@ -48,11 +48,13 @@ pub const Queue = struct {
         var handles: [8]abi.CommandList = undefined;
         if (lists.len > handles.len) return error.Invalid;
         @memcpy(handles[0..lists.len], lists);
-        try runtime.check(self.ctx.api().zeCommandQueueExecuteCommandLists(self.handle, @intCast(lists.len), &handles, sig));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandQueueExecuteCommandLists(self.handle, @intCast(lists.len), &handles, sig));
     }
 
     pub fn synchronize(self: *Queue) runtime.Error!void {
-        try runtime.check(self.ctx.api().zeCommandQueueSynchronize(self.handle, abi.wait_forever));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandQueueSynchronize(self.handle, abi.wait_forever));
     }
 };
 
@@ -63,7 +65,9 @@ pub const Recorder = struct {
 
     pub fn init(ctx: *const Context) runtime.Error!Recorder {
         var h: abi.CommandList = null;
-        const desc: abi.CommandListDesc = .{ .commandQueueGroupOrdinal = ctx.compute_ordinal };
+        // In order: a recorded step's kernels each read what the previous one wrote. (Created without the flag, the
+        // driver may overlap appended launches; nothing in the list orders them.)
+        const desc: abi.CommandListDesc = .{ .commandQueueGroupOrdinal = ctx.compute_ordinal, .flags = abi.list_flag_in_order };
         try runtime.check(ctx.api().zeCommandListCreate(ctx.handle, ctx.dev.handle, &desc, &h));
         if (h == null) return error.Invalid;
         return .{ .ctx = ctx, .handle = h };

@@ -178,6 +178,16 @@ __kernel void qwen35_attn_partial_gqa(__global const ushort* Q, __global const u
     const int c  = (int)get_global_id(2);
     const int P  = dims[0], W = dims[1], CAP = dims[2], NCH = dims[3], QROWS = dims[5], QOFF = dims[6];
     const int w  = y % W, h = y / W, qh = h * QW_Q_PER_KV + j;
+    if (c * CK > P + w) {   // the whole chunk lies past this row's last key (a replayed step's capacity-sized grid)
+        // The empty-chunk contract (PM = -inf, PL = 0, PO = 0 exactly): attn_merge weighs an empty chunk's PO by 0, and a
+        // stale NaN in PO would survive that.
+        for (int u = lid; u < QW_Q_PER_KV * D; u += S * NSG) {
+            const size_t es = (size_t)((h * QW_Q_PER_KV + u / D) * W + w) * (size_t)NCH + (size_t)c;
+            PO[es * D + (size_t)(u % D)] = 0.0f;
+            if (u % D == 0) { PM[es] = -INFINITY; PL[es] = 0.0f; }
+        }
+        return;               // uniform across the work-group: before any barrier
+    }
 
     // One local buffer for both phases (BK*S == D == 256 floats per sub-group): the per-key partial dots during the
     // key loop, then each sub-group's output slice for the merge. Halves the local memory, which bounds occupancy.

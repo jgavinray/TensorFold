@@ -14,7 +14,7 @@ pub const launch = @import("launch.zig");
 pub const event = @import("event.zig");
 pub const session = @import("session.zig");
 
-pub const Error = error{ DriverUnavailable, MissingSymbol, ZeFailed, Invalid, ForbiddenCard, NoSuchDevice, OutOfDeviceMemory };
+pub const Error = error{ DriverUnavailable, MissingSymbol, ZeFailed, Invalid, ForbiddenCard, NoSuchDevice, OutOfDeviceMemory, DeviceLost };
 pub const loader_name = "libze_loader.so.1";
 
 /// ze_result_t of the most recent failed call on this thread, for logs.
@@ -50,8 +50,41 @@ pub fn check(result: abi.Result) Error!void {
     }
 }
 
+/// Set by the first failed call that puts work on the card or waits for it. After it the process's GPU context may be
+/// faulted and its queues banned (xe resets a faulting job's exec queues), and a process that keeps submitting re-arms
+/// the driver's reset path, which can wedge the card: 2026-10-19 19:36 a test whose kernel read out of bounds went on
+/// to its next measurement - 42 more faults and 7 exec queue resets. From then on every submission or wait in this
+/// process fails at once with error.DeviceLost, without reaching the driver.
+pub var poisoned = std.atomic.Value(bool).init(false);
+
+/// Call before a submission or wait: error.DeviceLost once the process is poisoned.
+pub fn live() Error!void {
+    if (poisoned.load(.acquire)) return error.DeviceLost;
+}
+
+/// `check` for a submission or wait: a failure poisons the process (see `poisoned`).
+pub fn submit(result: abi.Result) Error!void {
+    if (result != abi.success) {
+        last_result = result;
+        poisoned.store(true, .release);
+        std.log.warn("xpu: a GPU submission or wait failed (ze result 0x{x}): no further GPU work in this process", .{result});
+        return error.DeviceLost;
+    }
+}
+
 test "complete runtime refuses an absent library" {
     try std.testing.expectError(error.DriverUnavailable, Runtime.openPath("/nonexistent/tensorfold-test/libze_loader.so"));
+}
+
+test "a failed submission poisons the process: every later submission fails without reaching the driver" {
+    defer poisoned.store(false, .release);
+    try live();
+    try submit(0);
+    try live();
+    try std.testing.expectError(error.DeviceLost, submit(0x70000001));
+    try std.testing.expectEqual(@as(abi.Result, 0x70000001), last_result);
+    try std.testing.expectError(error.DeviceLost, live());
+    try std.testing.expectError(error.DeviceLost, live());
 }
 
 test "a failed call cannot become success and remembers its code" {

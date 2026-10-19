@@ -4,6 +4,7 @@
 //! ../qwen3_5/xpu_geometry.zig). The tools and any test binary import "qwen27_forward" and see the forward plus the
 //! runtime, config, weights and state modules it re-exports.
 pub const forward = @import("families/qwen27/xpu_forward.zig");
+pub const replay = @import("families/qwen27/xpu_replay.zig");
 pub const rt = forward.rt;
 pub const sys = forward.sys;
 pub const cfg = forward.cfg;

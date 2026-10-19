@@ -37,6 +37,8 @@ pub const stype = struct {
 };
 
 pub const queue_flag_in_order: u32 = 1 << 1;
+/// ze_command_list_flag_t ZE_COMMAND_LIST_FLAG_IN_ORDER: a regular list's commands run one after another.
+pub const list_flag_in_order: u32 = 1 << 3;
 pub const queue_mode_asynchronous: u32 = 2;
 pub const queue_group_compute: u32 = 1 << 0;
 pub const event_pool_host_visible: u32 = 1 << 0;
@@ -126,11 +128,12 @@ pub const CopyRegion = extern struct {
     origin: GroupCount = .{ .x = 0, .y = 0, .z = 0 },
     region: GroupCount = .{ .x = 0, .y = 0, .z = 0 },
 };
+/// ze_command_list_desc_t: the ordinal comes before the flags. (They were swapped here; harmless while both were 0.)
 pub const CommandListDesc = extern struct {
     stype: u32 = stype.command_list_desc,
     pNext: ?*const anyopaque = null,
-    flags: u32 = 0,
     commandQueueGroupOrdinal: u32 = 0,
+    flags: u32 = 0,
 };
 pub const CommandQueueDesc = extern struct {
     stype: u32 = stype.command_queue_desc,
