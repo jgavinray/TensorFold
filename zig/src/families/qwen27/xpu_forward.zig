@@ -624,6 +624,9 @@ fn off(b: Buffer, bytes: usize) *anyopaque {
 pub const Options = struct {
     /// Stop after this layer's MLP (no final norm / head): the layer output is h + r in the scratch.
     stop_after: ?usize = null,
+    /// Diagnostics: after every layer, copy rows `taps.rows` (scratch rows of this forward) of the residual `h` and the
+    /// layer's MLP output `r` (the layer output is h + r) into `taps.out` at [layer][tap][h | r][hidden] bf16.
+    taps: ?Taps = null,
     head: Head = .last,
     /// When set, the forward *records* into this regular command list instead of executing: no work reaches the card
     /// and nothing is synchronized. The caller closes the list and replays it (see `xpu_replay.zig`).
@@ -632,6 +635,8 @@ pub const Options = struct {
     /// element index of each, so the replay rewrites exactly those. Only used when `rec` is set.
     slots: ?*std.ArrayList(DimsSlot) = null,
 };
+
+pub const Taps = struct { rows: []const usize, out: *anyopaque };
 
 /// A stream's rows in one shared round: its cache and how many rows it contributes, in segment order.
 pub const Segment = struct { cache: *xs.Cache, rows: usize };
@@ -714,6 +719,11 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         try ru.projections(&.{ .{ .l = layer.mlp.gate, .y = sc.gate.ptr.? }, .{ .l = layer.mlp.up, .y = sc.up.ptr.? } }, sc.x.ptr.?, total);
         try ru.go(.mlp_act, geo.mlpAct(T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
         try ru.projection(layer.mlp.down, sc.act.ptr.?, sc.r.ptr.?, total);
+        if (o.taps) |tp| for (tp.rows, 0..) |row, k| {
+            const dst: usize = @intFromPtr(tp.out) + ((i * tp.rows.len + k) * 2) * c.hidden * 2;
+            try s.queue.copy(@ptrFromInt(dst), off(sc.h, row * c.hidden * 2), c.hidden * 2, null);
+            try s.queue.copy(@ptrFromInt(dst + c.hidden * 2), off(sc.r, row * c.hidden * 2), c.hidden * 2, null);
+        };
         if (o.stop_after) |n| if (i == n) {
             if (o.rec == null) try s.queue.synchronize();
             return;

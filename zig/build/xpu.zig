@@ -211,6 +211,12 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     q27_logits.addImport("qwen27_forward", q27_mod);
     const logits_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-logits", .root_module = q27_logits });
     const logits_install = b.addInstallArtifact(logits_exe, .{});
+    // Diagnostics: per-layer residual stream at chosen positions (exp/ref/mlx_positions.py compares layer by layer).
+    const q27_hidden = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_hidden.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_hidden.addImport("xpu_qwen35_kernels", q27k);
+    q27_hidden.addImport("qwen27_forward", q27_mod);
+    const hidden_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-hidden", .root_module = q27_hidden });
+    b.step("xpu-qwen27-hidden", "Build tf-xpu-qwen27-hidden (27B per-layer residual stream at chosen positions)").dependOn(&b.addInstallArtifact(hidden_exe, .{}).step);
     const greedy = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_greedy.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
     greedy.addImport("xpu_qwen35_kernels", q27k);
     greedy.addImport("qwen27_forward", q27_mod);
