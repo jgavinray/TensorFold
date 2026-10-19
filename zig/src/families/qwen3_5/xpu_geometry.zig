@@ -22,11 +22,11 @@ pub fn qmmQ8(rows: u32, outputs: [4]u32) Geo {
     for (outputs) |o| tiles += ceilDiv(o, 64);
     return .{ .gx = @max(1, tiles) * 256, .gy = rows, .lx = 256 };
 }
-/// qwen35_qmm_q8x (prefill matmul, int8 XMX): 128-item work-groups = 8 sub-groups (Q8X_SG) down the rows, each 16 rows
-/// (Q8X_RB = 2 row blocks of 8) x the work-group's 16 columns (Q8X_NT = 1): 16 columns x 128 rows per work-group.
+/// qwen35_qmm_q8x (prefill matmul, int8 XMX): 256-item work-groups = 16 sub-groups (Q8X_SG) down the rows, each 8 rows
+/// (Q8X_RB = 1 row block) x the work-group's 32 columns (Q8X_NT = 2 tiles of 16): 32 columns x 128 rows per work-group.
 /// Must match the kernel's Q8X_NT / Q8X_RB / Q8X_SG defaults.
 pub fn qmmQ8x(rows: u32, outputs: u32) Geo {
-    return .{ .gx = ceilDiv(outputs, 16) * 128, .gy = ceilDiv(rows, 128), .lx = 128 };
+    return .{ .gx = ceilDiv(outputs, 32) * 256, .gy = ceilDiv(rows, 128), .lx = 256 };
 }
 /// qwen35_qmm_split: one 64-item work-group per (quantization group, row).
 pub fn qmmSplit(rows: u32, groups: u32) Geo {
@@ -146,5 +146,8 @@ test "geometry scales to the 27B shapes" {
     // 27B: 4 kv heads x 6 query heads each, 4 key slices
     try expect(attnPartialGqa(4, 1, 4, 6), 384, 4, 4, 384);
     try expect(qmmSplit(3, 80), 80 * 64, 3, 1, 64);
+    // q8x: 32 columns x 128 rows per 256-item work-group (17408 outputs, a 128-row chunk; a 37-row tail)
+    try expect(qmmQ8x(128, 17408), 544 * 256, 1, 1, 256);
+    try expect(qmmQ8x(37, 48), 2 * 256, 1, 1, 256);
     try expect(attnMerge(4, 24), 32, 24, 4, 32);
 }

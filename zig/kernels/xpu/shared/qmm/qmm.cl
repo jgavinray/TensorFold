@@ -295,18 +295,19 @@ __kernel void qwen35_qmm_q8(__global const uint* XQ, __global const float* XS, c
 // Each A operand is one 2D block read of the int8 activation rows (rows >= R read 0). Per group, column and row the
 // q8 formula: OUT += SC * (s * (sum q*hi + sum q*lo / 254)) + BI * sum x.
 // Tiles: a sub-group owns Q8X_NT x 16 columns x Q8X_RB x 8 rows; a work-group is Q8X_SG sub-groups down the rows (geometry:
-// xpu_geometry.qmmQ8x). 1 x 2 measured best: 2.7-4.9x the bf16 XMX kernel this replaces on the big 27B shapes at
+// xpu_geometry.qmmQ8x). In the engine at the 100 W cap, 2 tiles x 1 row block x 16 sub-groups (32 columns x 128 rows a
+// work-group) measured best (1280-token prefill 328 tok/s; 1x2x8 301, 2x2x8 286, 4x1x16 274, 1x1x16 265). Isolated, 1 x 2 measured best: 2.7-4.9x the bf16 XMX kernel this replaces on the big 27B shapes at
 // R = 128, rms 0.50x the bf16 floor (exp/kernels/qmm_q8x/q8x_check.py). Prefill only (not byte-identical to q8).
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 #pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
 #ifndef Q8X_NT
-#define Q8X_NT 1
+#define Q8X_NT 2
 #endif
 #ifndef Q8X_RB
-#define Q8X_RB 2
+#define Q8X_RB 1
 #endif
 #ifndef Q8X_SG
-#define Q8X_SG 8           // sub-groups per work-group, stacked along ROWS: they share the work-group's columns, so their
+#define Q8X_SG 16          // sub-groups per work-group, stacked along ROWS: they share the work-group's columns, so their
 #endif                     // weight loads after the first hit L1 and weights leave DRAM once per Q8X_SG*8*Q8X_RB rows
 __attribute__((intel_reqd_sub_group_size(16)))
 __attribute__((reqd_work_group_size(16 * Q8X_SG, 1, 1)))
