@@ -63,7 +63,9 @@ pub const Recorder = struct {
 
     pub fn init(ctx: *const Context) runtime.Error!Recorder {
         var h: abi.CommandList = null;
-        const desc: abi.CommandListDesc = .{ .commandQueueGroupOrdinal = ctx.compute_ordinal };
+        // In order: a recorded step's kernels each read what the previous one wrote. (Created without the flag, the
+        // driver may overlap appended launches; nothing in the list orders them.)
+        const desc: abi.CommandListDesc = .{ .commandQueueGroupOrdinal = ctx.compute_ordinal, .flags = abi.list_flag_in_order };
         try runtime.check(ctx.api().zeCommandListCreate(ctx.handle, ctx.dev.handle, &desc, &h));
         if (h == null) return error.Invalid;
         return .{ .ctx = ctx, .handle = h };

@@ -375,7 +375,7 @@ pub const Scratch = struct {
     dims_used: usize = 0,
     /// While a decode step is being recorded, every `dims` slot index lands here so the replay can rewrite the
     /// per-token scalars inside the captured arrays. Null outside recording.
-    record_slots: ?*std.ArrayList(usize) = null,
+    record_slots: ?*std.ArrayList(DimsSlot) = null,
     /// Allocator for `record_slots` appends; the caller's, since the scratch does not own one otherwise.
     gpa: std.mem.Allocator = undefined,
 
@@ -461,16 +461,32 @@ pub const Scratch = struct {
     fn dimsBase(self: *Scratch) [*]u8 {
         return @as([*]u8, @ptrCast(self.pool.ptr.?)) + self.rows * 4 + self.rows * c.conv_kernel * 4;
     }
-    /// Copies `vals` into a fresh slot of the pool and returns its device-visible address. With a recorder active the
-    /// slot's index is appended to `record_slots` so the replay can rewrite the per-token scalars inside it.
+    /// Bytes of the host pool the last forward wrote (ids, conv windows, its `dims` slots): a recorded step's image.
+    pub fn poolUsed(self: *const Scratch) usize {
+        return self.rows * 4 + self.rows * c.conv_kernel * 4 + self.dims_used * slot_bytes;
+    }
+    /// Copies `vals` into a fresh slot of the pool and returns its device-visible address. Its values are fixed for a
+    /// recorded decode step; see `dimsMoving` for a slot holding the per-token position or cache length.
     fn dims(self: *Scratch, vals: anytype) *anyopaque {
         const bytes = std.mem.asBytes(&vals);
         std.debug.assert(bytes.len <= slot_bytes and self.dims_used < dims_slots);
         const p = self.dimsBase() + self.dims_used * slot_bytes;
         @memcpy(p[0..bytes.len], bytes);
-        if (self.record_slots) |list| list.append(self.gpa, self.dims_used) catch {};
         self.dims_used += 1;
         return @ptrCast(p);
+    }
+    /// `dims` for a slot whose element `position_at` holds the RoPE position and/or `cache_len_at` the cache length.
+    /// While a decode step is recorded the slot and those indices go to `record_slots`, and the replay rewrites exactly
+    /// them. (The indices used to be found by matching values against the position: any fixed element that happened
+    /// to equal it - rows 1, kv heads 4, heads 24, ... for a prompt of that length - was rewritten every token.)
+    fn dimsMoving(self: *Scratch, vals: anytype, position_at: ?usize, cache_len_at: ?usize) Error!*anyopaque {
+        const p = self.dims(vals);
+        if (self.record_slots) |list| try list.append(self.gpa, .{
+            .offset = @intFromPtr(p) - @intFromPtr(self.pool.ptr.?),
+            .position_at = position_at,
+            .cache_len_at = cache_len_at,
+        });
+        return p;
     }
 
     /// The recurrence snapshot of `layer` at absolute scratch row `row` (`deltaBytes` long); `keep` reads it back.
@@ -612,9 +628,9 @@ pub const Options = struct {
     /// When set, the forward *records* into this regular command list instead of executing: no work reaches the card
     /// and nothing is synchronized. The caller closes the list and replays it (see `xpu_replay.zig`).
     rec: ?*rt.cmdlist.Recorder = null,
-    /// Receives the pool slot index of every `dims` array the recorded step allocates, so the replay can find the
-    /// per-token scalars (position, cache length) inside them. Only used when `rec` is set.
-    slots: ?*std.ArrayList(usize) = null,
+    /// Receives every `dims` slot of the recorded step that holds a per-token scalar (position, cache length) and the
+    /// element index of each, so the replay rewrites exactly those. Only used when `rec` is set.
+    slots: ?*std.ArrayList(DimsSlot) = null,
 };
 
 /// A stream's rows in one shared round: its cache and how many rows it contributes, in segment order.
@@ -654,23 +670,8 @@ pub fn recordDecode(
     slots: *std.ArrayList(DimsSlot),
 ) Error!void {
     if (tokens.len != 1) return error.ReplayNeedsOneRow;
-    var capture: std.ArrayList(usize) = .empty;
-    defer capture.deinit(sc.gpa);
-    sc.record_slots = &capture;
-    defer sc.record_slots = null;
-    try runSegments(s, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec, .slots = &capture });
-    const pool: [*]u8 = @ptrCast(sc.pool.ptr.?);
-    const base = @intFromPtr(sc.dimsBase()) - @intFromPtr(sc.pool.ptr.?);
-    for (capture.items) |slot_i| {
-        const d: [*]const i32 = @ptrCast(@alignCast(pool + base + slot_i * Scratch.slot_bytes));
-        var slot: DimsSlot = .{ .offset = base + slot_i * Scratch.slot_bytes };
-        for (0..8) |j| {
-            const v: u32 = @intCast(@max(d[j], 0));
-            if (v == position and slot.position_at == null) slot.position_at = j;
-            if (v == cache.len and slot.cache_len_at == null) slot.cache_len_at = j;
-        }
-        try slots.append(sc.gpa, slot);
-    }
+    std.debug.assert(position == cache.len);
+    try runSegments(s, m, sc, &.{.{ .cache = cache, .rows = 1 }}, tokens, false, .{ .head = .last, .rec = rec, .slots = slots });
 }
 
 /// Forward `tokens` split across `segments`, each its own cache and row range, in one launch set (the shared-round
@@ -724,8 +725,13 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
     } else {
         try ru.projection(w.head, off(sc.x, (total - 1) * c.hidden * 2), sc.logits.ptr.?, 1);
     }
-    // A recording pass stops here: the commit is a queued copy plus a cache-length bump, neither belongs in a list.
-    if (o.rec != null) return;
+    // A recording pass stops here, after the logits row lands where a plain decode leaves it (`cache.logits`, which the
+    // backend reads); the cache-length bump is the replayer's. (Without the copy a replayed token's logits stayed in
+    // the scratch and the caller read the previous token's.)
+    if (o.rec) |r| {
+        try r.copy(segments[0].cache.logits.ptr, sc.logits.ptr, c.vocab * 2);
+        return;
+    }
     base = 0;
     for (segments) |seg| {
         const row: usize = if (o.head == .all) base + seg.rows - 1 else 0;
@@ -788,7 +794,7 @@ fn delta(ru: Run, d: xw.Gdn, layer: usize, segments: []const Segment, record: bo
     try ru.projection(d.out, sc.mix.ptr.?, sc.r.ptr.?, total);
 }
 
-fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, total: usize) rt.Error!void {
+fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, total: usize) Error!void {
     const sc = ru.sc;
     const w = ru.w;
     const T: u32 = @intCast(total);
@@ -808,13 +814,17 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
         // row dims[2] + r themselves (layout.cl: m = dims[2] + r), so the inputs are the unshifted buffers - shifting
         // the pointer by `base` too read every segment past the first `base` rows late (and `v` at the wrong stride).
         try ru.go(.queries, geo.layout(.queries, rows, c.hidden, c.head_dim, c.heads, c.kv_heads), .{
-            sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), T, @intCast(base), 0 }),
+            sc.q.ptr, sc.queries.ptr, try sc.dimsMoving([4]u32{ @intCast(seg.cache.len), T, @intCast(base), 0 }, 0, null),
         });
         try ru.go(.keys, geo.layout(.keys, rows, c.hidden, c.head_dim, c.heads, c.kv_heads), .{
-            sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), @intCast(seg.cache.capacity), @intCast(base), 0 }),
+            sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, try sc.dimsMoving([4]u32{ @intCast(seg.cache.len), @intCast(seg.cache.capacity), @intCast(base), 0 }, null, 0),
         });
-        const nch: usize = (seg.cache.len + seg.rows + 127) / 128;
-        const dims = sc.dims([8]i32{ @intCast(seg.cache.len), @intCast(seg.rows), @intCast(seg.cache.capacity), @intCast(nch), 0, @intCast(total), @intCast(base), 0 });
+        // A recorded decode step is replayed while the cache grows, and its launch geometry and dims are fixed at record
+        // time: it covers the cache's whole capacity. Chunks past a row's last key write PL = 0, which the merge skips,
+        // so a row's bits do not depend on the chunk count. (Sized to the length at record time, the replay ignored
+        // every key past that chunk boundary.)
+        const nch: usize = if (ru.rec != null) (seg.cache.capacity + 127) / 128 else (seg.cache.len + seg.rows + 127) / 128;
+        const dims = try sc.dimsMoving([8]i32{ @intCast(seg.cache.len), @intCast(seg.rows), @intCast(seg.cache.capacity), @intCast(nch), 0, @intCast(total), @intCast(base), 0 }, null, 0);
         try ru.go(.attn_partial_gqa, geo.attnPartialGqa(@intCast(nch), rows, c.kv_heads, c.heads / c.kv_heads), .{
             sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
         });

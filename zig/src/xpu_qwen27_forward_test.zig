@@ -1,5 +1,8 @@
 //! tf-xpu-qwen27-forward-test [model dir] [ref dir]: on-card gates for the Qwen 3.8 27B XPU forward (Phase 6.3/6.4).
 //! Gate C: greedy tokens of the fixture's prompt vs greedy-<name>.json, one row per generated token, on the card.
+//! Gate D: a replayed decode step (families/qwen27/xpu_replay.zig: the step recorded once into a command list and
+//! re-submitted per token) gives the eager forward's logits bit for bit for 140 tokens, across 128-key chunk
+//! boundaries, for prompt lengths equal to fixed `dims` values (1 row, 4 kv heads, 24 heads) and longer ones.
 //! The same run measures the decode step: one token per segment, capacity 512, >= 60 timed steps, median reported.
 //! The reference directory holds the MLX fp32 fixtures (exp/ref/qwen38-27b-mlx4-fp32): <name>.npy (prompt ids),
 //! greedy-<name>.json (prompt_tokens + tokens). Gate C needs only the greedy file; the teacher-forced logits rule is
@@ -152,6 +155,64 @@ fn decodeSteps(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, ids: []c
     }
 }
 
+fn prefill(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch, cache: *xs.Cache, ids: []const u32) !void {
+    var at: usize = 0;
+    while (at < ids.len) : (at += sc.rows) try fwd.run(s, m, sc, cache, ids[at..@min(ids.len, at + sc.rows)], .{});
+}
+
+fn gateD(s: *rt.session.Session, m: *fwd.Model, sc: *fwd.Scratch) !bool {
+    const lens = [_]usize{ 1, 4, 24, 130, 250 };
+    const n = 140;
+    const V = sc.cfg.vocab;
+    var q = try rt.cmdlist.Queue.init(&s.ctx);
+    defer q.deinit();
+    const ref = try gpa.alloc(u16, n * V);
+    defer gpa.free(ref);
+    const row = try gpa.alloc(u16, V);
+    defer gpa.free(row);
+    var all = true;
+    for (lens) |L| {
+        const prompt = try gpa.alloc(u32, L);
+        defer gpa.free(prompt);
+        for (prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 50000);
+        const cap = L + n + 8;
+        var toks: [n]u32 = undefined;
+        {
+            var a = try xs.Cache.init(gpa, s, sc.cfg, cap);
+            defer a.deinit();
+            try prefill(s, m, sc, &a, prompt);
+            for (0..n) |i| {
+                try a.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+                toks[i] = @intCast(argmax(row));
+                try fwd.run(s, m, sc, &a, toks[i .. i + 1], .{});
+                try a.logits.download(&s.queue, 0, std.mem.sliceAsBytes(ref[i * V ..][0..V]));
+            }
+        }
+        var b = try xs.Cache.init(gpa, s, sc.cfg, cap);
+        defer b.deinit();
+        try prefill(s, m, sc, &b, prompt);
+        var step = try fwd.replay.recordStep(s, m, sc, &b, toks[0..1], gpa);
+        defer step.deinit(gpa);
+        var a_scratch_probe = try xs.Cache.init(gpa, s, sc.cfg, cap); // a different stream's eager token
+        defer a_scratch_probe.deinit();
+        // An eager forward between recording and the first replay rewrites the shared host pool, as the backend's first
+        // token does; every token, the recorded one included, then runs from the replayed list.
+        try fwd.run(s, m, sc, &a_scratch_probe, toks[0..1], .{});
+        var bad: ?usize = null;
+        for (0..n) |i| {
+            try fwd.replay.replayStep(s, &step, &q, .{ .token = toks[i], .position = @intCast(b.len), .cache_len = @intCast(b.len) });
+            b.len += 1;
+            try b.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
+            if (bad == null and !std.mem.eql(u16, row, ref[i * V ..][0..V])) bad = i;
+        }
+        if (bad) |i| {
+            std.debug.print("gate D prompt {d}: replayed token {d} (cache {d}) differs from the eager forward -> FAIL\n", .{ L, i, L + i });
+            all = false;
+        } else std.debug.print("gate D prompt {d}: {d} replayed tokens == eager, bit for bit (cache {d} -> {d}) -> ok\n", .{ L, n - 1, L + 1, L + n });
+    }
+    return all;
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
@@ -195,6 +256,12 @@ pub fn main(init: std.process.Init) !u8 {
         ok = ok and r;
     }
     std.debug.print("GATE C greedy: {s}\n", .{if (ok) "PASS" else "FAIL"});
+    const d = gateD(&s, &m, &sc) catch |e| blk: {
+        std.debug.print("gate D error: {s}\n", .{@errorName(e)});
+        break :blk false;
+    };
+    std.debug.print("GATE D replay == eager: {s}\n", .{if (d) "PASS" else "FAIL"});
+    ok = ok and d;
 
     // The contract's decode measurement: >= 60 timed one-token steps, median reported.
     var dec: std.ArrayList(u64) = .empty;

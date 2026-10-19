@@ -1,4 +1,5 @@
-//! tf-xpu-qwen27-profile <model dir> <prompt tokens> <steps>: where a Qwen 3.8 27B decode step's time goes on a B70.
+//! tf-xpu-qwen27-profile <model dir> <prompt tokens> <steps> [rows]: where a Qwen 3.8 27B decode step's time goes on a B70.
+//! [rows] (default 1): rows per verify round - a speculative window's or a shared round's width; plain stays 1 row.
 //! Prefills a synthetic prompt in 128-row chunks (as the server does), then runs <steps> decode steps two ways and
 //! prints wall time per step, device time per step, and device time per kernel and per projection shape:
 //!   verify : the server's per-token path - a recording one-row round (`runSegments`, record = true, head = .all)
@@ -74,14 +75,15 @@ fn report(name: []const u8, p: *fwd.Profile, steps: usize, wall_ns: u64) void {
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
-    if (argv.len != 4) {
-        std.debug.print("usage: tf-xpu-qwen27-profile <model dir> <prompt tokens> <steps>\n", .{});
+    if (argv.len != 4 and argv.len != 5) {
+        std.debug.print("usage: tf-xpu-qwen27-profile <model dir> <prompt tokens> <steps> [rows]\n", .{});
         return 2;
     }
     const dir = argv[1];
     const plen = try std.fmt.parseInt(usize, argv[2], 10);
     const steps = try std.fmt.parseInt(usize, argv[3], 10);
-    const capacity = plen + 2 * (steps + 8) + 16;
+    const vrows: usize = if (argv.len == 5) try std.fmt.parseInt(usize, argv[4], 10) else 1;
+    const capacity = plen + (vrows + 1) * (steps + 8) + 16;
 
     var s: rt.session.Session = undefined;
     s.open(.{}) catch |e| {
@@ -95,7 +97,7 @@ pub fn main(init: std.process.Init) !u8 {
     var m: fwd.Model = .{ .weights = &w, .kernels = undefined };
     try m.kernels.load(&s, gpa);
     defer m.kernels.deinit();
-    var sc = try fwd.Scratch.initGpa(gpa, &s, config, chunk, capacity, 1);
+    var sc = try fwd.Scratch.initGpa(gpa, &s, config, chunk, capacity, @max(1, vrows));
     defer sc.deinit();
     var cache = try xs.Cache.init(gpa, &s, config, capacity);
     defer cache.deinit();
@@ -129,7 +131,9 @@ pub fn main(init: std.process.Init) !u8 {
             const ts = sys.nowNs();
             switch (mode) {
                 .verify => {
-                    try fwd.runSegments(&s, &m, &sc, &.{.{ .cache = &cache, .rows = 1 }}, &.{tok}, true, .{ .head = .all });
+                    var win: [32]u32 = undefined;
+                    for (win[0..vrows], 0..) |*t, k| t.* = tok +% @as(u32, @intCast(k));
+                    try fwd.runSegments(&s, &m, &sc, &.{.{ .cache = &cache, .rows = vrows }}, win[0..vrows], true, .{ .head = .all });
                     try sc.logits.download(&s.queue, 0, std.mem.sliceAsBytes(row));
                 },
                 .plain => {

@@ -38,6 +38,9 @@ pub const Step = struct {
     /// while this exact scratch lives.
     sc: *fwd.Scratch,
     slots: []DimsSlot,
+    /// The host pool as the recording left it (ids, conv windows, every `dims` slot): the kernels read the pool when
+    /// the list executes, and any eager forward in between (this stream's first token, another stream) rewrites it.
+    image: []u8,
     /// The values the step was recorded with; the replays that follow are checked against them.
     recorded: Values,
     /// Replays performed so far: the caller's cache length must be `recorded.cache_len + replays`.
@@ -46,6 +49,7 @@ pub const Step = struct {
     pub fn deinit(self: *Step, gpa: std.mem.Allocator) void {
         self.list.deinit();
         gpa.free(self.slots);
+        gpa.free(self.image);
         self.* = undefined;
     }
 };
@@ -102,9 +106,11 @@ pub const Replay = struct {
     }
 };
 
-/// Rewrites the step's moving values in place: the token id and the position/cache-length elements of every `dims` slot.
+/// Restores the step's pool image, then writes the moving values: the token id and the position/cache-length elements
+/// of the slots the forward marked (`Scratch.dimsMoving`).
 pub fn writeValues(step: *Step, v: Values) void {
     const pool: [*]u8 = @ptrCast(step.sc.pool.ptr.?);
+    @memcpy(pool[0..step.image.len], step.image);
     const ids: [*]u32 = @ptrCast(@alignCast(pool));
     ids[0] = v.token;
     for (step.slots) |slot| {
@@ -139,7 +145,10 @@ pub fn recordStep(
     var slots: std.ArrayList(DimsSlot) = .empty;
     errdefer slots.deinit(gpa);
     try fwd.recordDecode(s, &rec, m, sc, cache, tokens, recorded.position, &slots);
+    const pool: [*]const u8 = @ptrCast(sc.pool.ptr.?);
+    const image = try gpa.dupe(u8, pool[0..sc.poolUsed()]);
+    errdefer gpa.free(image);
     const list = try Recorded.take(&rec);
     const owned = try slots.toOwnedSlice(gpa);
-    return .{ .list = list, .sc = sc, .slots = owned, .recorded = recorded };
+    return .{ .list = list, .sc = sc, .slots = owned, .image = image, .recorded = recorded };
 }
