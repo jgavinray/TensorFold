@@ -216,6 +216,12 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.Bu
     greedy.addImport("qwen27_forward", q27_mod);
     const greedy_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-greedy", .root_module = greedy });
     const greedy_install = b.addInstallArtifact(greedy_exe, .{});
+    // Per-kernel device time of 27B decode steps (verify path and plain), for speed work.
+    const q27_prof = b.createModule(.{ .root_source_file = b.path("zig/src/xpu_qwen27_profile.zig"), .target = target, .optimize = .ReleaseFast, .link_libc = true });
+    q27_prof.addImport("xpu_qwen35_kernels", q27k);
+    q27_prof.addImport("qwen27_forward", q27_mod);
+    const prof_exe = b.addExecutable(.{ .name = "tf-xpu-qwen27-profile", .root_module = q27_prof });
+    b.step("xpu-qwen27-profile", "Build tf-xpu-qwen27-profile (27B decode-step device time per kernel)").dependOn(&b.addInstallArtifact(prof_exe, .{}).step);
     const tools = b.step("xpu-qwen27-tools", "Build tf-xpu-qwen27-logits and tf-xpu-qwen27-greedy into zig-out/bin");
     tools.dependOn(&logits_install.step);
     tools.dependOn(&greedy_install.step);
