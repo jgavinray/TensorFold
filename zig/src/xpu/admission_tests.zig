@@ -70,6 +70,28 @@ test "allocation failure and oversize allocation are errors, not buffers" {
     try std.testing.expectError(error.Invalid, rt.memory.Buffer.alloc(&ctx, .device, 1 << 40));
 }
 
+test "the runtime knows the card's capacity and refuses to overcommit it" {
+    // 2026-10-19: a 27B serving plan of ~58 GiB was created on a 31.9 GiB B70 (the driver evicted to system memory)
+    // and decode stalled forever. The context reads the card's real size and every device allocation is charged.
+    var r = try rt.Runtime.openPath(fixtures.success);
+    defer r.close();
+    const d = try rt.device.select(&r, "0000:44:00.0");
+    var ctx = try rt.context.Context.init(d);
+    defer ctx.deinit();
+    try std.testing.expectEqual(@as(u64, 32 << 30), ctx.usage.total); // the mock's one 32 GiB region
+    try std.testing.expectEqual(@as(u64, 31 << 30), ctx.usage.budget); // minus the 1 GiB reserve
+    // A driver failure rolls the charge back.
+    try std.testing.expectError(error.ZeFailed, rt.memory.Buffer.alloc(&ctx, .device, 4096));
+    try std.testing.expectEqual(@as(u64, 0), ctx.usage.used.load(.monotonic));
+    // Past the budget the runtime refuses before the driver is asked, and charges nothing.
+    ctx.usage.used.store(31 << 30, .monotonic);
+    try std.testing.expectError(error.OutOfDeviceMemory, rt.memory.Buffer.alloc(&ctx, .device, 4096));
+    try std.testing.expectError(error.OutOfDeviceMemory, rt.memory.Buffer.alloc(&ctx, .shared, 4096));
+    try std.testing.expectEqual(@as(u64, 31 << 30), ctx.usage.used.load(.monotonic));
+    // Host memory is not the card's: it is never charged or refused by the budget.
+    try std.testing.expectError(error.ZeFailed, rt.memory.Buffer.alloc(&ctx, .host, 4096));
+}
+
 test "a regular list is created on the compute group and a replay submits exactly one list" {
     var r = try rt.Runtime.openPath(fixtures.success);
     defer r.close();

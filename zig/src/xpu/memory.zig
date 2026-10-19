@@ -15,6 +15,25 @@ pub const Buffer = struct {
 
     pub fn alloc(ctx: *const Context, kind: Kind, len: usize) runtime.Error!Buffer {
         if (len == 0 or len > ctx.dev.props.maxMemAllocSize) return error.Invalid;
+        // Device and shared allocations are charged against the card's real capacity (context.Usage): an allocation
+        // that would overcommit VRAM is refused here, loudly, instead of being created and evicted by the driver.
+        const charged = kind != .host;
+        if (charged) {
+            const u = ctx.usage;
+            const before = u.used.fetchAdd(len, .monotonic);
+            if (before + len > u.budget) {
+                _ = u.used.fetchSub(len, .monotonic);
+                var bb: [12]u8 = undefined;
+                std.log.warn("xpu: {s}: device memory budget exceeded - asked {d} MiB with {d} MiB already allocated; " ++
+                    "budget {d} MiB of {d} MiB on the card. The plan does not fit this card: shrink it, never overcommit.", .{
+                    ctx.dev.bdf.format(&bb), (len + (1 << 20) - 1) >> 20, before >> 20, u.budget >> 20, u.total >> 20,
+                });
+                return error.OutOfDeviceMemory;
+            }
+        }
+        errdefer if (charged) {
+            _ = ctx.usage.used.fetchSub(len, .monotonic);
+        };
         var p: ?*anyopaque = null;
         const api = ctx.api();
         const dd: abi.DeviceMemDesc = .{};
@@ -30,6 +49,7 @@ pub const Buffer = struct {
 
     pub fn free(self: *Buffer) void {
         _ = self.ctx.api().zeMemFree(self.ctx.handle, self.ptr);
+        if (self.kind != .host) _ = self.ctx.usage.used.fetchSub(self.len, .monotonic);
         self.* = undefined;
     }
 

@@ -221,7 +221,17 @@ fn openQwen35(h: *Host, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, p
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.xpu.qwen35.backend(), h.clock.clock());
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = chunk, .structures = true });
+    logDeviceMemory(h);
     try h.host.start();
+}
+
+/// One line at load: what the serving plan holds on the card against what the card has (xpu/context.zig Usage).
+/// The serve gates read it; a plan that does not fit never gets here (Buffer.alloc refuses it).
+fn logDeviceMemory(h: *Host) void {
+    const u = h.session.ctx.usage;
+    std.log.info("xpu: device memory {d} MiB allocated of a {d} MiB budget ({d} MiB on the card)", .{
+        u.used.load(.monotonic) >> 20, u.budget >> 20, u.total >> 20,
+    });
 }
 
 /// Builds a Qwen3.8-27B host: the same shape, its own 27B config/weights/forward/backend.
@@ -265,5 +275,6 @@ fn openQwen27(h: *Host, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, p
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.xpu.qwen27.backend(), h.clock.clock());
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = chunk, .structures = true });
+    logDeviceMemory(h);
     try h.host.start();
 }

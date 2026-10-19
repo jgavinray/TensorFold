@@ -243,6 +243,10 @@ pub fn sizesOf(config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: 
 /// (every launch gets its own slot, so the whole forward can be queued before the host waits).
 pub const Scratch = struct {
     rows: usize,
+    /// Rows a recording (verify) round may span: the recurrence snapshots hold this many rows per linear layer.
+    /// Smaller than `rows` at 27B on purpose - see `snapshot_rows`. (Conv snapshots stay `rows` wide: gdn_pre writes
+    /// one for every row of every forward, prefill chunks included.)
+    snap_rows: usize,
     capacity: usize,
     logit_rows: usize,
     cfg: cfgmod.Config,
@@ -288,6 +292,21 @@ pub const Scratch = struct {
     const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
+    /// Recurrence-snapshot rows (a recording round's row budget). Each row costs one recurrence snapshot per linear layer:
+    /// 48 x 3 MiB (v_heads*dv*dk fp32) = 147 MiB at 27B, so the 2B's 128 rows would be 18.4 GiB next to 15 GiB of
+    /// weights on a 31.9 GiB card - an overcommit the driver resolves by evicting to system memory, which stalled
+    /// decode forever (2026-10-19). 32 rows = two streams' 16-row windows (what `xpu_qualify` runs) = 4.6 GiB.
+    pub const snapshot_rows = 2 * xs.window_rows;
+
+    /// Device bytes of the snapshot buffers, per *real* linear layer (`config.layers` of them - never the `max_layers`
+    /// capacity of the kinds table): `snap_rows` recurrence snapshots and `rows` conv tails.
+    pub fn snapshotBytes(config: cfgmod.Config, rows: usize, snap_rows: usize) usize {
+        var n: usize = 0;
+        for (0..config.layers) |i| if (config.kind(i) == .linear) {
+            n += snap_rows * xs.deltaBytes(config) + rows * xs.convBytes(config);
+        };
+        return n;
+    }
 
     pub fn init(s: *rt.session.Session, config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: usize) rt.Error!Scratch {
         return initGpa(std.heap.page_allocator, s, config, rows, capacity, logit_rows);
@@ -296,6 +315,7 @@ pub const Scratch = struct {
     pub fn initGpa(gpa: std.mem.Allocator, s: *rt.session.Session, config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: usize) rt.Error!Scratch {
         var out: Scratch = undefined;
         out.rows = rows;
+        out.snap_rows = @min(rows, snapshot_rows);
         out.capacity = capacity;
         out.logit_rows = logit_rows;
         out.cfg = config;
@@ -313,13 +333,14 @@ pub const Scratch = struct {
             @field(out, n) = try Buffer.alloc(&s.ctx, kind, sizes[i]);
             out.made = i + 1;
         }
-        // One recurrence and one conv snapshot buffer per linear layer, `rows` rows wide (one per window row).
-        for (&out.snaps_delta, 0..) |*b, i| if (config.kind(i) == .linear) {
-            b.* = try Buffer.alloc(&s.ctx, .device, rows * xs.deltaBytes(config));
+        // One recurrence snapshot buffer (`snap_rows` rows: only a recording round writes it) and one conv snapshot
+        // buffer (`rows` rows: gdn_pre writes a conv tail for every row of every forward) per real linear layer. Bounded
+        // by `config.layers`: `kinds` defaults every slot past the model's layers to `.linear`, and iterating the whole
+        // `max_layers` table allocated 64 phantom layers' snapshots (42.8 GiB at 27B, 2026-10-19).
+        for (out.snaps_delta[0..config.layers], out.snaps_conv[0..config.layers], 0..) |*b, *cb, i| if (config.kind(i) == .linear) {
+            b.* = try Buffer.alloc(&s.ctx, .device, out.snap_rows * xs.deltaBytes(config));
             out.made_snaps = i + 1;
-        };
-        for (&out.snaps_conv, 0..) |*b, i| if (config.kind(i) == .linear) {
-            b.* = try Buffer.alloc(&s.ctx, .device, rows * xs.convBytes(config));
+            cb.* = try Buffer.alloc(&s.ctx, .device, rows * xs.convBytes(config));
         };
         return out;
     }
@@ -364,7 +385,7 @@ pub const Scratch = struct {
     /// The recurrence snapshot of `layer` at absolute scratch row `row` (`deltaBytes` long); `keep` reads it back.
     pub fn snapDelta(self: *Scratch, layer: usize, row: usize) *anyopaque {
         const b = self.snaps_delta[layer] orelse unreachable;
-        std.debug.assert(row < self.rows);
+        std.debug.assert(row < self.snap_rows);
         return @ptrFromInt(@intFromPtr(b.ptr.?) + row * xs.deltaBytes(self.cfg));
     }
     /// The conv-tail snapshot of `layer` at absolute scratch row `row` (`convBytes` long); `keep` reads it back.
@@ -498,7 +519,7 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         total += seg.rows;
     }
     if (total == 0 or total != tokens.len or total > sc.rows or (o.head == .all and total > sc.logit_rows)) return error.QwenRowsExceeded;
-    if (record and (segments.len > max_segments or total > xs.max_segments * xs.window_rows)) return error.QwenRowsExceeded;
+    if (record and (segments.len > max_segments or total > sc.snap_rows)) return error.QwenRowsExceeded;
     if (!record and segments.len != 1) return error.QwenRowsExceeded;
     for (tokens) |id| if (id >= c.vocab) return error.InvalidQwenToken;
     @memcpy(sc.ids()[0..total], tokens);
@@ -547,7 +568,9 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
         try s.queue.copy(seg.cache.logits.ptr, off(sc.logits, row * c.vocab * 2), c.vocab * 2, null);
         var rec: [cfg.max_layers]?*const anyopaque = @splat(null);
         var cv: [cfg.max_layers]?*const anyopaque = @splat(null);
-        for (&rec, &cv, 0..) |*r, *v, i| if (seg.cache.c.kind(i) == .linear) {
+        // Snapshots exist only for real linear layers and only a recording round wrote them.
+        const n_layers = seg.cache.c.layers;
+        if (record) for (rec[0..n_layers], cv[0..n_layers], 0..) |*r, *v, i| if (seg.cache.c.kind(i) == .linear) {
             r.* = sc.snapDelta(i, base + seg.rows - 1);
             v.* = sc.snapConv(i, base + seg.rows - 1);
         };
@@ -616,12 +639,14 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
     for (segments) |seg| {
         const cache = &seg.cache.blocks[layer].attention;
         const rows: u32 = @intCast(seg.rows);
-        // dims[1] is the row stride of the shared `queries` buffer, dims[2] this segment's base.
+        // dims[1] is the row stride of the shared `queries` buffer, dims[2] this segment's base. The kernels read input
+        // row dims[2] + r themselves (layout.cl: m = dims[2] + r), so the inputs are the unshifted buffers - shifting
+        // the pointer by `base` too read every segment past the first `base` rows late (and `v` at the wrong stride).
         try ru.go(.queries, geo.layout(.queries, rows, c.hidden, c.head_dim, c.heads, c.kv_heads), .{
-            off(sc.q, base * c.gdnValueDim() * 2), sc.queries.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), T, @intCast(base), 0 }),
+            sc.q.ptr, sc.queries.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), T, @intCast(base), 0 }),
         });
         try ru.go(.keys, geo.layout(.keys, rows, c.hidden, c.head_dim, c.heads, c.kv_heads), .{
-            off(sc.knorm, base * c.kvDim() * 2), off(sc.v, base * c.gdnValueDim() * 2), cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), @intCast(seg.cache.capacity), @intCast(base), 0 }),
+            sc.knorm.ptr, sc.v.ptr, cache.keys.ptr, cache.values.ptr, sc.dims([4]u32{ @intCast(seg.cache.len), @intCast(seg.cache.capacity), @intCast(base), 0 }),
         });
         const nch: usize = (seg.cache.len + seg.rows + 127) / 128;
         const dims = sc.dims([8]i32{ @intCast(seg.cache.len), @intCast(seg.rows), @intCast(seg.cache.capacity), @intCast(nch), 0, @intCast(total), @intCast(base), 0 });
@@ -633,6 +658,44 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
     }
     try ru.go(.attention_gate, geo.layout(.attention_gate, T, c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.y.ptr, sc.qraw.ptr, sc.mix.ptr });
     try ru.projection(a.o, sc.mix.ptr.?, sc.r.ptr.?, total);
+}
+
+test "the serving scratch fits a B70 next to the 27B weights: real layers only, bounded snapshot rows" {
+    // 2026-10-19: the serving scratch asked for ~44 GiB on a 31.9 GiB card (snapshots for 64 phantom layers past the
+    // model's 64, at 128 rows each); the driver evicted to system memory and decode stalled forever. This pins the
+    // arithmetic on the host so it cannot regress silently: the real layer schedule, the snapshot row budget, and
+    // the whole non-weight footprint of the serving scratch (rows 128, context 32768, 256 logit rows).
+    const g = cfgmod.Pinned;
+    var config = cfgmod.Config{
+        .hidden = g.hidden,
+        .intermediate = g.intermediate,
+        .layers = g.layers,
+        .vocab = g.vocab,
+        .heads = g.heads,
+        .kv_heads = g.kv_heads,
+        .head_dim = g.head_dim,
+        .k_heads = g.k_heads,
+        .v_heads = g.v_heads,
+        .dk = g.dk,
+        .dv = g.dv,
+        .conv_kernel = g.conv_kernel,
+        .eps = g.eps,
+        .rope_dims = g.rotary_dim,
+        .rope_theta = g.theta,
+    };
+    // As config.parse sets it: full attention every 4th layer. Slots past `layers` keep the table default.
+    for (config.kinds[0..config.layers], 0..) |*k, i| k.* = if ((i + 1) % 4 == 0) .attention else .linear;
+    var linear: usize = 0;
+    for (0..config.layers) |i| linear += @intFromBool(config.kind(i) == .linear);
+    try std.testing.expectEqual(@as(usize, 48), linear);
+    try std.testing.expectEqual(48 * (Scratch.snapshot_rows * xs.deltaBytes(config) + 128 * xs.convBytes(config)),
+        Scratch.snapshotBytes(config, 128, Scratch.snapshot_rows));
+    // Static non-weight footprint of the serving scratch must leave room for 15 GiB of weights and per-stream caches
+    // on a 31.9 GiB card: budget 8 GiB (it is ~5.6 GiB; the defect above made it ~44 GiB).
+    const sizes = sizesOf(config, 128, 32768, xs.max_segments * xs.window_rows);
+    var total: usize = Scratch.snapshotBytes(config, 128, @min(128, Scratch.snapshot_rows));
+    for (sizes) |b| total += b;
+    try std.testing.expect(total <= 8 << 30);
 }
 
 test "every scratch buffer is at least as wide as the widest writer that fills it" {
