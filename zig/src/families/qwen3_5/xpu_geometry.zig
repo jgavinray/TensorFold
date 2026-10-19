@@ -16,6 +16,17 @@ fn ceilDiv(a: u32, b: u32) u32 {
 pub fn qmm(rows: u32, outputs: u32) Geo {
     return .{ .gx = @max(1, ceilDiv(outputs, 64)) * 256, .gy = rows, .lx = 256 };
 }
+/// qwen35_qmm_xmx (shared/qmm, XMX prefill matmul): 64-work-item groups = 4 sub-groups x QX_NT (2) column tiles of 16
+/// = 128 columns, by QX_ROWS (16) rows. Must match the kernel's QX_ROWS / QX_NT defaults.
+pub const qmm_xmx_rows: u32 = 16;
+pub const qmm_xmx_cols: u32 = 128;
+pub fn qmmXmx(rows: u32, outputs: u32) Geo {
+    return .{ .gx = ceilDiv(outputs, qmm_xmx_cols) * 64, .gy = ceilDiv(rows, qmm_xmx_rows), .lx = 64 };
+}
+/// qwen35_qmm_xsum: one work-item per (quantization group, row).
+pub fn qmmXsum(rows: u32, groups: u32) Geo {
+    return .{ .gx = ceilDiv(groups, 16) * 16, .gy = rows, .lx = 16 };
+}
 /// qwen35_qmm_pair: two same-shape N-column projections of one row, walked in lockstep. A work-group covers
 /// QW_HALF_TILE = 32 columns of each projection, so the grid is ceil(N/32) work-groups of 256 per row.
 pub fn qmmPair(rows: u32, outputs_per_projection: u32) Geo {

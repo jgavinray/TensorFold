@@ -64,11 +64,12 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
+            .qmm_xmx, .qmm_xsum => .qmm,
             inline else => |t| @field(Module, @tagName(t)),
         };
     }
@@ -214,6 +215,10 @@ pub const widths = struct {
     pub fn convSnap(cfg_: cfgmod.Config, rows: usize) usize {
         return rows * xs.convBytes(cfg_);
     }
+    /// `xsum`: the XMX prefill matmul's per-(row, quantization group) input sums (fp32), for the widest input.
+    pub fn xsum(cfg_: cfgmod.Config, rows: usize) usize {
+        return rows * (@max(cfg_.intermediate, @max(cfg_.hidden, cfg_.gdnValueDim())) / 64) * 4;
+    }
 };
 
 /// The byte size of every `Scratch` buffer, in `Scratch.names` order. Each entry is the widest writer's width (see
@@ -235,7 +240,7 @@ pub fn sizesOf(config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: 
         w.gdnGate(config, rows),
         w.attnPartial(config, rows, chunks), w.attnPartial(config, rows, chunks),
         w.attnPartialOut(config, rows, chunks),
-        w.logits(config, logit_rows), w.convSnap(config, rows),
+        w.logits(config, logit_rows), w.convSnap(config, rows), w.xsum(config, rows),
     };
 }
 
@@ -276,6 +281,7 @@ pub const Scratch = struct {
     po: Buffer,
     logits: Buffer,
     conv_snap: Buffer,
+    xsum: Buffer,
     /// Per-layer window snapshots for shared rounds, indexed by the absolute scratch row of the segment's last row.
     snaps_delta: [cfgmod.max_layers]?Buffer = @splat(null),
     snaps_conv: [cfgmod.max_layers]?Buffer = @splat(null),
@@ -289,7 +295,7 @@ pub const Scratch = struct {
     /// Allocator for `record_slots` appends; the caller's, since the scratch does not own one otherwise.
     gpa: std.mem.Allocator = undefined,
 
-    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap" };
+    const names = .{ "pool", "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries", "qkv", "gate", "up", "act", "qraw", "knorm", "a", "b", "beta", "g", "pm", "pl", "po", "logits", "conv_snap", "xsum" };
     pub const dims_slots = 1024;
     pub const slot_bytes = 32;
     /// Recurrence-snapshot rows (a recording round's row budget). Each row costs one recurrence snapshot per linear layer:
@@ -408,6 +414,10 @@ const Run = struct {
     sc: *Scratch,
     /// When set, launches are recorded into this regular list instead of executed on the immediate queue.
     rec: ?*rt.cmdlist.Recorder = null,
+    /// A non-recording forward (prefill chunks, the logits tools): projections of >= 8 rows may use the XMX matmul.
+    /// Recording rounds (verify windows) and recorded decode steps stay on the scalar kernel, byte-exact with one-row
+    /// execution as the startup qualify requires.
+    prefill: bool = false,
 
     fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
@@ -423,6 +433,17 @@ const Run = struct {
         return self.w.ptr(t);
     }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
+        // Prefill on the XMX engines: 5-7x the scalar kernel on the 27B shapes at the bf16 accuracy floor
+        // (exp/kernels/qmm_xmx/xmx_check.py). Narrow outputs (the GDN a/b heads) keep the scalar kernel.
+        if (self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64) {
+            try self.go(.qmm_xsum, geo.qmmXsum(@intCast(rows), @intCast(l.inputs / 64)), .{
+                x, @as(i32, @intCast(rows)), self.sc.xsum.ptr, @as(i32, @intCast(l.inputs)),
+            });
+            try self.go(.qmm_xmx, geo.qmmXmx(@intCast(rows), @intCast(l.outputs)), .{
+                x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)), self.sc.xsum.ptr,
+            });
+            return;
+        }
         try self.go(.qmm, geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
         });
@@ -534,7 +555,7 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
     sc.dims_used = 0;
     sc.record_slots = o.slots;
     defer sc.record_slots = null;
-    const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc, .rec = o.rec };
+    const ru = Run{ .s = s, .k = &m.kernels, .w = m.weights, .sc = sc, .rec = o.rec, .prefill = !record and o.rec == null };
     const w = m.weights;
     const T: u32 = @intCast(total);
     try ru.go(.embed, geo.layout(.embed, T, c.hidden, c.head_dim, c.heads, c.kv_heads), .{ sc.pool.ptr, w.ptr(w.embed.weight), w.ptr(w.embed.scales), w.ptr(w.embed.biases), sc.h.ptr });
