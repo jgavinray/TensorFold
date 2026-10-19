@@ -149,3 +149,119 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
             OUT[(size_t)r * N + n0 + i] = intel_convert_bfloat16_as_ushort(red[s][i][0]);
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// qwen35_qmm_xmx: the same affine int4 matmul on the XMX matrix engines, for prefill chunks (R >> 1).
+//
+// The scalar kernel is compute-bound at ~1.7 TFLOPS (int4 unpack + fp32 fma); the B70 sustains 121 TFLOPS bf16 on
+// `dpas` at the 100 W cap (exp/capability/BUDGET-27B.md). Per quantization group g (QW_GROUP inputs), column n:
+//     OUT += SC[n][g] * sum_k q x  +  BI[n][g] * sum_k x
+// - the scalar kernel's formula. Weights enter dpas as bf16(128 + q) = 0x4300 | q (exact; no float conversion), so
+// dpas yields sum (128+q) x and sum q x = that - 128 * sum x. sum_k x per (row, group) comes from
+// qwen35_qmm_xsum (one pass over X). Products are exact in fp32; only summation order differs from the scalar kernel
+// (not byte-identical: prefill only - decode and verify windows stay scalar, so the startup qualify is unaffected).
+// Tiles: a 16-lane sub-group owns 16 columns (lane = column) x QX_ROWS rows (QX_ROWS/8 dpas row blocks).
+// dpas layout (bf16, M8 K16 N16, SIMD16) verified on the card: exp/kernels/qmm_xmx/layout_check.py.
+#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
+#ifndef QX_ROWS
+#define QX_ROWS 16
+#endif
+#define QX_RB (QX_ROWS / 8)
+inline int qx_pair(uint w, int j) {             // nibbles 2j, 2j+1 of w as two bf16 (128 + q), low half first
+    const uint t = (w >> (8 * j)) & 0xFFu;
+    return (int)((t & 0xFu) | ((t >> 4) << 16) | 0x43004300u);
+}
+// XS[r][g] = sum of X[r][k] over group g (fp32), the bias term's input. Grid: (G, R).
+__kernel void qwen35_qmm_xsum(__global const ushort* X, const int R, __global float* XS, const int K) {
+    const int g = get_global_id(0), r = get_global_id(1), G = K / QW_GROUP;
+    if (g >= G || r >= R) return;
+    const __global ushort* x = X + (size_t)r * K + (size_t)g * QW_GROUP;
+    float s = 0.0f;
+    for (int k = 0; k < QW_GROUP; ++k) s += intel_convert_as_bfloat16_float(x[k]);
+    XS[(size_t)r * G + g] = s;
+}
+#ifndef QX_NT
+#define QX_NT 2            // 16-column tiles per sub-group: one A load feeds QX_NT dpas
+#endif
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void qwen35_qmm_xmx(__global const ushort* X,   // bf16 bits, R x K
+                             const int R,
+                             __global const uint* W,     // N x (K/8) uint32, 8 int4 per word
+                             __global const ushort* SC,  // bf16 bits, N x (K/QW_GROUP)
+                             __global const ushort* BI,  // bf16 bits, N x (K/QW_GROUP)
+                             __global ushort* OUT,       // bf16 bits, R x N
+                             const int N, const int K,
+                             __global const float* XS) { // R x G, from qwen35_qmm_xsum
+    const int G = K / QW_GROUP;
+    const int l = get_sub_group_local_id();
+    const int nbase = (get_global_id(0) / 16) * (16 * QX_NT);   // first column of this sub-group
+    const int r0 = get_global_id(1) * QX_ROWS;
+    int nc[QX_NT];
+    #pragma unroll
+    for (int t = 0; t < QX_NT; ++t) nc[t] = min(nbase + 16 * t + l, N - 1);
+
+    float8 acc[QX_NT][QX_RB];
+    #pragma unroll
+    for (int t = 0; t < QX_NT; ++t)
+        #pragma unroll
+        for (int rb = 0; rb < QX_RB; ++rb) acc[t][rb] = (float8)(0.0f);
+
+    for (int g = 0; g < G; ++g) {
+        uint8 wg[QX_NT];
+        #pragma unroll
+        for (int t = 0; t < QX_NT; ++t) wg[t] = vload8(g, W + (size_t)nc[t] * (K >> 3));
+        float8 cq[QX_NT][QX_RB];
+        #pragma unroll
+        for (int t = 0; t < QX_NT; ++t)
+            #pragma unroll
+            for (int rb = 0; rb < QX_RB; ++rb) cq[t][rb] = (float8)(0.0f);
+        #pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            int8 b[QX_NT];
+            #pragma unroll
+            for (int t = 0; t < QX_NT; ++t) {
+                const uint w0 = ((uint*)&wg[t])[2 * kk], w1 = ((uint*)&wg[t])[2 * kk + 1];
+                b[t] = (int8)(qx_pair(w0, 0), qx_pair(w0, 1), qx_pair(w0, 2), qx_pair(w0, 3),
+                              qx_pair(w1, 0), qx_pair(w1, 1), qx_pair(w1, 2), qx_pair(w1, 3));
+            }
+            const int k0 = g * QW_GROUP + kk * 16;
+            #pragma unroll
+            for (int rb = 0; rb < QX_RB; ++rb) {
+                short8 a;
+                #pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int r = min(r0 + rb * 8 + m, R - 1);
+                    ((ushort*)&a)[m] = intel_sub_group_block_read_us(X + (size_t)r * K + k0);
+                }
+                #pragma unroll
+                for (int t = 0; t < QX_NT; ++t) cq[t][rb] = intel_sub_group_bf16_bf16_matrix_mad_k16(a, b[t], cq[t][rb]);
+            }
+        }
+        #pragma unroll
+        for (int rb = 0; rb < QX_RB; ++rb) {
+            float8 sx;
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) ((float*)&sx)[m] = XS[(size_t)min(r0 + rb * 8 + m, R - 1) * G + g];
+            #pragma unroll
+            for (int t = 0; t < QX_NT; ++t) {
+                const float sc = intel_convert_as_bfloat16_float(SC[(size_t)nc[t] * G + g]);
+                const float bi = intel_convert_as_bfloat16_float(BI[(size_t)nc[t] * G + g]);
+                acc[t][rb] = fma(bi, sx, fma(sc, cq[t][rb] - 128.0f * sx, acc[t][rb]));
+            }
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < QX_NT; ++t) {
+        const int n = nbase + 16 * t + l;
+        if (n < N) {
+            #pragma unroll
+            for (int rb = 0; rb < QX_RB; ++rb)
+                #pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int r = r0 + rb * 8 + m;
+                    if (r < R) OUT[(size_t)r * N + n] = intel_convert_bfloat16_as_ushort(((float*)&acc[t][rb])[m]);
+                }
+        }
+    }
+}
