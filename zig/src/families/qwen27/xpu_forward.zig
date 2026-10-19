@@ -64,12 +64,13 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, qmm_split, qmm_q8, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, qmm_split, qmm_q8, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_partial_gqa, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
             .qmm_xmx, .qmm_xsum, .qmm_split, .qmm_q8 => .qmm,
+            .attn_partial_gqa => .attn_partial,
             inline else => |t| @field(Module, @tagName(t)),
         };
     }
@@ -568,7 +569,7 @@ const Run = struct {
     fn q8(self: Run, ps: []const Proj, x: *anyopaque, rows: usize) rt.Error!void {
         std.debug.assert(ps.len >= 1 and ps.len <= 4 and self.sc.cfg.group == 64);
         const k = ps[0].l.inputs;
-        try self.go(.qmm_split, geo.qmmXsum(@intCast(rows), @intCast(k / 64)), .{
+        try self.go(.qmm_split, geo.qmmSplit(@intCast(rows), @intCast(k / 64)), .{
             x, @as(i32, @intCast(rows)), self.sc.xq.ptr, self.sc.xscale.ptr, @as(i32, @intCast(k)),
         });
         var seg: [4]Proj = undefined;
@@ -814,7 +815,7 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
         });
         const nch: usize = (seg.cache.len + seg.rows + 127) / 128;
         const dims = sc.dims([8]i32{ @intCast(seg.cache.len), @intCast(seg.rows), @intCast(seg.cache.capacity), @intCast(nch), 0, @intCast(total), @intCast(base), 0 });
-        try ru.go(.attn_partial, geo.attnPartial(@intCast(nch), rows, c.heads), .{
+        try ru.go(.attn_partial_gqa, geo.attnPartialGqa(@intCast(nch), rows, c.kv_heads, c.heads / c.kv_heads), .{
             sc.queries.ptr, cache.keys.ptr, cache.values.ptr, @as(f32, 1.0 / 16.0), dims, sc.pm.ptr, sc.pl.ptr, sc.po.ptr,
         });
         try ru.go(.attn_merge, geo.attnMerge(rows, c.heads), .{ sc.pm.ptr, sc.pl.ptr, sc.po.ptr, dims, off(sc.y, base * c.gdnValueDim() * 2) });

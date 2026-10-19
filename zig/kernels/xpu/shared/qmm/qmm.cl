@@ -160,7 +160,7 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
 // 3 ALU ops unpack a word's 8 nibbles into two 4 x uint8 vectors, 4 dp4a apply them to the activations - 356 mJ/GB,
 // 281 GB/s, rms error 0.50x the bf16 floor (exp/kernels/power, exp/kernels/qmm_dp4a).
 //
-// qwen35_qmm_split, per (row r, group g of QW_GROUP inputs): s = max|x| / 127 (1 for an all-zero group),
+// qwen35_qmm_split, per (row r, group g of QW_GROUP inputs; one 64-item work-group each): s = max|x| / 127 (1 for an all-zero group),
 // x/s = hi + lo/254 with hi, lo int8 - about 2^-16 of the group max, far below the bf16 floor. XQ holds, per (r, g),
 // 16 words of hi then 16 of lo, in the order the unpack produces: within each 8-input word x0 x2 x4 x6 | x1 x3 x5 x7
 // (w & 0x0F0F0F0F holds nibbles 0,2,4,6; (w >> 4) & 0x0F0F0F0F holds 1,3,5,7). XS holds (s, exact fp32 sum of the
@@ -172,33 +172,29 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
 // dispatched first it finishes under its wide siblings' traffic). An absent segment has N = 0. Each row is computed
 // alone, so a row's bits do not depend on R (decode and verify windows agree byte for byte).
 
+// One 64-item work-group per (group, row): item k owns input k; max and sum are work-group reductions.
+__attribute__((reqd_work_group_size(QW_GROUP, 1, 1)))
 __kernel void qwen35_qmm_split(__global const ushort* X, const int R, __global uint* XQ, __global float* XS,
-                               const int K) {
-    const int g = get_global_id(0), r = get_global_id(1), G = K / QW_GROUP;
-    if (g >= G || r >= R) return;
-    const __global ushort* x = X + (size_t)r * K + (size_t)g * QW_GROUP;
-    float mx = 0.0f, sum = 0.0f;
-    for (int k = 0; k < QW_GROUP; ++k) {
-        const float v = bf16_to_f32(x[k]);
-        mx = fmax(mx, fabs(v));
-        sum += v;
-    }
+                                const int K) {
+    const int g = get_group_id(0), r = get_group_id(1), k = get_local_id(0), G = K / QW_GROUP;
+    const float v = bf16_to_f32(X[(size_t)r * K + (size_t)g * QW_GROUP + k]);
+    const float mx = work_group_reduce_max(fabs(v));
+    const float sum = work_group_reduce_add(v);
     const float s = mx > 0.0f ? mx / 127.0f : 1.0f;
+    const float t = v / s;
+    const float h = rint(t);
+    __local uchar hb[QW_GROUP], lb[QW_GROUP];
+    const int i = k & 7, slot = (k & ~7) + ((i & 1) ? 4 + (i >> 1) : (i >> 1));
+    hb[slot] = (uchar)((int)h & 0xFF);
+    lb[slot] = (uchar)((int)rint((t - h) * 254.0f) & 0xFF);
+    barrier(CLK_LOCAL_MEM_FENCE);
     __global uint* xq = XQ + ((size_t)r * G + g) * (QW_GROUP / 2);
-    for (int w = 0; w < QW_GROUP / 8; ++w) {
-        uint he = 0, ho = 0, le = 0, lo = 0;
-        for (int i = 0; i < 8; ++i) {
-            const float v = bf16_to_f32(x[8 * w + i]) / s;
-            const float h = rint(v);
-            const uint hb = (uint)((int)h & 0xFF), lb = (uint)((int)rint((v - h) * 254.0f) & 0xFF);
-            const int sh = 8 * (i >> 1);
-            if (i & 1) { ho |= hb << sh; lo |= lb << sh; }
-            else       { he |= hb << sh; le |= lb << sh; }
-        }
-        xq[2 * w] = he; xq[2 * w + 1] = ho; xq[QW_GROUP / 4 + 2 * w] = le; xq[QW_GROUP / 4 + 2 * w + 1] = lo;
+    if (k < QW_GROUP / 4) xq[k] = ((__local const uint*)hb)[k];
+    else if (k < QW_GROUP / 2) xq[k] = ((__local const uint*)lb)[k - QW_GROUP / 4];
+    if (k == 0) {
+        XS[((size_t)r * G + g) * 2] = s;
+        XS[((size_t)r * G + g) * 2 + 1] = sum;
     }
-    XS[((size_t)r * G + g) * 2] = s;
-    XS[((size_t)r * G + g) * 2 + 1] = sum;
 }
 
 inline void q8_tile(__global const uint* XQ, __global const float* XS, const int R, __global const uint* W,
