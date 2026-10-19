@@ -81,6 +81,7 @@ pub const KernelId = enum {
 };
 const module_count = std.enums.values(Module).len;
 const kernel_count = std.enums.values(KernelId).len;
+pub const kernel_ids = std.enums.values(KernelId);
 
 /// The compiled module's bytes, embedded in the executable by the build graph (`zig/build/xpu.zig`).
 fn builtinBytes(comptime m: Module) []const u8 {
@@ -244,6 +245,75 @@ pub fn sizesOf(config: cfgmod.Config, rows: usize, capacity: usize, logit_rows: 
     };
 }
 
+/// Per-kernel device time of forward calls (Level Zero kernel timestamps), ported from the 2B forward. Every launch gets
+/// its own event; `collect` reads them after the queue has finished and rearms them. Copies are not timed.
+pub const Profile = struct {
+    pool: rt.event.Pool,
+    events: []rt.event.Event,
+    ids: []KernelId,
+    shapes: []u64,
+    used: usize = 0,
+    ns: [kernel_count]f64 = @splat(0),
+    count: [kernel_count]usize = @splat(0),
+    shape_ns: std.AutoHashMapUnmanaged(u64, f64) = .empty,
+    shape_count: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+
+    pub fn init(s: *rt.session.Session, gpa: std.mem.Allocator, capacity: u32) !Profile {
+        var pool = try rt.event.Pool.init(&s.ctx, capacity);
+        errdefer pool.deinit();
+        const events = try gpa.alloc(rt.event.Event, capacity);
+        errdefer gpa.free(events);
+        const ids = try gpa.alloc(KernelId, capacity);
+        errdefer gpa.free(ids);
+        const shapes = try gpa.alloc(u64, capacity);
+        errdefer gpa.free(shapes);
+        for (events, 0..) |*e, i| e.* = try pool.event(@intCast(i));
+        return .{ .pool = pool, .events = events, .ids = ids, .shapes = shapes };
+    }
+    pub fn deinit(self: *Profile, gpa: std.mem.Allocator) void {
+        for (self.events) |*e| e.deinit();
+        gpa.free(self.events);
+        gpa.free(self.ids);
+        gpa.free(self.shapes);
+        self.shape_ns.deinit(gpa);
+        self.shape_count.deinit(gpa);
+        self.pool.deinit();
+    }
+    pub fn shapeKey(outputs: usize, inputs: usize) u64 {
+        return (@as(u64, outputs) << 32) | @as(u64, inputs);
+    }
+    fn next(self: *Profile, id: KernelId, shape: u64) ?*const rt.event.Event {
+        if (self.used >= self.events.len) return null;
+        self.ids[self.used] = id;
+        self.shapes[self.used] = shape;
+        self.used += 1;
+        return &self.events[self.used - 1];
+    }
+    pub fn collect(self: *Profile, gpa: std.mem.Allocator) (rt.Error || error{OutOfMemory})!void {
+        for (self.events[0..self.used], self.ids[0..self.used], self.shapes[0..self.used]) |*e, id, shape| {
+            const t = try e.kernelNs();
+            self.ns[@intFromEnum(id)] += t;
+            self.count[@intFromEnum(id)] += 1;
+            if (shape != 0) {
+                const gop = try self.shape_ns.getOrPut(gpa, shape);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += t;
+                const goc = try self.shape_count.getOrPut(gpa, shape);
+                if (!goc.found_existing) goc.value_ptr.* = 0;
+                goc.value_ptr.* += 1;
+            }
+            try e.reset();
+        }
+        self.used = 0;
+    }
+    pub fn clear(self: *Profile) void {
+        self.ns = @splat(0);
+        self.count = @splat(0);
+        self.shape_ns.clearRetainingCapacity();
+        self.shape_count.clearRetainingCapacity();
+    }
+};
+
 /// Intermediate buffers (device), plus a small host-visible pool for ids, conv windows and kernel `dims` arrays
 /// (every launch gets its own slot, so the whole forward can be queued before the host waits).
 pub const Scratch = struct {
@@ -282,6 +352,8 @@ pub const Scratch = struct {
     logits: Buffer,
     conv_snap: Buffer,
     xsum: Buffer,
+    /// Optional per-kernel device timing; see `Profile`. Never set in serving.
+    prof: ?Profile = null,
     /// Per-layer window snapshots for shared rounds, indexed by the absolute scratch row of the segment's last row.
     snaps_delta: [cfgmod.max_layers]?Buffer = @splat(null),
     snaps_conv: [cfgmod.max_layers]?Buffer = @splat(null),
@@ -327,6 +399,7 @@ pub const Scratch = struct {
         out.cfg = config;
         out.gpa = gpa;
         out.record_slots = null;
+        out.prof = null;
         out.made = 0;
         out.made_snaps = 0;
         out.dims_used = 0;
@@ -420,11 +493,21 @@ const Run = struct {
     prefill: bool = false,
 
     fn go(self: Run, id: KernelId, g: geo.Geo, args: anytype) rt.Error!void {
+        try self.goShape(id, 0, g, args);
+    }
+    /// `shape` is the projection's shape key (0 for other kernels), used by the profiler.
+    fn goShape(self: Run, id: KernelId, shape: u64, g: geo.Geo, args: anytype) rt.Error!void {
         const global: Dim = .{ .x = g.gx, .y = g.gy, .z = g.gz };
         const local: Dim = .{ .x = g.lx, .y = g.ly, .z = g.lz };
         const launch_cfg = rt.launch.Config{ .global = global, .local = local };
         if (self.rec) |r| {
+            if (self.sc.prof != null) return error.Invalid; // a recorded list carries no timestamps
             try r.run(self.k.get(id), launch_cfg, args);
+            return;
+        }
+        if (self.sc.prof) |*p| {
+            const ev = p.next(id, shape) orelse return error.Invalid;
+            try rt.launch.run(&self.s.queue, self.k.get(id), launch_cfg, args, ev);
             return;
         }
         try rt.launch.run(&self.s.queue, self.k.get(id), launch_cfg, args, null);
@@ -439,12 +522,12 @@ const Run = struct {
             try self.go(.qmm_xsum, geo.qmmXsum(@intCast(rows), @intCast(l.inputs / 64)), .{
                 x, @as(i32, @intCast(rows)), self.sc.xsum.ptr, @as(i32, @intCast(l.inputs)),
             });
-            try self.go(.qmm_xmx, geo.qmmXmx(@intCast(rows), @intCast(l.outputs)), .{
+            try self.goShape(.qmm_xmx, Profile.shapeKey(l.outputs, l.inputs), geo.qmmXmx(@intCast(rows), @intCast(l.outputs)), .{
                 x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)), self.sc.xsum.ptr,
             });
             return;
         }
-        try self.go(.qmm, geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
+        try self.goShape(.qmm, Profile.shapeKey(l.outputs, l.inputs), geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
         });
     }

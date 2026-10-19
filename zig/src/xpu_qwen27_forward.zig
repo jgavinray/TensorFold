@@ -18,4 +18,7 @@ pub const Kernels = forward.Kernels;
 pub const KernelId = forward.KernelId;
 pub const kernel_ids = forward.kernel_ids;
 pub const run = forward.run;
+pub const runSegments = forward.runSegments;
+pub const Segment = forward.Segment;
+pub const Profile = forward.Profile;
 pub const getenvBool = forward.getenvBool;
