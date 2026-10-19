@@ -294,7 +294,7 @@ __kernel void qwen35_qmm_q8(__global const uint* XQ, __global const float* XS, c
 // of 8 rows (short8), B lane n holds column n with int i = K 4i..4i+3, C lane n holds rows 0..7 as int32 - exact.
 // Each A operand is one 2D block read of the int8 activation rows (rows >= R read 0). Per group, column and row the
 // q8 formula: OUT += SC * (s * (sum q*hi + sum q*lo / 254)) + BI * sum x.
-// Tiles: a sub-group owns Q8X_NT x 16 columns x Q8X_RB x 8 rows; a work-group is 4 sub-groups across columns (geometry:
+// Tiles: a sub-group owns Q8X_NT x 16 columns x Q8X_RB x 8 rows; a work-group is Q8X_SG sub-groups down the rows (geometry:
 // xpu_geometry.qmmQ8x). 1 x 2 measured best: 2.7-4.9x the bf16 XMX kernel this replaces on the big 27B shapes at
 // R = 128, rms 0.50x the bf16 floor (exp/kernels/qmm_q8x/q8x_check.py). Prefill only (not byte-identical to q8).
 #pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
@@ -305,14 +305,19 @@ __kernel void qwen35_qmm_q8(__global const uint* XQ, __global const float* XS, c
 #ifndef Q8X_RB
 #define Q8X_RB 2
 #endif
+#ifndef Q8X_SG
+#define Q8X_SG 8           // sub-groups per work-group, stacked along ROWS: they share the work-group's columns, so their
+#endif                     // weight loads after the first hit L1 and weights leave DRAM once per Q8X_SG*8*Q8X_RB rows
 __attribute__((intel_reqd_sub_group_size(16)))
+__attribute__((reqd_work_group_size(16 * Q8X_SG, 1, 1)))
 __kernel void qwen35_qmm_q8x(__global const uint* XQ, __global const float* XS, const int R, __global const uint* W,
                              __global const ushort* SC, __global const ushort* BI, __global ushort* OUT, const int N,
                              const int K) {
     const int G = K / QW_GROUP;
     const int l = get_sub_group_local_id();
-    const int nbase = (get_global_id(0) / 16) * (16 * Q8X_NT);
-    const int r0 = get_global_id(1) * (8 * Q8X_RB);
+    const int sg = get_local_id(0) / 16;
+    const int nbase = get_group_id(0) * (16 * Q8X_NT);
+    const int r0 = (get_group_id(1) * Q8X_SG + sg) * (8 * Q8X_RB);
     const int rowb = G * (QW_GROUP * 2);       // bytes per XQ row (hi 64 + lo 64 per group)
     int nc[Q8X_NT];
     #pragma unroll

@@ -22,10 +22,11 @@ pub fn qmmQ8(rows: u32, outputs: [4]u32) Geo {
     for (outputs) |o| tiles += ceilDiv(o, 64);
     return .{ .gx = @max(1, tiles) * 256, .gy = rows, .lx = 256 };
 }
-/// qwen35_qmm_q8x (prefill matmul, int8 XMX): 64-item work-groups = 4 sub-groups x 16 columns (Q8X_NT = 1) by 16 rows
-/// (Q8X_RB = 2 row blocks of 8). Must match the kernel's Q8X_NT / Q8X_RB defaults.
+/// qwen35_qmm_q8x (prefill matmul, int8 XMX): 128-item work-groups = 8 sub-groups (Q8X_SG) down the rows, each 16 rows
+/// (Q8X_RB = 2 row blocks of 8) x the work-group's 16 columns (Q8X_NT = 1): 16 columns x 128 rows per work-group.
+/// Must match the kernel's Q8X_NT / Q8X_RB / Q8X_SG defaults.
 pub fn qmmQ8x(rows: u32, outputs: u32) Geo {
-    return .{ .gx = ceilDiv(outputs, 64) * 64, .gy = ceilDiv(rows, 16), .lx = 64 };
+    return .{ .gx = ceilDiv(outputs, 16) * 128, .gy = ceilDiv(rows, 128), .lx = 128 };
 }
 /// qwen35_qmm_split: one 64-item work-group per (quantization group, row).
 pub fn qmmSplit(rows: u32, groups: u32) Geo {
