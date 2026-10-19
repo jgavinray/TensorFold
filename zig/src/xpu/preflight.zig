@@ -33,7 +33,7 @@ pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
         // by calling `preflight` per card inside its lock loop and moving on when one refuses (see xpu_harness.py
         // `card()`). Refusing the whole pool for a card the session will never touch would block a job on a parked
         // card; instead skip it here, and require the card actually held (`bdf`) to be bound below.
-        if (!isBound(p, card)) continue;
+        if (!isUsable(p, card)) continue;
         const cap = try readCap(p, card, diag);
         if (cap != cap_uw) {
             diag.set("{s}: power1_cap is {d} uW, not 100000000 (100 W) - ask the human (do not re-set it)", .{ card, cap });
@@ -56,8 +56,27 @@ pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
     }
 }
 
-/// Whether the card has a driver bound: a card with no `driver` symlink cannot be opened, so it is not usable. The
-/// lock and the pool sweep both use this so a parked card is never handed out or swept.
+/// Whether the slot holds a usable card: an Intel display device (sysfs `vendor` 0x8086, `class` 0x03xxxx) with a
+/// driver bound. The lock and the pool sweep both use this, so neither a parked card nor a slot whose address now
+/// belongs to another device is handed out or swept (2026-10-19: one B70 was removed and 0000:44:00.0 became an NVMe
+/// drive - bound, but to `nvme`; preflight then refused the whole pool with NoPowerCap).
+pub fn isUsable(p: Paths, card: []const u8) bool {
+    return isIntelDisplay(p, card) and isBound(p, card);
+}
+
+/// Whether the device at `card` is an Intel display-class device, from its sysfs `vendor` and `class` files.
+pub fn isIntelDisplay(p: Paths, card: []const u8) bool {
+    var path: [160]u8 = undefined;
+    var buf: [32]u8 = undefined;
+    const vendor = sys.zfmt(&path, "{s}/{s}/vendor", .{ p.pci_root, card }) orelse return false;
+    const v = sys.readSmall(vendor, &buf) orelse return false;
+    if (!std.mem.eql(u8, std.mem.trim(u8, v, " \n\r\t"), "0x8086")) return false;
+    const class = sys.zfmt(&path, "{s}/{s}/class", .{ p.pci_root, card }) orelse return false;
+    const k = sys.readSmall(class, &buf) orelse return false;
+    return std.mem.startsWith(u8, std.mem.trim(u8, k, " \n\r\t"), "0x03");
+}
+
+/// Whether the card has a driver bound: a card with no `driver` symlink cannot be opened, so it is not usable.
 pub fn isBound(p: Paths, card: []const u8) bool {
     var path: [160]u8 = undefined;
     const driver = sys.zfmt(&path, "{s}/{s}/driver", .{ p.pci_root, card }) orelse return false;
@@ -96,6 +115,15 @@ pub fn memAvailableKiB(meminfo_path: []const u8) ?u64 {
     return null;
 }
 
+/// Test fixture: writes the sysfs `vendor`/`class` of an Intel display device for `card` under `root`.
+pub fn markIntelDisplay(tmp: *std.testing.TmpDir, root: []const u8, card: []const u8) !void {
+    const io = std.testing.io;
+    var d: [128]u8 = undefined;
+    try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "{s}/{s}", .{ root, card }));
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&d, "{s}/{s}/vendor", .{ root, card }), .data = "0x8086\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&d, "{s}/{s}/class", .{ root, card }), .data = "0x030000\n" });
+}
+
 const Fixture = struct { root: [200]u8, rl: usize, mem: [200]u8, ml: usize };
 
 fn fixture(tmp: *std.testing.TmpDir, caps: [2][]const u8, bound: bool, mem_kib: u64) !Fixture {
@@ -106,6 +134,7 @@ fn fixture(tmp: *std.testing.TmpDir, caps: [2][]const u8, bound: bool, mem_kib: 
         try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "dev/{s}/hwmon/hwmon3", .{card}));
         try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&d, "dev/{s}/hwmon/hwmon3/power1_cap", .{card}), .data = cap });
         if (bound) try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "dev/{s}/driver", .{card}));
+        try markIntelDisplay(tmp, "dev", card);
     }
     var m: [96]u8 = undefined;
     try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = try std.fmt.bufPrint(&m, "MemTotal: 1 kB\nMemAvailable:   {d} kB\n", .{mem_kib}) });
@@ -147,9 +176,34 @@ test "preflight refuses a changed cap, an unbound card, low memory and a missing
     defer tmp4.cleanup();
     const io = std.testing.io;
     try tmp4.dir.createDirPath(io, "dev/0000:08:00.0/driver");
+    try markIntelDisplay(&tmp4, "dev", "0000:08:00.0");
     const real = try tmp4.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(real);
     var root: [200]u8 = undefined;
     const rl = (try std.fmt.bufPrint(&root, "{s}/dev", .{real})).len;
     try std.testing.expectError(error.NoPowerCap, check(.{ .pci_root = root[0..rl], .meminfo = "/proc/meminfo" }, null, &d));
+}
+
+test "a slot whose address now belongs to another device is not a card (2026-10-19: 0000:44:00.0 became an NVMe)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    // 08: a bound B70 at 100 W. 44: bound to a driver, but an NVMe controller (vendor 0x144d, class 0x010802), no cap.
+    try tmp.dir.createDirPath(io, "dev/0000:08:00.0/hwmon/hwmon3");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dev/0000:08:00.0/hwmon/hwmon3/power1_cap", .data = "100000000\n" });
+    try tmp.dir.createDirPath(io, "dev/0000:08:00.0/driver");
+    try markIntelDisplay(&tmp, "dev", "0000:08:00.0");
+    try tmp.dir.createDirPath(io, "dev/0000:44:00.0/driver");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dev/0000:44:00.0/vendor", .data = "0x144d\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dev/0000:44:00.0/class", .data = "0x010802\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "meminfo", .data = "MemAvailable:   31457280 kB\n" });
+    const real = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(real);
+    var root: [200]u8 = undefined;
+    var mem: [200]u8 = undefined;
+    const p: Paths = .{ .pci_root = (try std.fmt.bufPrint(&root, "{s}/dev", .{real})), .meminfo = (try std.fmt.bufPrint(&mem, "{s}/meminfo", .{real})) };
+    try std.testing.expect(isUsable(p, "0000:08:00.0"));
+    try std.testing.expect(!isUsable(p, "0000:44:00.0"));
+    var d: Diag = .{};
+    try check(p, "0000:08:00.0", &d); // the NVMe is skipped, not refused for having no power cap
 }
