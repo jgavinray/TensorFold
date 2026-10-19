@@ -58,31 +58,35 @@ pub fn check(gpa: std.mem.Allocator, s: *rt.session.Session, m: *fwd.Model, conf
     defer gpa.free(got);
     const one = try gpa.alloc(u16, cfg.xpu_vocab);
     defer gpa.free(one);
-    // Both streams' 16-row windows in one shared forward, as the Metal qualify does: `caches[1]` then lands at base
-    // 16, so the two streams' snapshots occupy disjoint scratch rows and both later `keep`s read their own.
+    // Two streams' windows of UNEQUAL widths in one shared forward (3 and 13 rows): `caches[1]` lands at base 3, so its
+    // rows read per-segment state (snapshots, conv windows) at scratch rows no other segment fills alike. With equal
+    // widths a missing `base` shift reads the other segment's identical values and passes - that hid the unshifted
+    // conv-window table until the 2026-10-19 stress test (a shared round with a multi-row draft window diverged).
+    const width = [2]usize{ 3, 13 };
+    const first = [2]usize{ 0, 3 };
     try fwd.runSegments(s, m, wide, &.{
-        .{ .cache = &caches[0].cache, .rows = 16 },
-        .{ .cache = &caches[1].cache, .rows = 16 },
-    }, ids[0..32], true, .{ .head = .all });
+        .{ .cache = &caches[0].cache, .rows = width[0] },
+        .{ .cache = &caches[1].cache, .rows = width[1] },
+    }, ids[0..16], true, .{ .head = .all });
     try wide.logits.download(&s.queue, 0, std.mem.sliceAsBytes(got));
     for (0..2) |stream| {
-        for (0..16) |r| {
-            try fwd.run(s, m, &solo, &caches[stream + 2].cache, ids[stream * 16 + r ..][0..1], .{ .head = .all });
+        for (0..width[stream]) |r| {
+            try fwd.run(s, m, &solo, &caches[stream + 2].cache, ids[first[stream] + r ..][0..1], .{ .head = .all });
             try solo.logits.download(&s.queue, 0, std.mem.sliceAsBytes(one));
-            const row = (stream * 16 + r) * cfg.xpu_vocab;
+            const row = (first[stream] + r) * cfg.xpu_vocab;
             if (!std.mem.eql(u8, std.mem.sliceAsBytes(got[row..][0..cfg.xpu_vocab]), std.mem.sliceAsBytes(one))) return error.QwenWindowLogitsMismatch;
         }
         try equal(gpa, s, config, &caches[stream].cache, &caches[stream + 2].cache);
     }
-    try caches[0].keep(s, m, wide, &.{ 0, 1, 2 });
+    try caches[0].keep(s, m, wide, &.{ 0, 1 });
     try caches[1].keep(s, m, wide, &.{0});
     for (0..2) |stream| {
         var fresh = try xs.Cache.init(gpa, s, config, 64);
         defer fresh.deinit();
         const prefix: usize = if (stream == 0) 1 else 3;
-        const kept: usize = if (stream == 0) 3 else 1;
+        const kept: usize = if (stream == 0) 2 else 1;
         for (0..prefix) |r| try fwd.run(s, m, &solo, &fresh, ids[r..][0..1], .{ .head = .last });
-        for (0..kept) |r| try fwd.run(s, m, &solo, &fresh, ids[stream * 16 + r ..][0..1], .{ .head = .all });
+        for (0..kept) |r| try fwd.run(s, m, &solo, &fresh, ids[first[stream] + r ..][0..1], .{ .head = .all });
         try equal(gpa, s, config, &caches[stream].cache, &fresh);
     }
 }
