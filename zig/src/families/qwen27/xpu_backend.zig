@@ -153,6 +153,7 @@ pub const Xpu = struct {
             self.window_costs = kept.window;
             self.shared_costs = kept.shared;
             self.timed = true;
+            self.logCosts("cached");
             return;
         };
         var ids: [64]u32 = undefined;
@@ -183,6 +184,15 @@ pub const Xpu = struct {
         }
         self.timed = true;
         if (k) |key| lanes.cost_cache.save(Costs, self.gpa, io, key, .{ .window = self.window_costs, .shared = self.shared_costs });
+        self.logCosts("timed");
+    }
+
+    fn logCosts(self: *const Xpu, how: []const u8) void {
+        var buf: [512]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        for (self.window_costs) |cost| w.print(" {d}:{d:.1}", .{ cost.width, cost.ms }) catch break;
+        for (self.shared_costs) |cost| w.print(" {d}:{d:.1}", .{ cost.width, cost.ms }) catch break;
+        std.log.info("xpu: verify round ms by rows ({s}):{s}", .{ how, w.buffered() });
     }
 
     /// One served round on the scratch streams: each a window of `per` rows (0: `i + 1`), verified then kept to one row.
