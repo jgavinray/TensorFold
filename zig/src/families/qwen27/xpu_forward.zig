@@ -64,12 +64,12 @@ pub fn getenvBool(name: [*:0]const u8) bool {
 /// Module keys (file names under shared/<key>/) and the kernels each provides.
 const Module = enum { layout, norm, norm_nores, qmm, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge };
 pub const KernelId = enum {
-    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
+    embed, head_norm, queries, keys, attention_gate, norm, norm_nores, qmm, qmm_xmx, qmm_xsum, qmm_multi, mlp_act, gdn_pre, gdn_chain, gdn_post, attn_partial, attn_merge,
 
     fn module(self: KernelId) Module {
         return switch (self) {
             .embed, .head_norm, .queries, .keys, .attention_gate => .layout,
-            .qmm_xmx, .qmm_xsum => .qmm,
+            .qmm_xmx, .qmm_xsum, .qmm_multi => .qmm,
             inline else => |t| @field(Module, @tagName(t)),
         };
     }
@@ -515,10 +515,13 @@ const Run = struct {
     fn wp(self: Run, t: xw.Tensor) *anyopaque {
         return self.w.ptr(t);
     }
+    /// Prefill on the XMX engines: 5-7x the scalar kernel on the 27B shapes at the bf16 accuracy floor
+    /// (exp/kernels/qmm_xmx/xmx_check.py). Narrow outputs (the GDN a/b heads) keep the scalar kernel.
+    fn xmx(self: Run, l: xw.Linear, rows: usize) bool {
+        return self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64;
+    }
     fn projection(self: Run, l: xw.Linear, x: *anyopaque, y: *anyopaque, rows: usize) rt.Error!void {
-        // Prefill on the XMX engines: 5-7x the scalar kernel on the 27B shapes at the bf16 accuracy floor
-        // (exp/kernels/qmm_xmx/xmx_check.py). Narrow outputs (the GDN a/b heads) keep the scalar kernel.
-        if (self.prefill and rows >= 8 and l.outputs >= 1024 and l.inputs % 64 == 0 and self.sc.cfg.group == 64) {
+        if (self.xmx(l, rows)) {
             try self.go(.qmm_xsum, geo.qmmXsum(@intCast(rows), @intCast(l.inputs / 64)), .{
                 x, @as(i32, @intCast(rows)), self.sc.xsum.ptr, @as(i32, @intCast(l.inputs)),
             });
@@ -529,6 +532,46 @@ const Run = struct {
         }
         try self.goShape(.qmm, Profile.shapeKey(l.outputs, l.inputs), geo.qmm(@intCast(rows), @intCast(l.outputs)), .{
             x, @as(i32, @intCast(rows)), self.wp(l.weight), self.wp(l.scales), self.wp(l.biases), y, @as(i32, @intCast(l.outputs)), @as(i32, @intCast(l.inputs)),
+        });
+    }
+    const Proj = struct { l: xw.Linear, y: *anyopaque };
+    /// Up to four projections of one input `x` (same `inputs`), narrow ones listed first. Those the XMX path takes go
+    /// one by one; the rest share one `qmm_multi` launch, every column bit-identical to `qmm`'s. A narrow projection
+    /// alone is a few work-groups at latency (GDN a/b: ~55 us each, 96 per token); dispatched first inside its wide
+    /// siblings' launch it costs nothing extra (exp/kernels/qmm_multi/multi_check.py: -12.6 ms per 27B token).
+    fn projections(self: Run, ps: []const Proj, x: *anyopaque, rows: usize) rt.Error!void {
+        std.debug.assert(ps.len <= 4);
+        var rest: [4]Proj = undefined;
+        var n: usize = 0;
+        var outputs: u32 = 0;
+        for (ps) |p| {
+            std.debug.assert(p.l.inputs == ps[0].l.inputs);
+            if (self.xmx(p.l, rows)) {
+                try self.projection(p.l, x, p.y, rows);
+            } else {
+                rest[n] = p;
+                n += 1;
+                outputs += @intCast(p.l.outputs);
+            }
+        }
+        if (n == 0) return;
+        if (n == 1) return self.projection(rest[0].l, x, rest[0].y, rows);
+        var outs: [4]u32 = @splat(0);
+        var seg: [4]Proj = undefined;
+        var nn: [4]i32 = @splat(0);
+        for (0..4) |i| {
+            seg[i] = rest[if (i < n) i else 0]; // absent segments: N = 0, pointers never read
+            if (i < n) {
+                outs[i] = @intCast(rest[i].l.outputs);
+                nn[i] = @intCast(rest[i].l.outputs);
+            }
+        }
+        try self.goShape(.qmm_multi, Profile.shapeKey(outputs, rest[0].l.inputs), geo.qmmMulti(@intCast(rows), outs), .{
+            x,                                          @as(i32, @intCast(rows)),  @as(i32, @intCast(rest[0].l.inputs)),
+            self.wp(seg[0].l.weight), self.wp(seg[0].l.scales), self.wp(seg[0].l.biases), seg[0].y, nn[0],
+            self.wp(seg[1].l.weight), self.wp(seg[1].l.scales), self.wp(seg[1].l.biases), seg[1].y, nn[1],
+            self.wp(seg[2].l.weight), self.wp(seg[2].l.scales), self.wp(seg[2].l.biases), seg[2].y, nn[2],
+            self.wp(seg[3].l.weight), self.wp(seg[3].l.scales), self.wp(seg[3].l.biases), seg[3].y, nn[3],
         });
     }
     fn norm(self: Run, h: *anyopaque, residual: ?*anyopaque, weight: xw.Tensor, x: *anyopaque, rows: usize) rt.Error!void {
@@ -649,8 +692,7 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
             .attention => |a| try attention(ru, a, i, segments, total),
         }
         try ru.norm(sc.h.ptr.?, sc.r.ptr, layer.post_norm, sc.x.ptr.?, total);
-        try ru.projection(layer.mlp.gate, sc.x.ptr.?, sc.gate.ptr.?, total);
-        try ru.projection(layer.mlp.up, sc.x.ptr.?, sc.up.ptr.?, total);
+        try ru.projections(&.{ .{ .l = layer.mlp.gate, .y = sc.gate.ptr.? }, .{ .l = layer.mlp.up, .y = sc.up.ptr.? } }, sc.x.ptr.?, total);
         try ru.go(.mlp_act, geo.mlpAct(T, c.intermediate), .{ sc.gate.ptr, sc.up.ptr, sc.act.ptr });
         try ru.projection(layer.mlp.down, sc.act.ptr.?, sc.r.ptr.?, total);
         if (o.stop_after) |n| if (i == n) {
@@ -687,10 +729,9 @@ pub fn runSegments(s: *rt.session.Session, m: *Model, sc: *Scratch, segments: []
 fn delta(ru: Run, d: xw.Gdn, layer: usize, segments: []const Segment, record: bool, total: usize) rt.Error!void {
     const sc = ru.sc;
     const T: u32 = @intCast(total);
-    try ru.projection(d.qkv, sc.x.ptr.?, sc.qkv.ptr.?, total);
-    try ru.projection(d.z, sc.x.ptr.?, sc.z.ptr.?, total);
-    try ru.projection(d.a, sc.x.ptr.?, sc.a.ptr.?, total);
-    try ru.projection(d.b, sc.x.ptr.?, sc.b.ptr.?, total);
+    try ru.projections(&.{
+        .{ .l = d.a, .y = sc.a.ptr.? }, .{ .l = d.b, .y = sc.b.ptr.? }, .{ .l = d.qkv, .y = sc.qkv.ptr.? }, .{ .l = d.z, .y = sc.z.ptr.? },
+    }, sc.x.ptr.?, total);
     const w = ru.w;
     var base: usize = 0;
     for (segments) |seg| {
@@ -733,9 +774,7 @@ fn attention(ru: Run, a: xw.Attention, layer: usize, segments: []const Segment, 
     const sc = ru.sc;
     const w = ru.w;
     const T: u32 = @intCast(total);
-    try ru.projection(a.q, sc.x.ptr.?, sc.qraw.ptr.?, total);
-    try ru.projection(a.k, sc.x.ptr.?, sc.k.ptr.?, total);
-    try ru.projection(a.v, sc.x.ptr.?, sc.v.ptr.?, total);
+    try ru.projections(&.{ .{ .l = a.k, .y = sc.k.ptr.? }, .{ .l = a.v, .y = sc.v.ptr.? }, .{ .l = a.q, .y = sc.qraw.ptr.? } }, sc.x.ptr.?, total);
     // qraw holds q_proj's output: rows x qDim() bf16 (2 * heads * head_dim = 12288 at 27B, 4096 at 2B).
     // dims[2] is its element stride; the 2B value coincidentally equals 2*hidden, the 27B one does not.
     const qn = sc.dims([4]u32{ T, c.heads, @intCast(c.qDim()), 2 * c.head_dim });

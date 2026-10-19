@@ -43,19 +43,17 @@
 
 inline float bf16_to_f32(ushort b) { return intel_convert_as_bfloat16_float(b); }
 
-__kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
-                         const int R,
-                         __global const uint* W,     // N x (K/8) uint32, 8 int4 per word
-                         __global const ushort* SC,  // bf16 bits, N x (K/QW_GROUP)
-                         __global const ushort* BI,  // bf16 bits, N x (K/QW_GROUP)
-                         __global ushort* OUT,       // bf16 bits, R x N
-                         const int N, const int K) {
+// One work-group's tile: columns [bx*QW_TILE, +QW_TILE) of row get_group_id(1). Shared by qwen35_qmm and
+// qwen35_qmm_multi, so a column's arithmetic (and its bf16 bits) is the same whichever kernel computes it.
+inline void qmm_tile(__global const ushort* X, const int R, __global const uint* W, __global const ushort* SC,
+                     __global const ushort* BI, __global ushort* OUT, const int N, const int K, const int bx,
+                     __local float (*red)[8][32]) {
     const int G = K / QW_GROUP;   // groups per row (K is a multiple of QW_GROUP)
 
     const int tid = get_local_id(0);
     const int s = tid / QW_LANES;         // column set 0..QW_SETS-1 (8 columns each)
     const int l = tid % QW_LANES;         // lane within the set's group stride
-    const int n0 = get_group_id(0) * QW_TILE + s * 8;
+    const int n0 = bx * QW_TILE + s * 8;
     const int r = get_group_id(1);
 
     if (n0 >= N || r >= R) return;        // whole set dead: exit (its lanes hit no barrier)
@@ -132,7 +130,6 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
         }
     }
 
-    __local float red[8][8][32];
     #pragma unroll
     for (int i = 0; i < 8; ++i) red[s][i][l] = acc[i];
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -148,6 +145,47 @@ __kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
         for (int i = 0; i < nl; ++i)
             OUT[(size_t)r * N + n0 + i] = intel_convert_bfloat16_as_ushort(red[s][i][0]);
     }
+}
+
+__kernel void qwen35_qmm(__global const ushort* X,   // bf16 bits, R x K
+                         const int R,
+                         __global const uint* W,     // N x (K/8) uint32, 8 int4 per word
+                         __global const ushort* SC,  // bf16 bits, N x (K/QW_GROUP)
+                         __global const ushort* BI,  // bf16 bits, N x (K/QW_GROUP)
+                         __global ushort* OUT,       // bf16 bits, R x N
+                         const int N, const int K) {
+    __local float red[8][8][32];
+    qmm_tile(X, R, W, SC, BI, OUT, N, K, get_group_id(0), red);
+}
+
+// qwen35_qmm_multi: up to four projections of the same activation rows (same K) in one launch - each output
+// column computed exactly as qwen35_qmm computes it (qmm_tile), stored to its own projection's R x N_i output.
+// Work-groups are numbered segment by segment in argument order, so the caller lists the narrow projections first:
+// a narrow projection alone is a few work-groups on one Xe core and runs at latency (the 27B GatedDeltaNet a/b,
+// 48 outputs: ~55 us of a 5120-wide fma chain), and dispatched first it finishes under its wide siblings' traffic.
+// An absent segment has N = 0 (its pointers are never read).
+__kernel void qwen35_qmm_multi(__global const ushort* X, const int R, const int K,
+                               __global const uint* W0, __global const ushort* SC0, __global const ushort* BI0, __global ushort* OUT0, const int N0,
+                               __global const uint* W1, __global const ushort* SC1, __global const ushort* BI1, __global ushort* OUT1, const int N1,
+                               __global const uint* W2, __global const ushort* SC2, __global const ushort* BI2, __global ushort* OUT2, const int N2,
+                               __global const uint* W3, __global const ushort* SC3, __global const ushort* BI3, __global ushort* OUT3, const int N3) {
+    __local float red[8][8][32];
+    const int t0 = (N0 + QW_TILE - 1) / QW_TILE, t1 = (N1 + QW_TILE - 1) / QW_TILE, t2 = (N2 + QW_TILE - 1) / QW_TILE;
+    int bx = get_group_id(0);
+    // Pick the segment, then run one tile body (four inlined bodies spill registers).
+    __global const uint* W = W0;
+    __global const ushort* SC = SC0;
+    __global const ushort* BI = BI0;
+    __global ushort* OUT = OUT0;
+    int N = N0;
+    if (bx >= t0) {
+        bx -= t0; W = W1; SC = SC1; BI = BI1; OUT = OUT1; N = N1;
+        if (bx >= t1) {
+            bx -= t1; W = W2; SC = SC2; BI = BI2; OUT = OUT2; N = N2;
+            if (bx >= t2) { bx -= t2; W = W3; SC = SC3; BI = BI3; OUT = OUT3; N = N3; }
+        }
+    }
+    qmm_tile(X, R, W, SC, BI, OUT, N, K, bx, red);
 }
 
 
