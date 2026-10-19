@@ -6,7 +6,8 @@
 // work_group_reduce_add, so the kernel is correct for any sub-group width the runtime picks.
 //
 // Shapes are compile-time defines; defaults are the Qwen3.5-2B geometry, so the proven 2B gate applies
-// to this file unchanged. The 27B build overrides QW_NV (48 value heads; 2B has 16) and QW_TAPS stays 4;
+// to this file unchanged. The 27B build overrides QW_NV (48 value heads; 2B has 16), sets QW_ALOG_BF16 (A_log's
+// storage, see below) and QW_TAPS stays 4;
 // QW_NK (16 key/query heads), QW_DK/QW_DV (128) and the channel layout are shared. The total channel
 // count QW_CC = 2*QW_NK*QW_DK + QW_NV*QW_DV is 6144 on 2B and 10240 on 27B.
 #pragma OPENCL EXTENSION cl_intel_bfloat16_conversions : enable
@@ -33,9 +34,21 @@
 #define TOB(x) intel_convert_bfloat16_as_ushort(x)
 #define RBF(x) BF(TOB(x))            // round to nearest-even bf16 and back
 
+// A_log's storage follows the checkpoint: the Qwen3.5-2B keeps it fp32 (the default here), the Qwen 3.8 27B MLX
+// checkpoint stores it bf16 and its build passes -DQW_ALOG_BF16 (xpu_weights.zig loads it as .bf16, raw bytes). Read
+// as fp32, a bf16 A_log gave value head hv the bits of heads 2hv+1/2hv (hv < 24) and arena padding (hv >= 24): every
+// GDN layer ran with the wrong decay rates (mean |dNLL| 0.29 vs MLX fp32, 2026-10-19; exp/precision).
+#ifdef QW_ALOG_BF16
+typedef ushort alog_t;
+#define ALOG_F(x) BF(x)
+#else
+typedef float alog_t;
+#define ALOG_F(x) (x)
+#endif
+
 __kernel void qwen35_gdn_pre(__global const ushort* QKV, __global const ushort* CS, __global const ushort* CW,
                              __global const int* windows, __global const ushort* Ain, __global const ushort* Bin,
-                             __global const float* ALOG, __global const ushort* DT,
+                             __global const alog_t* ALOG, __global const ushort* DT,
                              __global ushort* Q, __global ushort* Kout, __global ushort* Vout,
                              __global float* G, __global ushort* BETA, __global ushort* CO) {
   const int d = get_local_id(0);
@@ -74,7 +87,7 @@ __kernel void qwen35_gdn_pre(__global const ushort* QKV, __global const ushort* 
     if (d == 0) {
       const float s = RBF(BF(Ain[w * QW_NV + hv]) + BF(DT[hv]));
       const float sp = RBF(fmax(s, 0.0f) + log(1.0f + exp(-fabs(s))));
-      G[w * QW_NV + hv] = exp(-exp(ALOG[hv]) * sp);
+      G[w * QW_NV + hv] = exp(-exp(ALOG_F(ALOG[hv])) * sp);
       BETA[w * QW_NV + hv] = TOB(1.0f / (1.0f + exp(-BF(Bin[w * QW_NV + hv]))));
     }
   }
