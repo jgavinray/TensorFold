@@ -44,7 +44,8 @@ pub const Event = struct {
     }
 
     pub fn wait(self: *const Event) runtime.Error!void {
-        try runtime.check(self.ctx.api().zeEventHostSynchronize(self.handle, abi.wait_forever));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeEventHostSynchronize(self.handle, abi.wait_forever));
     }
 
     pub fn reset(self: *const Event) runtime.Error!void {

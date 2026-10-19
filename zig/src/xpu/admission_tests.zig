@@ -101,6 +101,9 @@ test "a regular list is created on the compute group and a replay submits exactl
     var rec = try rt.cmdlist.Recorder.init(&ctx);
     const group = r.lib.lookup(*const fn () callconv(.c) u32, "tf_mock_last_list_group").?;
     try std.testing.expectEqual(ctx.compute_ordinal, group());
+    // In order: a recorded step's launches each read what the one before wrote (ZE_COMMAND_LIST_FLAG_IN_ORDER).
+    const flags = r.lib.lookup(*const fn () callconv(.c) u32, "tf_mock_last_list_flags").?;
+    try std.testing.expectEqual(@as(u32, 1 << 3), flags());
 
     var q = try rt.cmdlist.Queue.init(&ctx);
     defer q.deinit();

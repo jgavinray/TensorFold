@@ -34,25 +34,30 @@ pub const Queue = struct {
 
     pub fn copy(self: *Queue, dst: ?*anyopaque, src: ?*const anyopaque, len: usize, sig: ?*const Event) runtime.Error!void {
         if (len == 0) return;
-        try runtime.check(self.ctx.api().zeCommandListAppendMemoryCopy(self.list, dst, src, len, handle(sig), 0, null));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandListAppendMemoryCopy(self.list, dst, src, len, handle(sig), 0, null));
     }
 
     /// Fills `len` bytes with a repeating `pattern` (len must be a multiple of pattern.len).
     pub fn fill(self: *Queue, dst: ?*anyopaque, pattern: []const u8, len: usize, sig: ?*const Event) runtime.Error!void {
         if (pattern.len == 0 or len % pattern.len != 0) return error.Invalid;
         if (len == 0) return;
-        try runtime.check(self.ctx.api().zeCommandListAppendMemoryFill(self.list, dst, pattern.ptr, pattern.len, len, handle(sig), 0, null));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandListAppendMemoryFill(self.list, dst, pattern.ptr, pattern.len, len, handle(sig), 0, null));
     }
 
     pub fn barrier(self: *Queue, sig: ?*const Event) runtime.Error!void {
-        try runtime.check(self.ctx.api().zeCommandListAppendBarrier(self.list, handle(sig), 0, null));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandListAppendBarrier(self.list, handle(sig), 0, null));
     }
 
     pub fn signalEvent(self: *Queue, ev: *const Event) runtime.Error!void {
-        try runtime.check(self.ctx.api().zeCommandListAppendSignalEvent(self.list, ev.handle));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandListAppendSignalEvent(self.list, ev.handle));
     }
 
     pub fn synchronize(self: *Queue) runtime.Error!void {
-        try runtime.check(self.ctx.api().zeCommandListHostSynchronize(self.list, abi.wait_forever));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandListHostSynchronize(self.list, abi.wait_forever));
     }
 };

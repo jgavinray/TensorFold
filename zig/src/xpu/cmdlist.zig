@@ -48,11 +48,13 @@ pub const Queue = struct {
         var handles: [8]abi.CommandList = undefined;
         if (lists.len > handles.len) return error.Invalid;
         @memcpy(handles[0..lists.len], lists);
-        try runtime.check(self.ctx.api().zeCommandQueueExecuteCommandLists(self.handle, @intCast(lists.len), &handles, sig));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandQueueExecuteCommandLists(self.handle, @intCast(lists.len), &handles, sig));
     }
 
     pub fn synchronize(self: *Queue) runtime.Error!void {
-        try runtime.check(self.ctx.api().zeCommandQueueSynchronize(self.handle, abi.wait_forever));
+        try runtime.live();
+        try runtime.submit(self.ctx.api().zeCommandQueueSynchronize(self.handle, abi.wait_forever));
     }
 };
 

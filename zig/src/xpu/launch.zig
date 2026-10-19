@@ -26,7 +26,8 @@ pub fn launch(q: *Queue, k: *Kernel, cfg: Config, signal: ?*const Event) runtime
     const g = try cfg.groups();
     try k.setGroupSize(cfg.local.x, cfg.local.y, cfg.local.z);
     const sig: abi.Event = if (signal) |e| e.handle else null;
-    try runtime.check(q.ctx.api().zeCommandListAppendLaunchKernel(q.list, k.handle, &g, sig, 0, null));
+    try runtime.live();
+    try runtime.submit(q.ctx.api().zeCommandListAppendLaunchKernel(q.list, k.handle, &g, sig, 0, null));
 }
 
 /// Sets every argument of the tuple in order, then launches.

@@ -11,6 +11,7 @@ static int drivers_asked = 0;
 static int list_creates = 0;
 static int executes = 0;
 static uint32_t last_list_group = 0xdeadbeef;
+static uint32_t last_list_flags;
 static uint32_t last_queue_group = 0xdeadbeef;
 static uint32_t last_execute_lists = 0;
 
@@ -58,7 +59,9 @@ R zeCommandListCreateImmediate(void *c, void *dev, const void *desc, void **l) {
   memcpy(&last_queue_flags, (const uint8_t *)desc + 24, 4); queue_creates++; *l = (void *)0x300; return 0;
 }
 R zeCommandListCreate(void *c, void *dev, const void *desc, void **l) {
-  memcpy(&last_list_group, (const uint8_t *)desc + 20, 4); list_creates++; *l = (void *)0x301; return 0;
+  /* ze_command_list_desc_t: stype, pNext, commandQueueGroupOrdinal (offset 16), flags (offset 20) */
+  memcpy(&last_list_group, (const uint8_t *)desc + 16, 4); memcpy(&last_list_flags, (const uint8_t *)desc + 20, 4);
+  list_creates++; *l = (void *)0x301; return 0;
 }
 R zeCommandListClose(void *l) { return 0; }
 R zeCommandListReset(void *l) { return 0; }
@@ -97,6 +100,7 @@ int tf_mock_queue_creates(void) { return queue_creates; }
 int tf_mock_list_creates(void) { return list_creates; }
 int tf_mock_executes(void) { return executes; }
 uint32_t tf_mock_last_list_group(void) { return last_list_group; }
+uint32_t tf_mock_last_list_flags(void) { return last_list_flags; }
 uint32_t tf_mock_last_queue_group(void) { return last_queue_group; }
 uint32_t tf_mock_last_execute_lists(void) { return last_execute_lists; }
 uint32_t tf_mock_init_flags(void) { return init_flags; }
