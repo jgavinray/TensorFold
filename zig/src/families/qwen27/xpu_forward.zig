@@ -593,8 +593,12 @@ fn delta(ru: Run, d: xw.Gdn, layer: usize, segments: []const Segment, record: bo
         const cache = &seg.cache.blocks[layer].linear;
         // The conv snapshot is written at this segment's absolute scratch row.
         const snap_conv: *anyopaque = sc.snapConv(layer, base);
+        // gdn_pre reads windows[w * taps + tap] for the segment's own rows w = 0..rows-1, and runSegments wrote this
+        // segment's windows at scratch row base + w: hand it the window table shifted by `base`, as the qkv input is.
+        // (Unshifted, every row past the first of a segment at base > 0 read another segment's window - a shared
+        // round with a multi-row draft window diverged from the same stream served alone, 2026-10-19 stress test.)
         try ru.go(.gdn_pre, geo.gdnPre(@intCast(seg.rows), 2 * c.k_heads + c.v_heads), .{
-            off(sc.qkv, base * sc.cfg.gdnQkvDim() * 2), cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows().ptr)),
+            off(sc.qkv, base * sc.cfg.gdnQkvDim() * 2), cache.conv.ptr, w.ptr(d.conv), @as(*anyopaque, @ptrCast(sc.windows()[base * c.conv_kernel ..].ptr)),
             off(sc.a, base * c.v_heads * 2), off(sc.b, base * c.v_heads * 2), w.ptr(d.a_log), w.ptr(d.dt_bias),
             off(sc.q, base * c.gdnValueDim() * 2), off(sc.k, base * c.k_heads * c.dk * 2), off(sc.v, base * c.gdnValueDim() * 2),
             off(sc.g, base * c.v_heads * 4), off(sc.beta, base * c.v_heads * 2), snap_conv,
