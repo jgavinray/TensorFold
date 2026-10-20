@@ -1,13 +1,12 @@
-//! Read-only preflight before any device work (same rules as exp/harness/xpu_harness.py preflight): both B70 power caps
-//! read exactly 100 W, MemAvailable >= 24 GiB, and the card is bound to a driver. Never writes sysfs.
+//! Read-only preflight before any device work: the held card is bound to a driver and MemAvailable >= 24 GiB.
+//! Never writes sysfs.
 const std = @import("std");
 const device = @import("device.zig");
 const sys = @import("sys.zig");
 
-pub const cap_uw: u64 = 100_000_000;
 pub const min_available_kib: u64 = 24 * 1024 * 1024;
 
-pub const Refusal = error{ NoPowerCap, PowerCapNotHundredWatts, CardNotBound, MemoryLow, Unreadable };
+pub const Refusal = error{ CardNotBound, MemoryLow, Unreadable };
 
 /// Human-readable reason for the last refusal.
 pub const Diag = struct {
@@ -28,18 +27,6 @@ pub const Paths = struct {
 };
 
 pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
-    for (device.cards) |card| {
-        // A card with no driver bound cannot be opened, so it is not part of the usable pool: the harness mirrors this
-        // by calling `preflight` per card inside its lock loop and moving on when one refuses (see xpu_harness.py
-        // `card()`). Refusing the whole pool for a card the session will never touch would block a job on a parked
-        // card; instead skip it here, and require the card actually held (`bdf`) to be bound below.
-        if (!isUsable(p, card)) continue;
-        const cap = try readCap(p, card, diag);
-        if (cap != cap_uw) {
-            diag.set("{s}: power1_cap is {d} uW, not 100000000 (100 W) - ask the human (do not re-set it)", .{ card, cap });
-            return error.PowerCapNotHundredWatts;
-        }
-    }
     if (bdf) |b| {
         if (!isBound(p, b)) {
             diag.set("{s}: not bound to a driver - card may be wedged; stop and tell the human", .{b});
@@ -59,7 +46,7 @@ pub fn check(p: Paths, bdf: ?[]const u8, diag: *Diag) Refusal!void {
 /// Whether the slot holds a usable card: an Intel display device (sysfs `vendor` 0x8086, `class` 0x03xxxx) with a
 /// driver bound. The lock and the pool sweep both use this, so neither a parked card nor a slot whose address now
 /// belongs to another device is handed out or swept (2026-10-19: one B70 was removed and 0000:44:00.0 became an NVMe
-/// drive - bound, but to `nvme`; preflight then refused the whole pool with NoPowerCap).
+/// drive - bound, but to `nvme`).
 pub fn isUsable(p: Paths, card: []const u8) bool {
     return isIntelDisplay(p, card) and isBound(p, card);
 }
@@ -81,22 +68,6 @@ pub fn isBound(p: Paths, card: []const u8) bool {
     var path: [160]u8 = undefined;
     const driver = sys.zfmt(&path, "{s}/{s}/driver", .{ p.pci_root, card }) orelse return false;
     return sys.exists(driver);
-}
-
-fn readCap(p: Paths, card: []const u8, diag: *Diag) Refusal!u64 {
-    var i: u32 = 0;
-    while (i < 64) : (i += 1) {
-        var path: [192]u8 = undefined;
-        const z = sys.zfmt(&path, "{s}/{s}/hwmon/hwmon{d}/power1_cap", .{ p.pci_root, card, i }) orelse return error.Unreadable;
-        var buf: [32]u8 = undefined;
-        const text = sys.readSmall(z, &buf) orelse continue;
-        return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n\r\t"), 10) catch {
-            diag.set("{s}: power1_cap unparsable", .{card});
-            return error.Unreadable;
-        };
-    }
-    diag.set("{s}: no power1_cap (driver not bound?)", .{card});
-    return error.NoPowerCap;
 }
 
 pub fn memAvailableKiB(meminfo_path: []const u8) ?u64 {
@@ -126,13 +97,12 @@ pub fn markIntelDisplay(tmp: *std.testing.TmpDir, root: []const u8, card: []cons
 
 const Fixture = struct { root: [200]u8, rl: usize, mem: [200]u8, ml: usize };
 
-fn fixture(tmp: *std.testing.TmpDir, caps: [2][]const u8, bound: bool, mem_kib: u64) !Fixture {
+fn fixture(tmp: *std.testing.TmpDir, bound: bool, mem_kib: u64) !Fixture {
     const io = std.testing.io;
     var out: Fixture = undefined;
-    for (device.cards, caps) |card, cap| {
+    for (device.cards) |card| {
         var d: [96]u8 = undefined;
-        try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "dev/{s}/hwmon/hwmon3", .{card}));
-        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&d, "dev/{s}/hwmon/hwmon3/power1_cap", .{card}), .data = cap });
+        try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "dev/{s}", .{card}));
         if (bound) try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&d, "dev/{s}/driver", .{card}));
         try markIntelDisplay(tmp, "dev", card);
     }
@@ -145,52 +115,32 @@ fn fixture(tmp: *std.testing.TmpDir, caps: [2][]const u8, bound: bool, mem_kib: 
     return out;
 }
 
-test "preflight admits 100 W caps, bound cards and 24 GiB" {
+test "preflight admits a bound card and 24 GiB" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const f = try fixture(&tmp, .{ "100000000\n", "100000000\n" }, true, 30 * 1024 * 1024);
+    const f = try fixture(&tmp, true, 30 * 1024 * 1024);
     var d: Diag = .{};
     try check(.{ .pci_root = f.root[0..f.rl], .meminfo = f.mem[0..f.ml] }, "0000:08:00.0", &d);
 }
 
-test "preflight refuses a changed cap, an unbound card, low memory and a missing cap" {
+test "preflight refuses an unbound card and low memory" {
+    var d: Diag = .{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var d: Diag = .{};
-    const f = try fixture(&tmp, .{ "100000000\n", "120000000\n" }, true, 30 * 1024 * 1024);
-    try std.testing.expectError(error.PowerCapNotHundredWatts, check(.{ .pci_root = f.root[0..f.rl], .meminfo = f.mem[0..f.ml] }, null, &d));
-    try std.testing.expect(std.mem.indexOf(u8, d.message(), "0000:44:00.0") != null);
+    const g = try fixture(&tmp, false, 30 * 1024 * 1024);
+    try std.testing.expectError(error.CardNotBound, check(.{ .pci_root = g.root[0..g.rl], .meminfo = g.mem[0..g.ml] }, "0000:44:00.0", &d));
 
     var tmp2 = std.testing.tmpDir(.{});
     defer tmp2.cleanup();
-    const g = try fixture(&tmp2, .{ "100000000", "100000000" }, false, 30 * 1024 * 1024);
-    try std.testing.expectError(error.CardNotBound, check(.{ .pci_root = g.root[0..g.rl], .meminfo = g.mem[0..g.ml] }, "0000:44:00.0", &d));
-
-    var tmp3 = std.testing.tmpDir(.{});
-    defer tmp3.cleanup();
-    const h = try fixture(&tmp3, .{ "100000000", "100000000" }, true, 23 * 1024 * 1024);
+    const h = try fixture(&tmp2, true, 23 * 1024 * 1024);
     try std.testing.expectError(error.MemoryLow, check(.{ .pci_root = h.root[0..h.rl], .meminfo = h.mem[0..h.ml] }, "0000:08:00.0", &d));
-    // A bound card with no readable `power1_cap` is refused; a card with no driver is skipped, not refused (the pool
-    // may legitimately hold a parked card, as xpu_harness.py's per-card `preflight` loop does).
-    var tmp4 = std.testing.tmpDir(.{});
-    defer tmp4.cleanup();
-    const io = std.testing.io;
-    try tmp4.dir.createDirPath(io, "dev/0000:08:00.0/driver");
-    try markIntelDisplay(&tmp4, "dev", "0000:08:00.0");
-    const real = try tmp4.dir.realPathFileAlloc(io, ".", std.testing.allocator);
-    defer std.testing.allocator.free(real);
-    var root: [200]u8 = undefined;
-    const rl = (try std.fmt.bufPrint(&root, "{s}/dev", .{real})).len;
-    try std.testing.expectError(error.NoPowerCap, check(.{ .pci_root = root[0..rl], .meminfo = "/proc/meminfo" }, null, &d));
 }
 
 test "a slot whose address now belongs to another device is not a card (2026-10-19: 0000:44:00.0 became an NVMe)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
-    // 08: a bound B70 at 100 W. 44: bound to a driver, but an NVMe controller (vendor 0x144d, class 0x010802), no cap.
-    try tmp.dir.createDirPath(io, "dev/0000:08:00.0/hwmon/hwmon3");
-    try tmp.dir.writeFile(io, .{ .sub_path = "dev/0000:08:00.0/hwmon/hwmon3/power1_cap", .data = "100000000\n" });
+    // 08: a bound B70. 44: bound to a driver, but an NVMe controller (vendor 0x144d, class 0x010802).
     try tmp.dir.createDirPath(io, "dev/0000:08:00.0/driver");
     try markIntelDisplay(&tmp, "dev", "0000:08:00.0");
     try tmp.dir.createDirPath(io, "dev/0000:44:00.0/driver");
@@ -205,5 +155,5 @@ test "a slot whose address now belongs to another device is not a card (2026-10-
     try std.testing.expect(isUsable(p, "0000:08:00.0"));
     try std.testing.expect(!isUsable(p, "0000:44:00.0"));
     var d: Diag = .{};
-    try check(p, "0000:08:00.0", &d); // the NVMe is skipped, not refused for having no power cap
+    try check(p, "0000:08:00.0", &d);
 }

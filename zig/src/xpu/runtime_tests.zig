@@ -74,7 +74,7 @@ test "xpu req1/req3: select both B70s by PCI address, refuse others, hold the sh
     }
 }
 
-test "xpu req2: preflight on the live host reads 100 W caps and 24 GiB" {
+test "xpu req2: preflight on the live host admits every bound card (24 GiB MemAvailable)" {
     var d: rt.preflight.Diag = .{};
     // Every bound card must pass preflight; a parked card is skipped by the sweep, so it is not asserted.
     for (rt.device.cards) |card| {
