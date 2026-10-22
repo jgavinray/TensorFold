@@ -30,14 +30,15 @@ pub const Error = error{
 
 pub const Slot = enum(u2) { mixer_in, mixer_out, gu, down };
 
-/// The trellis quantities of one entry; dense entries carry none of them.
+/// The trellis quantities of one entry; dense entries carry none of them (`q` null).
+/// `halves` is 2*bits and may be odd — the odd counts are mul1's half steps; the
+/// trellis word count per tile row is halves * 8.
 pub const Quant = struct {
-    bits: u8, // whole and 1..8; odd halves (2*bits) are mul1's half steps
-    halves: u8, // 2 * bits, the trellis word count per tile row is halves * 8
+    halves: u8,
     k: usize,
     n: usize,
     codebook: exl3_format.Codebook,
-    suh: bool, // fp16 scales suh/svh; false: the packed sign words su/sv
+    suh: bool, // fp16 scales suh/svh; false: the packed sign words su/sv (I16, [K/16]/[N/16])
     bias: bool,
 };
 
@@ -157,7 +158,7 @@ fn codebookOf(dictionary: []const u8) ?exl3_format.Codebook {
 }
 
 fn quantOf(entry: *const eaq.Entry, why: ?*eaq.Why) Error!Quant {
-    var q: Quant = .{ .bits = 0, .halves = 0, .k = 0, .n = 0, .codebook = .inst3, .suh = false, .bias = false };
+    var q: Quant = .{ .halves = 0, .k = 0, .n = 0, .codebook = .inst3, .suh = false, .bias = false };
     const dict = jsonString(entry.params, "dictionary") orelse {
         fail(why, "entry {s}: no dictionary", .{entry.name});
         return error.BadTrellisParams;
@@ -176,7 +177,6 @@ fn quantOf(entry: *const eaq.Entry, why: ?*eaq.Why) Error!Quant {
         fail(why, "entry {s}: bits {d} is not a half-step count in 1..8", .{ entry.name, bits });
         return error.BadTrellisParams;
     }
-    q.bits = @intFromFloat(bits);
     q.halves = @intFromFloat(halves_f);
     if (q.halves < 2 or q.halves > 16) {
         fail(why, "entry {s}: halves {d} outside 2..16", .{ entry.name, q.halves });
@@ -238,9 +238,10 @@ fn quantOf(entry: *const eaq.Entry, why: ?*eaq.Why) Error!Quant {
     }
     // exactly one scale style, both parts present and consistently shaped
     if ((suh_at == null) != (svh_at == null) or (su_at == null) != (sv_at == null) or
-        (suh_at != null and su_at != null) or (svh_at != null and sv_at != null))
+        (suh_at != null and su_at != null) or (svh_at != null and sv_at != null) or
+        (suh_at == null and su_at == null))
     {
-        fail(why, "entry {s}: needs both suh and svh (F16) or both su and sv", .{entry.name});
+        fail(why, "entry {s}: needs both suh and svh (F16) or both su and sv (I16)", .{entry.name});
         return error.BadScalePart;
     }
     if (suh_at) |si| {
@@ -255,8 +256,14 @@ fn quantOf(entry: *const eaq.Entry, why: ?*eaq.Why) Error!Quant {
         }
         q.suh = true;
     } else {
-        // the packed sign words su/sv: presence checked above, their geometry is the
-        // trellis tile's, which the upload stage reads from the entry's parts
+        // the packed sign words su/sv: I16 [K/16] and [N/16] (core/exl3_load.zig parts)
+        const su = entry.parts[su_at.?].shape;
+        const sv = entry.parts[sv_at.?].shape;
+        const dt_ok = entry.parts[su_at.?].dtype == .i16 and entry.parts[sv_at.?].dtype == .i16;
+        if (!dt_ok or su.len != 1 or sv.len != 1 or su[0] != q.k / 16 or sv[0] != q.n / 16) {
+            fail(why, "entry {s}: packed su/sv are not I16 [{d}] and [{d}]", .{ entry.name, q.k / 16, q.n / 16 });
+            return error.BadScalePart;
+        }
         q.suh = false;
     }
     return q;
@@ -320,7 +327,7 @@ pub fn map(gpa: std.mem.Allocator, pack: *const eaq.Pack, why: ?*eaq.Why) (Error
                     fail(why, "entries {s} and {s} both fill the head", .{ table.head.?.name, e.name });
                     return error.DuplicateProjection;
                 }
-                table.head = .{ .name = e.name, .entry = e, .dense = e.format == .dense, .q = try quantOf(e, why) };
+                table.head = .{ .name = e.name, .entry = e, .dense = e.format == .dense, .q = if (e.format == .dense) null else try quantOf(e, why) };
             },
             .embed => {
                 if (table.embed != null) {
@@ -329,13 +336,19 @@ pub fn map(gpa: std.mem.Allocator, pack: *const eaq.Pack, why: ?*eaq.Why) (Error
                 }
                 table.embed = .{ .name = e.name, .entry = e, .dense = e.format == .dense };
             },
-            .other => try others.append(gpa, .{ .name = e.name, .entry = e, .dense = e.format == .dense }),
+            .other => {
+                for (others.items) |o| if (std.mem.eql(u8, o.name, e.name)) {
+                    fail(why, "entries {s} appear twice", .{e.name});
+                    return error.DuplicateProjection;
+                };
+                try others.append(gpa, .{ .name = e.name, .entry = e, .dense = e.format == .dense });
+            },
             .projection => |m| {
                 for (projections.items) |p| if (p.layer == m.layer and p.slot == m.slot and p.part == m.part) {
                     fail(why, "entries {s} and {s} both fill layer {d}'s {s} part {d}", .{ p.name, e.name, m.layer, @tagName(m.slot), m.part });
                     return error.DuplicateProjection;
                 };
-                try projections.append(gpa, .{ .name = e.name, .entry = e, .layer = m.layer, .slot = m.slot, .part = m.part, .dense = e.format == .dense, .q = try quantOf(e, why) });
+                try projections.append(gpa, .{ .name = e.name, .entry = e, .layer = m.layer, .slot = m.slot, .part = m.part, .dense = e.format == .dense, .q = if (e.format == .dense) null else try quantOf(e, why) });
             },
         }
     }
@@ -349,13 +362,19 @@ pub fn map(gpa: std.mem.Allocator, pack: *const eaq.Pack, why: ?*eaq.Why) (Error
     table.projections = try projections.toOwnedSlice(gpa);
     errdefer gpa.free(table.projections);
     table.others = try others.toOwnedSlice(gpa);
-    // fused parts of one slot must agree on K: they stack on N over the same input width
+    errdefer gpa.free(table.others);
+    // fused parts of one slot must agree on K (same input width) and on the trellis
+    // style (halves, codebook): they were one projection before packing
     for (table.projections, 0..) |p, i| {
         if (i > 0 and p.layer == table.projections[i - 1].layer and p.slot == table.projections[i - 1].slot and p.part > 0) {
             const prev = table.projections[i - 1];
-            if (prev.q != null and p.q != null and prev.q.?.k != p.q.?.k) {
-                fail(why, "layer {d} {s}: part {d} has K {d} against part {d}'s {d}", .{ p.layer, @tagName(p.slot), p.part, p.q.?.k, prev.part, prev.q.?.k });
-                return error.MismatchedFusedK;
+            if (prev.q != null and p.q != null) {
+                const a = prev.q.?;
+                const b = p.q.?;
+                if (a.k != b.k or a.halves != b.halves or a.codebook != b.codebook) {
+                    fail(why, "layer {d} {s}: part {d} disagrees with part {d} on K, halves or codebook", .{ p.layer, @tagName(p.slot), p.part, prev.part });
+                    return error.MismatchedFusedK;
+                }
             }
         }
     }

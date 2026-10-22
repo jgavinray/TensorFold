@@ -34,7 +34,6 @@ test "a good toy pack opens and maps onto the 27B table" {
     try std.testing.expectEqualStrings("lm_head", head.name);
     try std.testing.expect(!head.dense);
     const q = head.q orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u8, 6), q.bits);
     try std.testing.expectEqual(@as(u8, 12), q.halves); // 2 * 6 bits
     try std.testing.expectEqual(@as(usize, 64), q.k);
     try std.testing.expectEqual(@as(usize, 128), q.n);
