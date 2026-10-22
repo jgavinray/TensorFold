@@ -26,12 +26,12 @@ int main(int argc, char **argv) {
     }
     std::vector<uint8_t> bin;
     if (a8 || a4)                                      // W4A8 / W4A4 (GPTQ g128): the only option is swiglu (W4A8)
-        bin = W4A8Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), swiglu, a4).getBinary();
+        bin = W4A8Prompt<HW::Xe2>(Product{ProductFamily::GenericXe2, 0}, swiglu, a4).getBinary();
     else if (std::strcmp(argv[1], "xe2") == 0)
-        bin = W4Prompt<HW::Xe2>(Product(ProductFamily::GenericXe2, 0, PlatformType::Discrete), gsz, s4, asplit, b3,
+        bin = W4Prompt<HW::Xe2>(Product{ProductFamily::GenericXe2, 0}, gsz, s4, asplit, b3,
                                 swiglu).getBinary();
     else
-        bin = W4Prompt<HW::Xe3>(Product(ProductFamily::GenericXe3, 0, PlatformType::Integrated), gsz, s4, asplit, b3,
+        bin = W4Prompt<HW::Xe3>(Product{ProductFamily::GenericXe3, 0}, gsz, s4, asplit, b3,
                                 swiglu).getBinary();
     std::ofstream(argv[3], std::ios::binary).write(reinterpret_cast<const char *>(bin.data()), bin.size());
     std::printf("%s: %zu bytes\n", argv[3], bin.size());

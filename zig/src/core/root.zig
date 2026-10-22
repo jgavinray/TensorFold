@@ -9,6 +9,7 @@ pub const digest_cache = @import("digest_cache.zig");
 pub const checkpoint_identity = @import("checkpoint_identity.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const exl3_load = @import("exl3_load.zig");
+pub const eaq_fixture = @import("eaq_fixture.zig");
 pub const direct_io = @import("direct_io.zig");
 pub const Checkpoint = checkpoint.Checkpoint;
 pub const draft_depth = @import("draft_depth.zig");

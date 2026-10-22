@@ -77,6 +77,12 @@ pub const Shape = struct {
     codebook: exl3_format.Codebook = .mul1,
     dictionary: []const u8 = "exl3.mul1.v1",
     bits: u8 = 6,
+    /// The head entry's format; null keeps the default (or the .format tamper's junk).
+    head_format: ?[]const u8 = null,
+    /// The head entry's name; null keeps lm_head.
+    head_name: ?[]const u8 = null,
+    /// The head entry's params object as raw JSON; null keeps the default.
+    head_params: ?[]const u8 = null,
 };
 
 /// Writes a pack in `dir` (a 64-wide, 128-token toy head) with one defect, or none.
@@ -93,7 +99,11 @@ pub fn write(gpa_in: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, t: Tamper, 
         .{ .name = "lm_head.svh", .dtype = "F16", .shape = "[128]", .bytes = 256 },
         extra,
     };
-    const specs1: []const Spec = if (t == .tensor_extra) &s1 else s1[0..3];
+    const fp8_specs = [_]Spec{.{ .name = "lm_head.weight", .dtype = "F8_E4M3", .shape = "[64,128]", .bytes = 64 * 128 }};
+    const head_format = shape.head_format orelse (if (t == .format) "eaq.mystery/0" else "eaq.trellis/0");
+    const fp8_head = std.mem.endsWith(u8, head_format, "fp8/0");
+    const s1_base: []const Spec = if (fp8_head) &fp8_specs else s1[0..3];
+    const specs1: []const Spec = if (t == .tensor_extra) &s1 else s1_base;
     var s2 = shard2;
     if (t == .tensor_dtype) s2[0].dtype = "F16";
     if (t == .tensor_shape) s2[0].shape = "[2,32]";
@@ -101,16 +111,20 @@ pub fn write(gpa_in: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, t: Tamper, 
     var table: [32]u8 = undefined;
     eaq.codebookSha(shape.codebook, &table);
     const dict_hash = if (t == .dictionary_hash) sha("x") else hex(table);
+    const head_params = shape.head_params orelse try std.fmt.allocPrint(gpa, "{{\"bits\":{d}.0,\"K\":64,\"N\":128,\"dictionary\":\"{s}\"}}", .{ shape.bits, if (t == .dictionary_unused) "exl3.mcg.v1" else shape.dictionary });
+    const head_parts = if (fp8_head)
+        \\{"weight":{"tensor":"lm_head.weight","dtype":"F8_E4M3","shape":[64,128]}}
+    else
+        try std.fmt.allocPrint(gpa, "{{\"trellis\":{{\"tensor\":\"lm_head.trellis\",\"dtype\":\"I16\",\"shape\":[4,8,{d}]}},\"suh\":{{\"tensor\":\"lm_head.suh\",\"dtype\":\"F16\",\"shape\":[64]}},\"svh\":{{\"tensor\":\"lm_head.svh\",\"dtype\":\"F16\",\"shape\":[128]}}}}", .{words});
     const head_entry = try std.fmt.allocPrint(gpa,
-        \\{{"name":"lm_head","format":"{s}","params":{{"bits":{d}.0,"K":64,"N":128,"dictionary":"{s}"}},"shard":"{s}",
-        \\"parts":{{"trellis":{{"tensor":"lm_head.trellis","dtype":"I16","shape":[4,8,{d}]}},"suh":{{"tensor":"lm_head.suh","dtype":"F16","shape":[64]}},
-        \\"svh":{{"tensor":"lm_head.svh","dtype":"F16","shape":[128]}}}}}}
+        \\{{"name":"{s}","format":"{s}","params":{s},"shard":"{s}",
+        \\"parts":{s}}}
     , .{
-        if (t == .format) "eaq.mystery/0" else "eaq.trellis/0",
-        shape.bits,
-        if (t == .dictionary_unused) "exl3.mcg.v1" else shape.dictionary,
+        shape.head_name orelse "lm_head",
+        head_format,
+        head_params,
         if (t == .entry_shard_outside) "../outside.safetensors" else "model-00001.safetensors",
-        words,
+        head_parts,
     });
     const norm_entry = try std.fmt.allocPrint(gpa,
         \\{{"name":"{s}","format":"eaq.dense/0","params":{{}},"shard":"{s}",
