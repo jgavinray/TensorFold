@@ -308,6 +308,15 @@ TensorFold. What they follow or copy:
 
 - The Level Zero loader and the Intel compute runtime are loaded at run time and are not bundled; `ocloc` compiles the kernels
   at build time and is not distributed.
+- The engine's EXL3 work reads [ExLlamaV3](https://github.com/turboderp-org/exllamav3)'s EXL3 format: its trellis
+  layout and bitstream, its "mul1", "mcg" and "3inst" codebooks, its half-integer bit widths and its 128-point
+  Hadamard rotations, as [docs/recipes/exl3.md](docs/recipes/exl3.md) specifies them. The format files that carry the
+  derivation are `zig/src/core/exl3_format.zig`, the scalar reference decoder whose `mul1` tables the kernels'
+  constants match, and `zig/src/core/exl3_projection.zig`, the borrowed resident projections; the tests' fixture
+  `zig/src/core/eaq_fixture.zig` writes its synthetic EAQ packs' trellis parts in the same layout. ExLlamaV3 uses the
+  MIT License, Copyright © 2025 Turboderp; see [the license text](LICENSES/MIT.txt). The device kernels
+  `zig/kernels/xpu/qwen27/exl3.cl` and `exl3_h.cl` are TensorFold's, written to that format spec. The engine runs
+  none of ExLlamaV3's code and bundles no captured kernel binaries or model weights.
 
 ## Fish Audio Drama 3 on CUDA
 

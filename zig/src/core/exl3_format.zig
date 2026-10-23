@@ -51,6 +51,32 @@ pub fn codebookValue(codebook: Codebook, state: u16) f16 {
     return @floatCast(lo + hi); // the float64 sum is exact: one fp16 rounding
 }
 
+/// The integer half-to-even fp16 rounding the XPU kernels use for the mul1 weight:
+/// the exact value is ((1024+S)*1774 - 2721792) * 2^-18 (0x1EEE = 1774*2^-18,
+/// 0xC931 = -2721792*2^-18); IGC folds (float)(half) round-trips, so exl3.cl rounds
+/// in integer land. Keep this in sync with the kernel.
+fn integerFp16Weight(sum: u32) f32 {
+    const n: i32 = @as(i32, @intCast(sum)) * 1774 - 2721792;
+    const mag: u32 = @abs(n);
+    std.debug.assert(mag != 0); // (1024+S)*1774 never equals 2721792 for integer S in [0, 1020]
+    const b: u32 = 31 - @clz(mag);
+    const q: u32 = if (b > 10) @as(u32, 1) << @intCast(b - 10) else 1;
+    const rem: u32 = mag & (q - 1);
+    var r: u32 = mag - rem;
+    if (rem > q >> 1 or (rem == q >> 1 and (r & q) != 0)) r += q;
+    const signed: i32 = if (n < 0) -@as(i32, @intCast(r)) else @as(i32, @intCast(r));
+    return @as(f32, @floatFromInt(signed)) * 0x1.0p-18;
+}
+
+test "the integer fp16 weight rounding matches codebookValue for every mul1 state" {
+    for (0..65536) |s| {
+        const st: u16 = @intCast(s);
+        const x: u32 = @truncate(@as(u64, st) *% Mul1Mul);
+        const sum: u32 = 1024 + (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + ((x >> 24) & 255);
+        try std.testing.expectEqual(@as(f32, @floatCast(codebookValue(.mul1, st))), integerFp16Weight(sum));
+    }
+}
+
 /// E(p) for p = 0..255: where value p's 16-bit window ends in the tile's bitstream (exclusive).
 pub fn streamEnds(w: Width, ends: *[256]u32) void {
     if (!w.isHalf()) {
@@ -265,7 +291,78 @@ test "the reference decoder reproduces the numpy oracle on every codebook and wi
     }
 }
 
+test "the exl3_decode2 lane-window extraction reproduces tileStates on whole widths" {
+    // mirrors the kernel's per-lane loads and shifts exactly: lane L of exl3_decode2 owns
+    // positions 16L+v, whose state windows end at (p+1)*bits in the circular ring; the
+    // kernel loads the span's uint words once and extracts each window with two shifts.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try loadOracle(arena.allocator());
+    const count = u64At(8);
+    var at: usize = 16;
+    var windows_checked: usize = 0;
+    for (0..count) |_| {
+        const rec = recordAt(at);
+        const w: Width = .{ .halves = rec.halves };
+        const words = w.tileWords();
+        const trellis_base = at + 12;
+        at = rec.next;
+        if (rec.halves % 2 != 0) continue; // the kernel takes whole widths, like the seed
+        const bits: u32 = rec.halves / 2;
+        const nw: u32 = 8 * bits;
+        var tk: usize = 0;
+        while (tk < rec.kt) : (tk += 1) {
+            var tn: usize = 0;
+            while (tn < rec.nt) : (tn += 1) {
+                const ti = tk * rec.nt + tn;
+                const tile_at = trellis_base + ti * words * 2;
+                var tile: [128]i16 = undefined;
+                @memcpy(std.mem.sliceAsBytes(tile[0..words]), oracle[tile_at .. tile_at + words * 2]);
+                var states: [256]u32 = undefined;
+                tileStates(w, tile[0..words], &states);
+                for (0..16) |lane| {
+                    const lo: i64 = @as(i64, @intCast(16 * lane + 1)) * @as(i64, bits) - 16;
+                    const base_w = @divFloor(lo, 32);
+                    const nwords = (15 * bits + 16 + 31) / 32 + 1;
+                    var wrd: [6]u32 = undefined;
+                    for (0..nwords) |i| {
+                        const u = @mod(base_w + @as(i64, @intCast(i)), @as(i64, nw));
+                        wrd[i] = std.mem.readInt(u32, std.mem.sliceAsBytes(tile[0..words])[@intCast(u * 4)..][0..4], .little);
+                    }
+                    for (0..16) |v| {
+                        const p = 16 * lane + v;
+                        const a_v = lo + @as(i64, @intCast(v)) * @as(i64, bits);
+                        const u = @divFloor(a_v, 32);
+                        const i: usize = @intCast(u - base_w);
+                        const s: u5 = @intCast(a_v - u * 32);
+                        const w32 = if (s == 0) wrd[i] else (wrd[i] << s | wrd[i + 1] >> @intCast(@as(u6, 32) - s));
+                        try std.testing.expectEqual(states[p], w32 >> 16);
+                        // the t1 kernel's av-transform form must give the same state
+                        const av = a_v + @as(i64, 256) * bits;
+                        const w0i = av >> 5;
+                        const uu2: usize = @intCast(if (w0i >= nw) w0i - nw else w0i);
+                        const w1i: usize = if (uu2 + 1 == nw) 0 else uu2 + 1;
+                        const s2: u5 = @intCast(av & 31);
+                        const ring_word = struct {
+                            fn f(t: []const i16, nw2: u32, wi: usize) u32 {
+                                return std.mem.readInt(u32, std.mem.sliceAsBytes(t[0 .. nw2 * 2])[@intCast(wi * 4)..][0..4], .little);
+                            }
+                        }.f;
+                        const w0b = ring_word(tile[0..words], nw, uu2);
+                        const w1b = ring_word(tile[0..words], nw, w1i);
+                        const w32b = if (s2 == 0) w0b else (w0b << s2 | w1b >> @intCast(@as(u6, 32) - s2));
+                        try std.testing.expectEqual(states[p], w32b >> 16);
+                        windows_checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(windows_checked > 0);
+}
+
 test "a real mcg 8.00 bpw block unpacks and dequantizes to the oracle's values" {
+
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try loadOracle(arena.allocator());

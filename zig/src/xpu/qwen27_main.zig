@@ -1,6 +1,7 @@
 //! Development runner of the Qwen3.8-27B XPU forward: greedy tokens and timings, to check against a fp32 reference.
 const std = @import("std");
 const q = @import("qwen27.zig");
+const core = @import("core");
 const dr_mod = @import("drafter.zig");
 const Drafter = dr_mod.Drafter;
 const fp64_ref = @import("fp64_ref.zig");
@@ -52,7 +53,10 @@ pub fn main(init: std.process.Init) !void {
     q.profReport("decode");
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
-    if (std.c.getenv("XPU_EXL3_PROBE") != null) try exl3Probe(r);
+    if (std.c.getenv("XPU_EXL3_PROBE") != null) {
+        try exl3Probe(r);
+        try exl3PromptProbe(r);
+    }
     if (std.c.getenv("XPU_MULTI_TEST")) |v| try multiTest(r, ids.items, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
     if (std.c.getenv("XPU_A8_ZEBIN")) |path| try a8Loop(r, std.mem.span(path));
@@ -462,6 +466,9 @@ fn exl3Probe(r: *q.Runner) !void {
             }
             const bytes4 = @as(f64, @floatFromInt(K)) * @as(f64, @floatFromInt(N)) / 2.0;
             std.debug.print("int4 (ours)  K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s\n", .{ K, N, T, best * 1e3, bytes4 / best / 1e9 });
+            // bits=1 is excluded here: exl3_gemv lane-prefetches tw[lane] (nw >= 16 needed);
+            // the indexed-read kernels (decode2/_t1, the _h clones, dequant128_c) are safe
+            // and bits=1 is covered by exl3PromptProbe against the host oracle.
             for ([_]u32{ 4, 3, 2 }) |bits| {
                 const bytes: usize = @as(usize, K / 16) * (N / 16) * 16 * bits * 2;
                 const tr = try d.alloc_(bytes);
@@ -474,15 +481,420 @@ fn exl3Probe(r: *q.Runner) !void {
                 var kslices = ks;
                 while ((K / 16) % kslices != 0) kslices -= 1;
                 var b2: f64 = 1e9;
+                var b3: f64 = 1e9;
                 for (0..100) |it| {
                     const t0 = q.now();
                     try d.launch(d.k.exl3_gemv, .{ .x = N / 16, .y = kslices }, .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) });
                     try d.sync();
                     if (it > 5) b2 = @min(b2, q.now() - t0);
                 }
-                std.debug.print("exl3 {d} bits  K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s ({d} K slices)\n", .{ bits, K, N, T, b2 * 1e3, @as(f64, @floatFromInt(bytes)) / b2 / 1e9, kslices });
+                for (0..100) |it| {
+                    const t0 = q.now();
+                    if (T == 1)
+                        try d.launch(d.k.exl3_decode2_t1, .{ .x = N / 16, .y = kslices }, .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) })
+                    else
+                        try d.launch(d.k.exl3_decode2, .{ .x = N / 16, .y = kslices }, .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) });
+                    try d.sync();
+                    if (it > 5) b3 = @min(b3, q.now() - t0);
+                }
+                // seed vs v2 outputs: the same states and decode math, fp32 summation order differs.
+                // The seed runs twice: its xr[t] is runtime-indexed and shuffled, so a miscompile
+                // would show as seed != seed. The general kernel runs at every T; t1 only at T == 1.
+                const yn: usize = kslices * T * N;
+                const snap = try alloc.alloc(f32, yn);
+                defer alloc.free(snap);
+                const snap2 = try alloc.alloc(f32, yn);
+                defer alloc.free(snap2);
+                const hp = try d.g.hostAlloc(yn * 4);
+                defer d.g.free(hp);
+                const v2k = if (T == 1) d.k.exl3_decode2_t1 else d.k.exl3_decode2;
+                const args = .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) };
+                const groups: q.ze.GroupCount = .{ .x = N / 16, .y = kslices };
+                try d.launch(d.k.exl3_gemv, .{ .x = N / 16, .y = kslices }, .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) });
+                try d.sync();
+                try q.copy(d, hp, a.pscr, yn * 4);
+                try d.sync(); // the copy list is async: the host read must wait for it
+                @memcpy(snap, @as([*]const f32, @ptrCast(@alignCast(hp)))[0..yn]);
+                try d.launch(d.k.exl3_gemv, .{ .x = N / 16, .y = kslices }, .{ tr, a.h, a.pscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(T)), @as(i32, @intCast(bits)), @as(i32, @intCast(kslices)) });
+                try d.sync();
+                try q.copy(d, hp, a.pscr, yn * 4);
+                try d.sync(); // as above
+                var seed_deterministic = true;
+                for (snap, @as([*]const f32, @ptrCast(@alignCast(hp)))[0..yn]) |x, y| if (x != y) {
+                    seed_deterministic = false;
+                    break;
+                };
+                try d.launch(v2k, groups, args);
+                try d.sync();
+                try q.copy(d, hp, a.pscr, yn * 4);
+                try d.sync(); // as above
+                @memcpy(snap2, @as([*]const f32, @ptrCast(@alignCast(hp)))[0..yn]);
+                var worst: f32 = 0;
+                var mism: usize = 0;
+                for (snap, snap2) |x, y| {
+                    const dd = @abs(x - y);
+                    if (dd > worst) worst = dd;
+                    if (dd != 0) mism += 1;
+                }
+                try d.launch(d.k.exl3_decode2, groups, args);
+                try d.sync();
+                try q.copy(d, hp, a.pscr, yn * 4);
+                try d.sync(); // as above
+                var gw: f32 = 0;
+                var gm: usize = 0;
+                for (snap, @as([*]const f32, @ptrCast(@alignCast(hp)))[0..yn]) |x, y| {
+                    const dd = @abs(x - y);
+                    if (dd > gw) gw = dd;
+                    if (dd != 0) gm += 1;
+                }
+                std.debug.print("seed==seed: {} | v2({s}) vs seed: max |delta| {d:.4}, {d}/{d} differ | general vs seed: max {d:.4}, {d} differ\n", .{ seed_deterministic, if (T == 1) "t1" else "gen", worst, mism, yn, gw, gm });
+                if (T == 1) {
+                    // host reference from the same random trellis: tileStates + codebookValue +
+                    // tilePlacement, fp32-summed — anchors the card kernels without the seed.
+                    const tiles_n: usize = N / 16;
+                    const words: usize = @as(usize, 2 * bits) * 8;
+                    const per: usize = K / 16 / kslices;
+                    const xp = try d.g.hostAlloc(K * 2);
+                    defer d.g.free(xp);
+                    try q.copy(d, xp, a.h, K * 2);
+                    try d.sync();
+                    const xh = @as([*]const u16, @ptrCast(@alignCast(xp)))[0..K];
+                    var placement: [256]core.exl3_format.Placement = undefined;
+                    core.exl3_format.tilePlacement(&placement);
+                    var tile: [128]i16 = undefined;
+                    var states: [256]u32 = undefined;
+                    const w16 = core.exl3_format.Width{ .halves = @intCast(2 * bits) };
+                    const yref = try alloc.alloc(f32, kslices * N);
+                    defer alloc.free(yref);
+                    const yrefr = try alloc.alloc(f32, kslices * N);
+                    defer alloc.free(yrefr);
+                    @memset(yref, 0);
+                    @memset(yrefr, 0);
+                    const c1: f32 = @floatCast(@as(f16, @bitCast(core.exl3_format.Mul1ScaleBits)));
+                    const c0: f32 = @floatCast(@as(f16, @bitCast(core.exl3_format.Mul1BiasBits)));
+                    var tk: usize = 0;
+                    while (tk < K / 16) : (tk += 1) {
+                        var tn: usize = 0;
+                        while (tn < tiles_n) : (tn += 1) {
+                            const off2 = (tk * tiles_n + tn) * words * 2;
+                            @memcpy(std.mem.sliceAsBytes(tile[0..words]), host[off2 .. off2 + words * 2]);
+                            core.exl3_format.tileStates(w16, tile[0..words], &states);
+                            for (0..256) |p| {
+                                const st: u16 = @intCast(states[p]);
+                                const x: u32 = st *% core.exl3_format.Mul1Mul;
+                                const s: u32 = (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + ((x >> 24) & 255);
+                                const wgt: f32 = (1024.0 + @as(f32, @floatFromInt(s))) * c1 + c0; // the kernel's unrounded fp32 weight
+                                const xv: f32 = @as(f32, @as(f16, @bitCast(xh[tk * 16 + placement[p].row])));
+                                yref[(tk / per) * N + tn * 16 + placement[p].col] += xv * wgt;
+                                yrefr[(tk / per) * N + tn * 16 + placement[p].col] += xv * @as(f32, @floatCast(core.exl3_format.codebookValue(.mul1, st)));
+                            }
+                        }
+                    }
+                    var hworst: f32 = 0;
+                    var hrel: f32 = 0;
+                    for (yref, snap2) |x, y| {
+                        const dd = @abs(x - y);
+                        if (dd > hworst) hworst = dd;
+                        hrel = @max(hrel, dd / @max(1.0, @abs(x)));
+                    }
+                    var rworst: f32 = 0;
+                    var rrel: f32 = 0;
+                    for (yrefr, snap2) |x, y| {
+                        const dd = @abs(x - y);
+                        if (dd > rworst) rworst = dd;
+                        rrel = @max(rrel, dd / @max(1.0, @abs(x)));
+                    }
+                    std.debug.print("host(unrounded) vs v2: max {d:.6}, rel {d:.7} | host(fp16 w) vs v2: max {d:.6}, rel {d:.7}\n", .{ hworst, hrel, rworst, rrel });
+                }
+                std.debug.print("exl3 {d} bits  K {d:5} N {d:5} rows {d:2}: {d:6.3} ms, {d:5.0} GB/s ({d} K slices) | v2: {d:6.3} ms, {d:5.0} GB/s\n", .{ bits, K, N, T, b2 * 1e3, @as(f64, @floatFromInt(bytes)) / b2 / 1e9, kslices, b3 * 1e3, @as(f64, @floatFromInt(bytes)) / b3 / 1e9 });
                 d.g.free(tr);
             }
+        }
+    }
+}
+
+/// Dequant check: device fp16 scratch vs the fp64 oracle for the row block
+/// [row0, row0+rows); host_tr is the raw trellis bytes, wref the device copy (NT-pitched).
+/// Reports the max abs error and the ref RMS so the caller can apply a relative bound.
+fn exl3OracleCheck(host_tr: []const u8, hsuh: []const f16, hsvh: []const f16, wref: []const u16,
+                   K: usize, N: usize, NT: usize, bits: u32, row0: usize, rows: usize,
+                   worst: *f32, rel: *f32, rms: *f32) !void {
+    _ = K; // the oracle slices carry their own shapes; K pins nothing here
+    const words: usize = @as(usize, 16 * bits);
+    const out64 = try alloc.alloc(f64, rows * N);
+    defer alloc.free(out64);
+    const scratch64 = try alloc.alloc(f64, 2 * rows * N);
+    defer alloc.free(scratch64);
+    const tk0 = row0 / 16;
+    const trellis = @as([*]const i16, @ptrCast(@alignCast(host_tr.ptr + tk0 * (N / 16) * words * 2)))[0 .. (rows / 16) * (N / 16) * words];
+    core.exl3_format.dequantize(.{ .halves = @intCast(2 * bits) }, .mul1, trellis, rows / 16, N / 16, hsuh[row0..], hsvh, out64, scratch64);
+    var sumsq: f64 = 0;
+    for (0..rows) |k| {
+        for (0..N) |n| {
+            const ref: f32 = @floatCast(out64[k * N + n]);
+            const dv = @abs(ref - @as(f32, @as(f16, @bitCast(wref[(row0 + k) * NT + n]))));
+            if (dv > worst.*) worst.* = dv;
+            rel.* = @max(rel.*, dv / @max(@abs(ref), 1e-6));
+            sumsq += @as(f64, ref) * ref;
+        }
+    }
+    rms.* = @floatCast(@sqrt(sumsq / @as(f64, @floatFromInt(rows * N))));
+}
+
+/// GEMM check: the device fp16 tile at rows [m0, m0+128) x cols [n0, n0+128) vs a host
+/// fp32 matmul over the device-dequantized weights; ha is the [T][K] activation source,
+/// wref the full [K][NT] scratch, and cref the copied row block STARTING at crow0.
+fn exl3GemmTileCheck(ha: []const f16, wref: []const u16, cref: []const u16, K: usize, NT: usize,
+                     m0: usize, n0: usize, crow0: usize, worst: *f32, rel: *f32, rms: *f32) void {
+    var sumsq: f64 = 0;
+    for (0..128) |m| {
+        for (0..128) |n| {
+            var s: f32 = 0;
+            for (0..K) |k| s += @as(f32, ha[(m0 + m) * K + k]) * @as(f32, @as(f16, @bitCast(wref[k * NT + n0 + n])));
+            const dv = @abs(s - @as(f32, @as(f16, @bitCast(cref[(m0 + m - crow0) * NT + n0 + n]))));
+            if (dv > worst.*) worst.* = dv;
+            rel.* = @max(rel.*, dv / @max(@abs(s), 1e-6));
+            sumsq += @as(f64, s) * s;
+        }
+    }
+    rms.* = @floatCast(@sqrt(sumsq / @as(f64, 128 * 128)));
+}
+
+/// EXL3 prompt-path probe (no weights, random trellis/scales/activations): the [128,128]
+/// block dequant plus the fp16 DPAS GEMM at a full chunk of rows, against the host oracle
+/// (exl3_format.dequantize) and a host fp32 matmul over the device-dequantized weights.
+/// The full fp64 oracle runs for `down` (17408x5120; gu's would be ~4.3 GB) and on the
+/// first 128 k-rows for every shape; the GEMM is checked on the first 128x128 output tile
+/// of each shape. Timings compare against the seed int4 prompt GEMM on the same shapes.
+fn exl3PromptProbe(r: *q.Runner) !void {
+    const d = &r.d;
+    const a = &r.acts;
+    const l0 = &r.model.layers[0];
+    const T: u32 = q.CHUNK;
+    for ([_]q.Proj{ l0.gu, l0.down }) |w| {
+        const K: usize = w.k;
+        const N: usize = w.n;
+        const NT: usize = N;
+        const name: []const u8 = if (N == 2 * q.FF) "gu" else "down";
+        const full_oracle = K == q.FF; // down: host scratch for the fp64 oracle stays ~2.1 GB
+        for ([_]u32{ 4, 3, 2, 1 }) |bits| {
+            const tbytes: usize = (K / 16) * (N / 16) * @as(usize, 16 * bits) * 2;
+            const tr = try d.alloc_(tbytes);
+            const host_tr = try alloc.alloc(u8, tbytes);
+            defer alloc.free(host_tr);
+            var prng = std.Random.DefaultPrng.init(0x5137 + bits + @as(u64, K));
+            prng.random().bytes(host_tr);
+            try d.copyIn(tr, host_tr);
+            const suh = try d.alloc_(K * 2);
+            const svh = try d.alloc_(N * 2);
+            const hsuh = try alloc.alloc(f16, K);
+            defer alloc.free(hsuh);
+            const hsvh = try alloc.alloc(f16, N);
+            defer alloc.free(hsvh);
+            var vr = std.Random.DefaultPrng.init(0x9137 + bits + @as(u64, N));
+            for (hsuh) |*s| s.* = @floatCast(vr.random().float(f32) * 0.1 - 0.05);
+            for (hsvh) |*s| s.* = @floatCast(vr.random().float(f32) * 0.1 - 0.05);
+            try d.copyIn(suh, std.mem.sliceAsBytes(hsuh));
+            try d.copyIn(svh, std.mem.sliceAsBytes(hsvh));
+            // random fp16 activations in a.h's first T*K slots; the GEMM reads [T][K] there
+            const ha = try alloc.alloc(f16, T * K);
+            defer alloc.free(ha);
+            for (ha) |*x| x.* = @floatCast(vr.random().float(f32) * 2.0 - 1.0);
+            try d.copyIn(a.h, std.mem.sliceAsBytes(ha));
+
+            const wscr = try d.alloc_(K * NT * 2);
+            var bd: f64 = 1e9;
+            for (0..30) |it| {
+                const t0 = q.now();
+                try d.launch(d.k.exl3_dequant128, .{ .x = @intCast(K / 128), .y = @intCast(NT / 128) }, .{ tr, suh, svh, wscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(NT)), @as(i32, @intCast(bits)) });
+                try d.sync();
+                if (it > 3) bd = @min(bd, q.now() - t0);
+            }
+            const C = try d.alloc_(T * NT * 2);
+            var bg: f64 = 1e9;
+            for (0..30) |it| {
+                const t0 = q.now();
+                try d.launch(d.k.exl3_prompt16, .{ .x = @intCast((T + 127) / 128), .y = @intCast(NT / 128) }, .{ a.h, wscr, C, @as(i32, @intCast(T)), @as(i32, @intCast(NT)), @as(i32, @intCast(K)) });
+                try d.sync();
+                if (it > 3) bg = @min(bg, q.now() - t0);
+            }
+            var bs4: f64 = 0; // 0 = not measured: the seed int4 row only exists on int4 packs
+            if (w.exl3 == null) { // the seed int4 kernels cannot read trellis buffers; the comparison row exists for the int4 packs only
+                for (0..30) |it| {
+                    const t0 = q.now();
+                    try q.gemm(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T);
+                    try d.sync();
+                    if (it > 3) bs4 = @min(bs4, q.now() - t0);
+                }
+            }
+            var bc: f64 = 1e9; // the path's real cost: dequant + GEMM back to back
+            for (0..30) |it| {
+                const t0 = q.now();
+                try d.launch(d.k.exl3_dequant128, .{ .x = @intCast(K / 128), .y = @intCast(NT / 128) }, .{ tr, suh, svh, wscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(NT)), @as(i32, @intCast(bits)) });
+                try d.launch(d.k.exl3_prompt16, .{ .x = @intCast((T + 127) / 128), .y = @intCast(NT / 128) }, .{ a.h, wscr, C, @as(i32, @intCast(T)), @as(i32, @intCast(NT)), @as(i32, @intCast(K)) });
+                try d.sync();
+                if (it > 3) bc = @min(bc, q.now() - t0);
+            }
+
+            // dequant check: device fp16 scratch vs the fp64 oracle. down: all K rows
+            // (host scratch ~2.1 GB); gu: the first and last 128-row blocks (a bug in the
+            // bk indexing would show in any block; both ends pin it).
+            const wref = try alloc.alloc(u16, K * NT); // the device fp16 scratch, host side
+            defer alloc.free(wref);
+            const wp = try d.g.hostAlloc(K * NT * 2);
+            defer d.g.free(wp);
+            try q.copy(d, wp, wscr, K * NT * 2);
+            try d.sync();
+            @memcpy(wref, @as([*]const u16, @ptrCast(@alignCast(wp)))[0 .. K * NT]);
+            var dworst: f32 = 0;
+            var drel: f32 = 0;
+            var drms: f32 = 0;
+            if (full_oracle) {
+                try exl3OracleCheck(host_tr, hsuh, hsvh, wref, K, N, NT, bits, 0, K, &dworst, &drel, &drms);
+            } else {
+                try exl3OracleCheck(host_tr, hsuh, hsvh, wref, K, N, NT, bits, 0, 128, &dworst, &drel, &drms);
+                try exl3OracleCheck(host_tr, hsuh, hsvh, wref, K, N, NT, bits, K - 128, 128, &dworst, &drel, &drms);
+            }
+            if (dworst > 0.02 * drms) return error.Exl3GateFailed;
+
+            // GEMM check: two tiles — the first and the last (rows T-128.., cols NT-128..) —
+            // against a host fp32 matmul over the device weights.
+            const cref = try alloc.alloc(u16, 2 * 128 * NT);
+            defer alloc.free(cref);
+            const cp = try d.g.hostAlloc(2 * 128 * NT * 2);
+            defer d.g.free(cp);
+            try q.copy(d, cp, C, 128 * NT * 2);
+            try q.copy(d, @ptrFromInt(@intFromPtr(cp) + 128 * NT * 2), @ptrFromInt(@intFromPtr(C) + @as(usize, T - 128) * NT * 2), 128 * NT * 2);
+            try d.sync();
+            @memcpy(cref, @as([*]const u16, @ptrCast(@alignCast(cp)))[0 .. 2 * 128 * NT]);
+            var gworst: f32 = 0;
+            var grel: f32 = 0;
+            var grms: f32 = 0;
+            exl3GemmTileCheck(ha, wref, cref[0 .. 128 * NT], K, NT, 0, 0, 0, &gworst, &grel, &grms);
+            exl3GemmTileCheck(ha, wref, cref[128 * NT ..], K, NT, T - 128, NT - 128, T - 128, &gworst, &grel, &grms);
+            if (gworst > 0.02 * grms) return error.Exl3GateFailed;
+            const dq_gb: f64 = @as(f64, @floatFromInt(K * N * 2 + tbytes + K * 2 + N * 2)) / bd / 1e9;
+            const mm_flops: f64 = 2.0 * @as(f64, @floatFromInt(K)) * @as(f64, @floatFromInt(N)) * @as(f64, @floatFromInt(T));
+            std.debug.print("exl3 prompt {s} {d} bits K {d} N {d} T {d}: dequant {d:.3} ms ({d:.0} GB/s) | gemm {d:.3} ms ({d:.2} TFLOP/s) | dequant+gemm {d:.3} ms | seed int4 {d:.3} ms | dequant-vs-oracle max {d:.6} rel {d:.4} | gemm-vs-ref max {d:.4} rel {d:.5}\n", .{ name, bits, K, N, T, bd * 1e3, dq_gb, bg * 1e3, mm_flops / bg / 1e12, bc * 1e3, bs4 * 1e3, dworst, drel, gworst, grel });
+            d.g.free(wscr);
+            d.g.free(C);
+            d.g.free(suh);
+            d.g.free(svh);
+        }
+        // Edge-case pass (down, 4 bits, correctness only): T = 1093 makes the last M-tile's
+        // subgroups straddle the M boundary (partial 8-row store blocks) and the tail check
+        // sits on REAL columns; NT = N+128 exercises the dequant's SVH guard and the zero
+        // pad columns; unit-magnitude scales make the phase-B intermediate rounding visible.
+        // A second trellis with N' = N+16 exercises the partial-N contract (the block that
+        // straddles N must stay UNROTATED, matching the host oracle).
+        if (full_oracle) {
+            const bits: u32 = 4;
+            const T2: u32 = 1093;
+            const NT2: usize = N + 128;
+            const tbytes: usize = (K / 16) * (N / 16) * @as(usize, 16 * bits) * 2;
+            const tr = try d.alloc_(tbytes);
+            defer d.g.free(tr);
+            const host_tr = try alloc.alloc(u8, tbytes);
+            defer alloc.free(host_tr);
+            var prng = std.Random.DefaultPrng.init(0x5137 + bits + @as(u64, K));
+            prng.random().bytes(host_tr);
+            try d.copyIn(tr, host_tr);
+            const suh = try d.alloc_(K * 2);
+            const svh = try d.alloc_(NT2 * 2);
+            const hsuh = try alloc.alloc(f16, K);
+            defer alloc.free(hsuh);
+            const hsvh = try alloc.alloc(f16, NT2);
+            defer alloc.free(hsvh);
+            var vr = std.Random.DefaultPrng.init(0x2711);
+            for (hsuh) |*s| s.* = @floatCast(vr.random().float(f32) * 2.0 - 1.0);
+            for (hsvh) |*s| s.* = @floatCast(vr.random().float(f32) * 2.0 - 1.0);
+            try d.copyIn(suh, std.mem.sliceAsBytes(hsuh));
+            try d.copyIn(svh, std.mem.sliceAsBytes(hsvh));
+            const ha = try alloc.alloc(f16, T2 * K);
+            defer alloc.free(ha);
+            for (ha) |*x| x.* = @floatCast(vr.random().float(f32) * 2.0 - 1.0);
+            try d.copyIn(a.h, std.mem.sliceAsBytes(ha));
+            const wscr = try d.alloc_(K * NT2 * 2);
+            defer d.g.free(wscr);
+            try d.launch(d.k.exl3_dequant128, .{ .x = @intCast(K / 128), .y = @intCast(NT2 / 128) }, .{ tr, suh, svh, wscr, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, @intCast(NT2)), @as(i32, @intCast(bits)) });
+            const C2 = try d.alloc_(T2 * NT2 * 2);
+            defer d.g.free(C2);
+            try d.launch(d.k.exl3_prompt16, .{ .x = @intCast((T2 + 127) / 128), .y = @intCast(NT2 / 128) }, .{ a.h, wscr, C2, @as(i32, @intCast(T2)), @as(i32, @intCast(NT2)), @as(i32, @intCast(K)) });
+            try d.sync();
+            const wref = try alloc.alloc(u16, K * NT2);
+            defer alloc.free(wref);
+            const wp = try d.g.hostAlloc(K * NT2 * 2);
+            defer d.g.free(wp);
+            try q.copy(d, wp, wscr, K * NT2 * 2);
+            try d.sync();
+            @memcpy(wref, @as([*]const u16, @ptrCast(@alignCast(wp)))[0 .. K * NT2]);
+            var dworst: f32 = 0;
+            var drel: f32 = 0;
+            var drms: f32 = 0;
+            try exl3OracleCheck(host_tr, hsuh, hsvh, wref, K, N, NT2, bits, 0, 128, &dworst, &drel, &drms);
+            try exl3OracleCheck(host_tr, hsuh, hsvh, wref, K, N, NT2, bits, K - 128, 128, &dworst, &drel, &drms);
+            if (dworst > 0.02 * drms) return error.Exl3GateFailed;
+            var padw: f32 = 0; // pad columns of the scratch must be exactly zero
+            for (0..K) |k| {
+                for (0..128) |n| {
+                    padw = @max(padw, @abs(@as(f32, @as(f16, @bitCast(wref[k * NT2 + N + n])))));
+                }
+            }
+            const cref = try alloc.alloc(u16, 2 * 128 * NT2);
+            defer alloc.free(cref);
+            const cp = try d.g.hostAlloc(2 * 128 * NT2 * 2);
+            defer d.g.free(cp);
+            try q.copy(d, cp, C2, 128 * NT2 * 2);
+            try q.copy(d, @ptrFromInt(@intFromPtr(cp) + 128 * NT2 * 2), @ptrFromInt(@intFromPtr(C2) + @as(usize, T2 - 128) * NT2 * 2), 128 * NT2 * 2);
+            try d.sync();
+            @memcpy(cref, @as([*]const u16, @ptrCast(@alignCast(cp)))[0 .. 2 * 128 * NT2]);
+            var gworst: f32 = 0;
+            var grel: f32 = 0;
+            var grms: f32 = 0;
+            exl3GemmTileCheck(ha, wref, cref[0 .. 128 * NT2], K, NT2, 0, 0, 0, &gworst, &grel, &grms);
+            var pworst: f32 = 0;
+            var prel: f32 = 0;
+            var prms: f32 = 0;
+            exl3GemmTileCheck(ha, wref, cref[128 * NT2 ..], K, NT2, T2 - 128, N, T2 - 128, &pworst, &prel, &prms); // all-pad tile: ref == 0
+            if (gworst > 0.02 * grms or pworst > 1e-6) return error.Exl3GateFailed;
+            std.debug.print("exl3 prompt edge down 4 bits T {d} NT {d} (+128 pad): dequant-vs-oracle max {d:.5} rms {d:.4} | pad-scratch max {d:.9} | gemm real-tile max {d:.4} rms {d:.3} | tail-pad-tile max {d:.9}\n", .{ T2, NT2, dworst, drms, padw, gworst, grms, pworst });
+
+            // Partial-N contract: N' = N+16 tiles; the block straddling N' stays unrotated.
+            const N3: usize = N + 16;
+            const NT3: usize = N3 + (128 - N3 % 128);
+            const tb3: usize = (K / 16) * (N3 / 16) * @as(usize, 16 * bits) * 2;
+            const tr3 = try d.alloc_(tb3);
+            defer d.g.free(tr3);
+            const host_tr3 = try alloc.alloc(u8, tb3);
+            defer alloc.free(host_tr3);
+            var pr3 = std.Random.DefaultPrng.init(0x3131 + @as(u64, K));
+            pr3.random().bytes(host_tr3);
+            try d.copyIn(tr3, host_tr3);
+            const svh3 = try d.alloc_(N3 * 2);
+            defer d.g.free(svh3);
+            const hsvh3 = try alloc.alloc(f16, N3);
+            defer alloc.free(hsvh3);
+            var vr3 = std.Random.DefaultPrng.init(0x2712);
+            for (hsvh3) |*s| s.* = @floatCast(vr3.random().float(f32) * 2.0 - 1.0);
+            try d.copyIn(svh3, std.mem.sliceAsBytes(hsvh3));
+            const wscr3 = try d.alloc_(K * NT3 * 2);
+            defer d.g.free(wscr3);
+            try d.launch(d.k.exl3_dequant128, .{ .x = @intCast(K / 128), .y = @intCast(NT3 / 128) }, .{ tr3, suh, svh3, wscr3, @as(i32, @intCast(K)), @as(i32, @intCast(N3)), @as(i32, @intCast(NT3)), @as(i32, @intCast(bits)) });
+            try d.sync();
+            const wref3 = try alloc.alloc(u16, K * NT3);
+            defer alloc.free(wref3);
+            const wp3 = try d.g.hostAlloc(K * NT3 * 2);
+            defer d.g.free(wp3);
+            try q.copy(d, wp3, wscr3, K * NT3 * 2);
+            try d.sync();
+            @memcpy(wref3, @as([*]const u16, @ptrCast(@alignCast(wp3)))[0 .. K * NT3]);
+            var dworst3: f32 = 0;
+            var drel3: f32 = 0;
+            var drms3: f32 = 0;
+            try exl3OracleCheck(host_tr3, hsuh, hsvh3, wref3, K, N3, NT3, bits, 0, 128, &dworst3, &drel3, &drms3);
+            try exl3OracleCheck(host_tr3, hsuh, hsvh3, wref3, K, N3, NT3, bits, K - 128, 128, &dworst3, &drel3, &drms3);
+            if (dworst3 > 0.02 * drms3) return error.Exl3GateFailed;
+            std.debug.print("exl3 prompt edge down 4 bits partial-N N {d}: dequant-vs-oracle max {d:.5} rms {d:.4}\n", .{ N3, dworst3, drms3 });
         }
     }
 }

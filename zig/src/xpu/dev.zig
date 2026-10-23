@@ -96,6 +96,15 @@ pub const Dev = struct {
         attn_merge: ze.H,
         kv_move: ze.H,
         exl3_gemv: ze.H,
+        exl3_decode2: ze.H,
+        exl3_decode2_t1: ze.H,
+        exl3_dequant128: ze.H,
+        exl3_prompt16: ze.H,
+        exl3_decode2_h: ze.H,
+        exl3_decode2_t1_h: ze.H,
+        exl3_dequant128_c: ze.H,
+        exl3_xform_h: ze.H,
+        exl3_yscale_h: ze.H,
         rot_heads: ze.H,
         attn_prompt: ze.H,
         attn_prompt8: ze.H,
@@ -169,6 +178,16 @@ pub const Dev = struct {
         }
     }
 
+    /// XPU_EXL3_TRACE: the kernel's own name, from the handle's field in d.k (the twin of
+    /// the profiler's table, qwen27.zig:322), so a trace line names any launch, not only
+    /// the EXL3 ones.
+    pub fn kernelName(d: *Dev, k: ze.H) []const u8 {
+        inline for (@typeInfo(@TypeOf(d.k)).@"struct".field_names) |name| {
+            if (@field(d.k, name) == k) return name;
+        }
+        return "?";
+    }
+
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
         var ev: ze.H = null;
@@ -179,6 +198,12 @@ pub const Dev = struct {
             q.prof.used += 1;
         }
         try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
+        if (launchTracing()) { // the drain that pins a device-lost to the command that caused it
+            launch_seq += 1;
+            std.debug.print("EXL3TR launch #{d} {s} gx={d} gy={d} gz={d}\n", .{
+                launch_seq, d.kernelName(k), groups.x, groups.y, groups.z });
+            try d.sync();
+        }
     }
 
     pub fn sync(d: *Dev) !void {
@@ -207,8 +232,22 @@ pub const Dev = struct {
     }
 };
 
+/// XPU_EXL3_TRACE: every queued command prints and the command list drains, so the last
+/// line before a device-lost (Level Zero 0x70000001) is the command that caused it. The
+/// EXL3 launches add their args to it (forward_exl3.trLaunch). Unset, one cached getenv
+/// per launch and per copy.
+var launch_trace: ?bool = null;
+var launch_seq: u64 = 0;
+
+fn launchTracing() bool {
+    if (launch_trace == null) launch_trace = std.c.getenv("XPU_EXL3_TRACE") != null;
+    return launch_trace.?;
+}
+
 pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+    if (launchTracing()) std.debug.print("EXL3TR copy #{d} dst={x} src={x} n={d}\n", .{
+        launch_seq, @intFromPtr(dst), @intFromPtr(src), n });
 }
 
 pub fn off(p: *anyopaque, bytes: usize) *anyopaque {

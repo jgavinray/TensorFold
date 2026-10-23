@@ -17,6 +17,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     for ([_]struct { []const u8, []const u8, []const u8 }{
         .{ "glue", "zig/kernels/xpu/qwen27/glue.cl", "" },
         .{ "decode", "zig/kernels/xpu/qwen27/decode.cl", "" },
+        .{ "exl3", "zig/kernels/xpu/qwen27/exl3.cl", "" },
+        .{ "exl3_h", "zig/kernels/xpu/qwen27/exl3_h.cl", "" },
         .{ "gemm", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64" },
         .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
@@ -24,9 +26,15 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
-        c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s} -I zig/kernels/xpu/qwen27", .{ opts, k[2] }), "-output_no_suffix", "-output", k[0], "-out_dir" });
+        // the EXL3 GEMVs are small-register latency kernels: 256 GRF halves their occupancy
+        const exl3_family = std.mem.endsWith(u8, k[1], "exl3.cl") or std.mem.endsWith(u8, k[1], "exl3_h.cl");
+        const base_opts = if (exl3_family) opts[0 .. opts.len - " -cl-intel-256-GRF-per-thread".len] else opts; // drop only the GRF flag, keep anything else opts gains
+        const inc = if (exl3_family) "" else " -I zig/kernels/xpu/qwen27";
+        c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}{s}", .{ base_opts, k[2], inc }), "-output_no_suffix", "-output", k[0], "-out_dir" });
         c.setCwd(b.path("."));
-        for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
+        if (!exl3_family) { // exl3.cl and exl3_h.cl include nothing; skip the extra rebuild triggers
+            for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
+        }
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));
         _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{k[0]})), b.fmt("{s}.bin", .{k[0]}));
     }
@@ -56,6 +64,8 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const embedded = b.createModule(.{ .root_source_file = files.add("xpu_qwen27_kernels.zig",
         \\pub const glue align(8) = @embedFile("glue.bin").*;
         \\pub const decode align(8) = @embedFile("decode.bin").*;
+        \\pub const exl3 align(8) = @embedFile("exl3.bin").*;
+        \\pub const exl3_h align(8) = @embedFile("exl3_h.bin").*;
         \\pub const gemm align(8) = @embedFile("gemm.bin").*;
         \\pub const gemm128 align(8) = @embedFile("gemm128.bin").*;
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
@@ -74,13 +84,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const ze_mod = zeModule(b, target, optimize);
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addImport("xpu_qwen27_kernels", embedded);
-    // the FP64 references of the weight formats (core/quant), for XPU_FP64_REF and XPU_FIDELITY
-    module.addImport("core", b.createModule(.{
+    // the FP64 references of the weight formats (core/quant), for XPU_FP64_REF and XPU_FIDELITY,
+    // and the EXL3 reader pieces (exl3_format, exl3_load) that exl3_model.zig imports: every
+    // module that pulls qwen27.zig (the runner, the device tests) needs core in its context.
+    const core_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/core/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-    }));
+    });
+    module.addImport("core", core_mod);
     module.addImport("ze", ze_mod);
     const exe = b.addExecutable(.{ .name = "xpu-qwen27", .root_module = module });
     const install = b.addInstallArtifact(exe, .{});
@@ -95,6 +108,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         const m = b.createModule(.{ .root_source_file = b.path(t[1]), .target = target, .optimize = optimize, .link_libc = true });
         m.addImport("xpu_qwen27_kernels", embedded);
         m.addImport("ze", ze_mod);
+        m.addImport("core", core_mod);
         tests_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = t[0], .root_module = m }), .{}).step);
     }
 
@@ -102,6 +116,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const qwen27 = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27.zig"), .target = target, .optimize = optimize, .link_libc = true });
     qwen27.addImport("xpu_qwen27_kernels", embedded);
     qwen27.addImport("ze", ze_mod);
+    qwen27.addImport("core", core_mod);
     // the runner's open rules (one runner at a time, every option back to the process's own), run on this host
     const host = b.graph.host.result;
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27 })).step);
@@ -111,8 +126,10 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "xpu_qwen27", .module = qwen27 }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron } } });
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
-    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
-    const checkpoint_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "native_engines", .module = engines }, exlr8_build.cliImport(b, target, .ReleaseSafe, core), .{ .name = "core", .module = core } } });
+    // the SAME module object the runner imports: two createModule calls over one root file
+    // put root.zig in two modules of the server graph ("file exists in modules 'core' and 'core0'")
+    const core = core_mod;
+    const checkpoint_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "native_engines", .module = engines }, exlr8_build.cliImport(b, target, optimize, core), .{ .name = "core", .module = core } } });
     const server = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/server/main.zig"),
         .target = target,

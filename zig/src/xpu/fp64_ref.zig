@@ -1,4 +1,7 @@
-//! int4 GEMMs against FP64 references (XPU_FP64_REF) and teacher-forced top tokens (XPU_FIDELITY), runner only.
+//! int4 and EXL3 GEMMs against FP64 references (XPU_FP64_REF) and teacher-forced top tokens (XPU_FIDELITY), runner only.
+
+// The EXL3 references decode through core.exl3_format, the scalar oracle the Metal exl3_projection.zig
+// and its CPU mirror exl3_projection_decode.zig are tested against; no trellis math is duplicated here.
 const std = @import("std");
 const core = @import("core");
 const q = @import("qwen27.zig");
@@ -20,7 +23,7 @@ extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 /// Layers measured: two GDN (0, 1), two attention (31, 63); the head comes as layer LAYERS.
 const LAYERS_ON = [_]usize{ 0, 1, 31, 63 };
 const SITES = [_][]const u8{ "mixer_in", "mixer_out", "gate_up", "down", "head" };
-const PATHS = [_][]const u8{ "decode, 1 row", "decode, 8 rows", "prompt (nGEN)", "fp32 sequential", "fp16(FP64)" };
+const PATHS = [_][]const u8{ "decode, 1 row", "decode, 8 rows", "prompt (nGEN)", "fp32 sequential", "fp16(FP64)", "prompt (DPAS)", "dequant128 (fp16)" };
 /// Rows compared: 0 .. 7 (the decode paths), then 16 spread over the prompt.
 const NS = 24;
 
@@ -341,8 +344,10 @@ fn readRow(d: *Dev, dst: []f16, src: *anyopaque, row: usize, n: usize) !void {
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst.ptr, q.off(src, row * n * 2), n * 2, null, 0, null));
 }
 
-/// The probe: decode GEMMs on 1 and 8 rows, the prompt GEMM on all rows, then the host references on NS rows.
+/// The probe: decode GEMMs on 1 and 8 rows, the prompt GEMM on all rows, then the host references on NS rows;
+/// trellis handles (Proj.exl3) run the EXL3 sites instead.
 fn probe(d: *Dev, a: *Acts, w: Proj, x: *anyopaque, T: u32, layer: usize, site: u32) !void {
+    if (w.exl3 != null) return exl3Probe(d, a, w, x, T, layer, site);
     if (T < NS or (layer < q.LAYERS and std.mem.indexOfScalar(usize, &LAYERS_ON, layer) == null)) return;
     const t0 = q.now();
     try d.sync();
@@ -429,6 +434,331 @@ fn probe(d: *Dev, a: *Acts, w: Proj, x: *anyopaque, T: u32, layer: usize, site: 
     std.debug.print("fp64 ref: layer {d} {s} (K {d}) in {d:.1} s\n", .{ layer, SITES[site], K, q.now() - t0 });
 }
 
+// ---------------------------------------------------------------- EXL3 (trellis weights)
+
+/// One stored EXL3 part as the device sees it: the checkpoint's trellis words and the entry
+/// scales in the loader's host-normalized shape (exl3_model.projectionExl3's three styles).
+const Exl3Part = struct {
+    tr: []const i16, // [K/16, n/16, halves*8]
+    suh: []const f16, // [K]: per-weight fp16 as stored, per-16 replicated, or the sign words unpacked
+    svh: []const f16, // [n], the same three styles
+    k: usize,
+    n0: usize, // first device column of this part (the fused parts stack on N)
+    n: usize,
+    halves: u16,
+};
+
+var exl3_cache: std.AutoHashMap(usize, []Exl3Part) = .init(alloc);
+
+fn u16At(bytes: []const u8, i: usize) u16 {
+    return std.mem.readInt(u16, bytes[2 * i ..][0..2], .little);
+}
+
+/// One side's entry scales as the loader leaves them on the device (exl3_model's normalization:
+/// fp16 per weight copied, fp16 per 16 x16-replicated, packed I16 sign words unpacked).
+fn exl3Scales(c: *const q.Checkpoint, pre: []const u8, hi: []const u8, signs: []const u8, n: usize) ![]f16 {
+    const out = try alloc.alloc(f16, n);
+    if (c.has(try std.fmt.allocPrint(alloc, "{s}.{s}", .{ pre, hi }))) {
+        const t = try c.get(try std.fmt.allocPrint(alloc, "{s}.{s}", .{ pre, hi }));
+        if (!std.mem.eql(u8, t.dtype, "F16")) return error.UnexpectedDtype;
+        if (t.bytes.len == n * 2) {
+            for (0..n) |i| out[i] = @bitCast(u16At(t.bytes, i));
+        } else if (t.bytes.len == n / 8) { // per-16: n/16 fp16 values, replicated x16
+            for (0..n) |i| out[i] = @bitCast(u16At(t.bytes, i / 16));
+        } else return error.UnexpectedDtype;
+    } else {
+        const t = try c.get(try std.fmt.allocPrint(alloc, "{s}.{s}", .{ pre, signs }));
+        if (!std.mem.eql(u8, t.dtype, "I16") or t.bytes.len != n / 8) return error.UnexpectedDtype;
+        const words = try alloc.alloc(i16, n / 16);
+        defer alloc.free(words);
+        for (words, 0..) |*p, i| p.* = @bitCast(u16At(t.bytes, i));
+        core.exl3_format.unpackSigns(words, out); // word bit b set: element 16w+b is -1
+    }
+    return out;
+}
+
+/// The stored parts of an EXL3 projection, from the checkpoint (the loader's own group names;
+/// mul1 is the loader's own admission, witnessed per group). Kept across probes and through the
+/// teacher-forced forward, keyed by the handle's first buffer (w.w is part 0's trellis).
+fn exl3Parts(c: *const q.Checkpoint, w: Proj, layer: usize, site: u32) ![]Exl3Part {
+    if (exl3_cache.get(@intFromPtr(w.w))) |ps| return ps;
+    const attn = layer < q.LAYERS and q.isAttention(layer);
+    const names: []const []const u8 = switch (site) {
+        0 => if (attn) &.{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj" } else &.{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z" },
+        1 => if (attn) &.{"self_attn.o_proj"} else &.{"linear_attn.out_proj"},
+        2 => &.{ "mlp.gate_proj", "mlp.up_proj" },
+        3 => &.{"mlp.down_proj"},
+        else => &.{"lm_head"},
+    };
+    var list: std.ArrayList(Exl3Part) = .empty;
+    var n0: usize = 0;
+    for (names) |name| {
+        const pre = if (site == 4) name else try std.fmt.allocPrint(alloc, "model.layers.{d}.{s}", .{ layer, name });
+        _ = try c.get(try std.fmt.allocPrint(alloc, "{s}.mul1", .{pre})); // the loader admits mul1 only; the reference trusts nothing else
+        const t = try c.get(try std.fmt.allocPrint(alloc, "{s}.trellis", .{pre}));
+        if (!std.mem.eql(u8, t.dtype, "I16") or t.rank != 3 or t.shape[2] % 8 != 0) return error.UnexpectedDtype;
+        const halves: u16 = @intCast(t.shape[2] / 8);
+        const k: usize = @intCast(t.shape[0] * 16);
+        const n: usize = @intCast(t.shape[1] * 16);
+        if (k != w.k or n == 0 or n % 128 != 0 or t.bytes.len != k / 16 * (n / 16) * (@as(usize, halves) * 8) * 2) return error.UnexpectedShape;
+        const tr: []const i16 = if (@intFromPtr(t.bytes.ptr) % 2 == 0)
+            @as([*]const i16, @ptrCast(@alignCast(t.bytes.ptr)))[0 .. t.bytes.len / 2]
+        else blk: { // the oracle takes i16 words: copied only when the mmap places them oddly
+            const copy = try alloc.alloc(i16, t.bytes.len / 2);
+            for (copy, 0..) |*v, i| v.* = @bitCast(u16At(t.bytes, i));
+            break :blk copy;
+        };
+        try list.append(alloc, .{
+            .tr = tr,
+            .suh = try exl3Scales(c, pre, "suh", "su", k),
+            .svh = try exl3Scales(c, pre, "svh", "sv", n),
+            .k = k,
+            .n0 = n0,
+            .n = n,
+            .halves = halves,
+        });
+        n0 += n;
+    }
+    const ps = try list.toOwnedSlice(alloc);
+    try exl3_cache.put(@intFromPtr(w.w), ps);
+    return ps;
+}
+
+/// Host work: 128-column blocks of the parts' concatenation — the oracle's FP64 dequantize per
+/// block (core.exl3_format.dequantize: states, mul1 codebook, placement and both Hadamards, never
+/// duplicated here). A block is the widest slice that keeps every 128-wide rotation inside itself,
+/// and every admitted part has N a multiple of 128 (exl3_model.admitGroup), so the block equals
+/// the full-width dequantization restricted to its columns. Per block: the FP64 (and sequential
+/// fp32) sums over R rows, and the device's own dequant slab compared element-wise when passed.
+const Exl3Job = struct {
+    ps: []const Exl3Part,
+    k: usize,
+    x64: []const f64, // [K, R]
+    x32: []const f32, // [K, R], empty: no fp32 sums
+    rows: usize,
+    ref: []f64, // [R, NT] by device column
+    seq: []f32, // [R, NT], empty: no fp32 path
+    wdq: []const f16, // the device's dequant slab [K, NT], empty: no dequant comparison
+    deq: ?*Stats = null, // the shared column arrays; counters stay per worker and merge after the join
+    nt: usize,
+    from: usize = 0, // this worker's 128-column block range over the parts' concatenation
+    to: usize = 0,
+    st: Stats = .{}, // this worker's counters (its col_err/col_ref are the shared arrays)
+    failed: bool = false,
+
+    fn run(j: *Exl3Job) void {
+        j.work() catch {
+            j.failed = true;
+        };
+    }
+
+    fn work(j: *Exl3Job) !void {
+        const k = j.k;
+        const R = j.rows;
+        const kt = k / 16;
+        const fp32 = j.x32.len != 0;
+        const w64 = try alloc.alloc(f64, k * 128); // the block's FP64 W_eff columns
+        defer alloc.free(w64);
+        const scratch = try alloc.alloc(f64, 2 * k * 128); // the oracle's working copy
+        defer alloc.free(scratch);
+        const strip = try alloc.alloc(i16, kt * 8 * 128); // one strip of 8 tile columns, gathered K-contiguous (widest halves)
+        defer alloc.free(strip);
+        const a64 = try alloc.alloc(f64, R);
+        defer alloc.free(a64);
+        const a32 = try alloc.alloc(f32, R);
+        defer alloc.free(a32);
+        var base: usize = 0;
+        for (j.ps) |*p| {
+            const words = @as(usize, p.halves) * 8;
+            var b: usize = 0;
+            while (b < p.n / 128) : (b += 1) {
+                defer base += 1;
+                if (base < j.from or base >= j.to) continue;
+                const tn0 = b * 8; // the checkpoint stores the tiles K-major in N: gather this strip's tile rows contiguous
+                for (0..kt) |tk| @memcpy(strip[tk * 8 * words ..][0 .. 8 * words],
+                    p.tr[(tk * (p.n / 16) + tn0) * words ..][0 .. 8 * words]);
+                core.exl3_format.dequantize(.{ .halves = p.halves }, .mul1, strip[0 .. kt * 8 * words], kt, 8,
+                    p.suh, p.svh[b * 128 ..][0..128], w64, scratch);
+                const c0 = p.n0 + b * 128;
+                for (0..128) |cn| {
+                    @memset(a64, 0);
+                    @memset(a32, 0);
+                    for (0..k) |kk| {
+                        const w = w64[kk * 128 + cn];
+                        const xa = j.x64[kk * R ..][0..R];
+                        for (a64, xa) |*acc, xv| acc.* += xv * w;
+                        if (!fp32) continue;
+                        const wf: f32 = @floatCast(@as(f16, @floatCast(w))); // the device's own weight rounding, fp32 math after it
+                        const xb = j.x32[kk * R ..][0..R];
+                        for (a32, xb) |*acc, xv| acc.* = acc.* + xv * wf; // k ascending, product then sum, no FMA
+                    }
+                    for (0..R) |s| {
+                        j.ref[s * j.nt + c0 + cn] = a64[s];
+                        if (fp32) j.seq[s * j.nt + c0 + cn] = a32[s];
+                    }
+                }
+                if (j.deq == null) continue;
+                for (0..k) |kk| for (0..128) |cn| // the dequant128 site: device fp16 against the oracle, every stored element
+                    j.st.add(j.wdq[kk * j.nt + c0 + cn], w64[kk * 128 + cn], c0 + cn);
+            }
+        }
+    }
+};
+
+/// The parts' products with R fp16 rows (xh [R, K]) in FP64, in sequential fp32 when `seq` is not
+/// empty; `wdq` (with its statistics in `st6`) adds the element-wise check of the device's own
+/// dequant slab. The threading mirrors hostGemm: blocks are independent, the workers merge counters.
+fn hostGemmExl3(ps: []const Exl3Part, xh: []const f16, R: usize, nt: usize, ref: []f64, seq: []f32, wdq: []const f16, st6: ?*Stats) !void {
+    const K = ps[0].k;
+    const x64 = try alloc.alloc(f64, K * R);
+    defer alloc.free(x64);
+    const x32 = try alloc.alloc(f32, if (seq.len != 0) K * R else 0);
+    defer alloc.free(x32);
+    for (0..R) |s| for (0..K) |k| {
+        x64[k * R + s] = xh[s * K + k];
+        if (seq.len != 0) x32[k * R + s] = xh[s * K + k];
+    };
+    const dq: ?*Stats = if (wdq.len != 0) st6 else null;
+    var total: usize = 0;
+    for (ps) |p| total += p.n / 128;
+    const workers = @min(@max(std.Thread.getCpuCount() catch 1, 1), 8); // each worker holds ~3 x K x 128 f64 of oracle scratch: fewer than hostGemm's 64
+    var jobs: [8]Exl3Job = undefined;
+    var threads: [8]?std.Thread = @splat(null);
+    for (0..workers) |i| {
+        jobs[i] = .{
+            .ps = ps,
+            .k = K,
+            .x64 = x64,
+            .x32 = x32,
+            .rows = R,
+            .ref = ref,
+            .seq = seq,
+            .wdq = wdq,
+            .deq = dq,
+            .nt = nt,
+            .st = if (dq) |t| .{ .col_err = t.col_err, .col_ref = t.col_ref } else .{},
+        };
+        jobs[i].from = total * i / workers;
+        jobs[i].to = total * (i + 1) / workers;
+        threads[i] = std.Thread.spawn(.{}, Exl3Job.run, .{&jobs[i]}) catch null;
+        if (threads[i] == null) jobs[i].run();
+    }
+    for (threads[0..workers]) |t| if (t) |th| th.join();
+    if (st6) |t| for (jobs[0..workers]) |j| {
+        t.n += j.st.n;
+        t.max_abs = @max(t.max_abs, j.st.max_abs);
+        t.sq_err += j.st.sq_err;
+        t.sq_ref += j.st.sq_ref;
+        t.sq_rn += j.st.sq_rn;
+        t.max_ulp = @max(t.max_ulp, j.st.max_ulp);
+        t.ulp0 += j.st.ulp0;
+        t.ulp1 += j.st.ulp1;
+        t.bad += j.st.bad;
+    };
+    for (jobs[0..workers]) |j| if (j.failed) return error.ReferenceFailed;
+}
+
+/// The EXL3 probe: the two decode GEMV paths on 1 and 8 rows, the fused prompt GEMM (dequant128_c
+/// plus the one DPAS prompt16) on all rows, the device's own dequant slab, and the host references
+/// on NS rows — the same table as the int4 sites, the prompt row named for the DPAS kernel and the
+/// dequant row measuring the fp16 the prompt GEMM reads against the FP64 oracle (the PR 3 bounds
+/// language: accepted worst 2^-8 of the RMS weight, RMS 2^-11). The head runs the decode rows only:
+/// its rows are always <= 16 and its full-width dequant slab is the 2.54 GB the design refuses.
+fn exl3Probe(d: *Dev, a: *Acts, w: Proj, x: *anyopaque, T: u32, layer: usize, site: u32) !void {
+    if (T < NS or (layer < q.LAYERS and std.mem.indexOfScalar(usize, &LAYERS_ON, layer) == null)) return;
+    const t0 = q.now();
+    try d.sync();
+    var rows: [NS]usize = undefined;
+    for (&rows, 0..) |*r, i| r.* = if (i < 8) i else 8 + (i - 8) * (T - 8) / 16;
+    const K: usize = w.k;
+    const N: usize = w.n;
+    const xa = try alloc.alloc(f16, T * K);
+    defer alloc.free(xa);
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, xa.ptr, x, xa.len * 2, null, 0, null));
+    // device outputs: path 0 row 0, path 1 rows 0 .. 7, path 5 the NS rows (the fused prompt GEMM)
+    const out = try alloc.alloc(f16, 3 * NS * N);
+    defer alloc.free(out);
+    const m_prompt: u32 = if (site == 4) 0 else T; // the head never runs as a prompt GEMM
+    const scratch = try d.g.deviceAlloc(@max(T, 8) * N * 2);
+    defer d.g.free(scratch);
+    for ([_]u32{ 1, 8, m_prompt }, 0..) |m, path| {
+        if (m == 0) continue;
+        try fwd.gemmRows(d, a.pscr, x, a.ahi, a.alo, w, scratch, m, m > 16, a.wscr);
+        try d.sync();
+        const nr: usize = if (m == 1) 1 else if (m == 8) 8 else NS;
+        for (0..nr) |i| try readRow(d, out[(path * NS + i) * N ..][0..N], scratch, rows[i], N);
+    }
+    try d.sync();
+    // the device's own dequant pass: after the prompt launch above, wscr holds this projection's
+    // fused [K, NT] slab (one projection at a time); the pad columns keep the zeros Acts.init wrote
+    var slab: []f16 = &.{};
+    if (m_prompt != 0) {
+        slab = try alloc.alloc(f16, K * N);
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, slab.ptr, a.wscr.?, slab.len * 2, null, 0, null));
+        try d.sync();
+    }
+    defer if (slab.len != 0) alloc.free(slab);
+    const xh = try alloc.alloc(f16, NS * K);
+    defer alloc.free(xh);
+    for (rows, 0..) |r, s| @memcpy(xh[s * K ..][0..K], xa[r * K ..][0..K]);
+    const ps = try exl3Parts(&runner.ckpt, w, layer, site);
+    const ref = try alloc.alloc(f64, NS * N);
+    defer alloc.free(ref);
+    const seq = try alloc.alloc(f32, NS * N);
+    defer alloc.free(seq);
+    // statistics over the stored columns only (the tile padding is left out)
+    var st: [7]Stats = @splat(.{});
+    for (&st) |*s| {
+        s.col_err = try alloc.alloc(f64, N);
+        s.col_ref = try alloc.alloc(f64, N);
+        @memset(s.col_err, 0);
+        @memset(s.col_ref, 0);
+    }
+    defer for (&st) |*s| {
+        alloc.free(s.col_err);
+        alloc.free(s.col_ref);
+    };
+    try hostGemmExl3(ps, xh, NS, N, ref, seq, slab, if (slab.len != 0) &st[6] else null);
+    for (ps) |*p| for (0..p.n) |n| {
+        const c = p.n0 + n;
+        for (0..NS) |s| {
+            const r = ref[s * N + c];
+            if (s == 0) st[0].add(out[c], r, c);
+            if (s < 8) st[1].add(out[(NS + s) * N + c], r, c);
+            if (m_prompt != 0) st[5].add(out[(2 * NS + s) * N + c], r, c);
+            st[3].add(@floatCast(seq[s * N + c]), r, c);
+            st[4].add(@floatCast(r), r, c);
+        }
+    };
+    const lname = if (layer == q.LAYERS) "head" else try std.fmt.allocPrint(alloc, "{d}", .{layer});
+    for (st, 0..) |s, i| {
+        if (s.n == 0) continue;
+        const nf: f64 = @floatFromInt(s.n);
+        const rms = @sqrt(s.sq_ref / nf);
+        var worst: f64 = 0;
+        var wcol: usize = 0;
+        for (ps) |*p| for (0..p.n) |n| {
+            const c = p.n0 + n;
+            if (s.col_ref[c] == 0) continue;
+            const e = @sqrt(s.col_err[c] / s.col_ref[c]);
+            if (e > worst) {
+                worst = e;
+                wcol = c;
+            }
+        };
+        const rel = @sqrt(s.sq_err / s.sq_ref);
+        const rel_rn = @sqrt(s.sq_rn / s.sq_ref);
+        const p0 = 100 * @as(f64, @floatFromInt(s.ulp0)) / nf;
+        const p1 = 100 * @as(f64, @floatFromInt(s.ulp1)) / nf;
+        std.debug.print("| EXL3 mul1 | {s} | {s} | {s} | {d} ", .{ lname, SITES[site], PATHS[i], s.n });
+        std.debug.print("| {e:.2} | {e:.2} | {e:.2} | {e:.2} ", .{ s.max_abs, s.max_abs / rms, rel, rel_rn });
+        std.debug.print("| {e:.2} ({d}) | {d} | {d:.1} % | {d:.1} % |", .{ worst, wcol, s.max_ulp, p0, p1 });
+        if (s.bad != 0) std.debug.print(" {d} non-finite", .{s.bad});
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("fp64 ref: layer {d} {s} (K {d}) in {d:.1} s\n", .{ layer, SITES[site], K, q.now() - t0 });
+}
+
 // ---------------------------------------------------------------- teacher-forced fidelity
 
 /// The FP64 forward's GEMMs: each XPU GEMM output replaced by fp16(FP64) of the same int4 weights and input rows.
@@ -443,6 +773,7 @@ fn replace(d: *Dev, h: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
         };
     }
     if (site == 4 and w.w != r.model.head.w) return error.UnknownProjection;
+    if (w.exl3 != null) return replaceExl3(d, h, w, out, m, layer, site);
     try d.sync();
     const K: usize = w.k;
     const N: usize = w.n;
@@ -464,6 +795,33 @@ fn replace(d: *Dev, h: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, out, o.ptr, o.len * 2, null, 0, null));
     try d.sync();
 }
+
+/// The same teacher-forced stand-in on trellis weights: the GEMM's output replaced by
+/// fp16(FP64) of the oracle's dequantized weights and the input rows, the dequant through
+/// core.exl3_format.dequantize (128-column blocks, the fused parts' columns at their device base).
+fn replaceExl3(d: *Dev, h: *anyopaque, w: Proj, out: *anyopaque, m: u32, layer: usize, site: u32) !void {
+    try d.sync();
+    const K: usize = w.k;
+    const N: usize = w.n;
+    const xh = try alloc.alloc(f16, m * K);
+    defer alloc.free(xh);
+    const o = try alloc.alloc(f16, m * N);
+    defer alloc.free(o);
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, xh.ptr, h, xh.len * 2, null, 0, null));
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, o.ptr, out, o.len * 2, null, 0, null));
+    try d.sync();
+    const ps = try exl3Parts(&runner.ckpt, w, layer, site);
+    const ref = try alloc.alloc(f64, m * N);
+    defer alloc.free(ref);
+    try hostGemmExl3(ps, xh, m, N, ref, &.{}, &.{}, null);
+    for (ps) |*p| for (0..p.n) |n| {
+        const c = p.n0 + n;
+        for (0..m) |s| o[s * N + c] = @floatCast(ref[s * N + c]);
+    };
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, out, o.ptr, o.len * 2, null, 0, null));
+    try d.sync();
+}
+
 
 /// The prompt's final normed hidden rows (fp16 [T, D]) through XPU_DUMP_H's path, into memory.
 fn hidden(r: *q.Runner, ids: []const u32) ![]f16 {
@@ -497,6 +855,7 @@ fn push(t: *Top, i: u32, v: f64) void {
 /// The two top tokens of each row's logits by the FP64 head (same int4 head weights).
 fn headTops(h: []const f16, T: usize) ![]Top {
     const head = runner.model.head;
+    if (head.exl3 != null) return exl3HeadTops(h, head, T);
     const ps = try parts(&runner.ckpt, head, q.LAYERS, 4);
     const tops = try alloc.alloc(Top, T);
     @memset(tops, .{});
@@ -507,6 +866,24 @@ fn headTops(h: []const f16, T: usize) ![]Top {
         const ref = try alloc.alloc(f64, R * head.n);
         defer alloc.free(ref);
         try hostGemm(ps, h[r0 * q.D ..][0 .. R * q.D], R, head.n, ref, &.{});
+        for (0..R) |s| for (0..q.VOCAB) |c| push(&tops[r0 + s], @intCast(c), ref[s * head.n + c]);
+    }
+    return tops;
+}
+
+/// The two top tokens of each row's logits by the FP64 head of a trellis pack (the oracle's
+/// dequantized lm_head, the same 64-row blocks and top-2 push as the int4 head).
+fn exl3HeadTops(h: []const f16, head: Proj, T: usize) ![]Top {
+    const ps = try exl3Parts(&runner.ckpt, head, q.LAYERS, 4);
+    const tops = try alloc.alloc(Top, T);
+    @memset(tops, .{});
+    const step: usize = 64; // rows at a time: the FP64 logits of a block fit in memory
+    var r0: usize = 0;
+    while (r0 < T) : (r0 += step) {
+        const R: usize = @min(step, T - r0);
+        const ref = try alloc.alloc(f64, R * head.n);
+        defer alloc.free(ref);
+        try hostGemmExl3(ps, h[r0 * q.D ..][0 .. R * q.D], R, head.n, ref, &.{}, &.{}, null);
         for (0..R) |s| for (0..q.VOCAB) |c| push(&tops[r0 + s], @intCast(c), ref[s * head.n + c]);
     }
     return tops;

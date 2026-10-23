@@ -4,6 +4,8 @@ const ze = @import("ze");
 const q = @import("qwen27.zig");
 const dev = @import("dev.zig");
 const loader = @import("load.zig");
+const exl3fwd = @import("forward_exl3.zig");
+pub const exl3ResetXscr = exl3fwd.exl3ResetXscr; // the runner resets the module-global Xt staging at open
 const D = q.D;
 const Dev = dev.Dev;
 const EPS = q.EPS;
@@ -72,11 +74,21 @@ pub const Acts = struct {
     mpos: *anyopaque, // i32 [16]: and positions
     a8: *anyopaque, // W4A8 prompt: activations int8 [maxRows, FF] (permuted by blocks of 8) …
     sa: *anyopaque, // … and their scales fp32 [FF / 128, maxRows + 32]
+    wscr: ?*anyopaque, // EXL3 only: fp16 [D, 2 FF] dequant scratch (peak 356,515,840 B); null on int4/MLX models
 
-    pub fn init(d: *Dev) !Acts {
+    pub fn init(d: *Dev, with_wscr: bool) !Acts {
         const rows = q.maxRows();
         const nc = limits.chunks(rows);
         const ns = limits.splits(q.MAX_CTX, SPLIT);
+        // Zeroed once here so layer 0's GDN mixer_in pad columns (parts end at 16384, the 256
+        // tile pads NT to 16640) are deterministic zeros; from layer 1 on they hold the previous
+        // slot's finite weights — prompt16 reads them but dense_rows overwrites their output
+        // columns (forward.zig mixer_in block), so the values never reach a consumer.
+        const wscr: ?*anyopaque = if (with_wscr) blk: {
+            const w = try d.alloc_(@as(usize, q.D) * (2 * q.FF) * 2);
+            try d.fill(w, @as(u16, 0), @as(usize, q.D) * (2 * q.FF) * 2);
+            break :blk w;
+        } else null;
         return .{
             .x = try d.alloc_(rows * D * 4),
             .h = try d.alloc_(rows * FF * 2),
@@ -120,6 +132,7 @@ pub const Acts = struct {
             .mpos = try d.alloc_(16 * 4),
             .a8 = try d.alloc_(rows * FF),
             .sa = try d.alloc_((FF / 128) * (rows + 32) * 4),
+            .wscr = wscr,
         };
     }
 };
@@ -149,7 +162,7 @@ pub fn mlpIn(d: *Dev, a: *Acts, w: Proj, T: u32, gs: i32, pre: bool, wide: bool)
         try d.launch(d.k.rowsums_ff, .{ .x = T }, .{ a.p, a.ahi, a.alo, gs, q.rot_on });
         return a.p;
     }
-    try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide);
+    try gemmRows(d, a.pscr, a.h, a.ahi, a.alo, w, a.p, T, wide, a.wscr);
     try d.launch(d.k.swiglu, .{ .x = T, .y = 17 }, .{ a.p, a.h, a.ahi, a.alo, gs, @as(i32, @intFromBool(w.ilv)), q.rot_on });
     return a.h;
 }
@@ -164,11 +177,12 @@ pub fn embedRows(d: *Dev, m: *const Model, ids: *anyopaque, x: *anyopaque, rows:
 
 /// out[M, N] fp16 = h[M, K] · Wᵀ : decode kernels up to 16 rows, the nGEN prompt GEMMs above.
 pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32) !void {
-    return gemmRows(d, pscr, h, ahi, alo, w, out, m, m > 16);
+    return gemmRows(d, pscr, h, ahi, alo, w, out, m, m > 16, null);
 }
 
 /// `gemm` with the path chosen by the caller: `wide`, the nGEN prompt GEMMs whatever the rows (a prompt's chunk).
-pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32, wide: bool) !void {
+pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32, wide: bool, wscr: ?*anyopaque) !void {
+    if (w.exl3) |hx| { return exl3fwd.gemmRows(d, hx, wscr, h, ahi, alo, w, out, m, wide); } // null wscr is fine narrow: the GEMVs stage their own Xt (forward_exl3.xscratch)
     const M: i32 = @intCast(m);
     const N: i32 = @intCast(w.n);
     const K: i32 = @intCast(w.k);
@@ -262,7 +276,7 @@ pub const no_q8: ?*anyopaque = null;
 
 /// Prompt GEMM: W4A8 when on and the rows are prompt rows, else fp16; `pre`: x already in acts.a8; `qrot`: see quantA8.
 pub fn pgemm(d: *Dev, a: *Acts, x: *anyopaque, w: Proj, out: *anyopaque, T: u32, pre: bool, qrot: i32, int4: bool, wide: bool) !void {
-    if (!q.prefill_int8 or !wide or w.gs != 128) return gemmRows(d, a.pscr, x, a.ahi, a.alo, w, out, T, wide);
+    if (!q.prefill_int8 or !wide or w.gs != 128) return gemmRows(d, a.pscr, x, a.ahi, a.alo, w, out, T, wide, a.wscr);
     if (int4 and q.prefill_int4) {
         try d.launch(d.k.quant_a4, .{ .x = T }, .{ x, a.a8, a.sa, a.ahi, a.alo, @as(i32, @intCast(w.k)), @as(i32, @intCast(q.maxRows() + 32)), qrot });
         return d.launch(d.k.a4, a8Groups(w, T), a8Args(a, w, out, T));
@@ -432,7 +446,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     if (gemm_probe) |f| try f(d, a, m.head, a.h, T, LAYERS, 4);
     const first = if (mode.want == .rows) 0 else T - 1;
     const rows = T - first;
-    try gemm(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows);
+    try gemmRows(d, a.pscr, off(a.h, first * D * 2), off(a.ahi, first * (D / m.head.gs) * 2), off(a.alo, first * (D / m.head.gs) * 2), m.head, a.logits, rows, rows > 16, a.wscr);
     try d.launch(d.k.argmax_part, .{ .x = 256, .y = rows }, .{ a.logits, @as(i32, VOCAB), a.pv, a.pi });
     try d.launch(d.k.argmax, .{ .x = rows }, .{ a.pv, a.pi, a.tok });
     var toks: [16]i32 = undefined;

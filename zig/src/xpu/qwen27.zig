@@ -245,6 +245,8 @@ pub const Runner = struct {
         d.list = try d.g.immediate(0, 0);
         const mg = try d.g.module(&kb.glue);
         const md = try d.g.module(&kb.decode);
+        const mx = try d.g.module(&kb.exl3);
+        const mxh = try d.g.module(&kb.exl3_h); // the fp16-output forward kernels (exl3_h.cl): the decode GEMV twins and the fused-column-base dequant
         const mm = try d.g.module(&kb.gemm);
         const mgd = try d.g.module(&kb.gdn);
         const mw = try d.g.module(&kb.ngen_wide);
@@ -272,7 +274,16 @@ pub const Runner = struct {
             .attn_decode = try d.kernel(md, "attn_decode", 16),
             .attn_merge = try d.kernel(md, "attn_merge", 16),
             .kv_move = try d.kernel(md, "kv_move", 16),
-            .exl3_gemv = try d.kernel(md, "exl3_gemv", 16),
+            .exl3_gemv = try d.kernel(mx, "exl3_gemv", 16),
+            .exl3_decode2 = try d.kernel(mx, "exl3_decode2", 16),
+            .exl3_decode2_t1 = try d.kernel(mx, "exl3_decode2_t1", 16),
+            .exl3_dequant128 = try d.kernel(mx, "exl3_dequant128", 256),
+            .exl3_prompt16 = try d.kernel(mx, "exl3_prompt16", 256),
+            .exl3_decode2_h = try d.kernel(mxh, "exl3_decode2_h", 16),
+            .exl3_decode2_t1_h = try d.kernel(mxh, "exl3_decode2_t1_h", 16),
+            .exl3_dequant128_c = try d.kernel(mxh, "exl3_dequant128_c", 256),
+            .exl3_xform_h = try d.kernel(mxh, "exl3_xform_h", 16),
+            .exl3_yscale_h = try d.kernel(mxh, "exl3_yscale_h", 16),
             .rot_heads = try d.kernel(mg, "rot_heads", 16),
             .attn_prompt = try d.kernel(md, "attn_prompt", 128),
             .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
@@ -314,7 +325,10 @@ pub const Runner = struct {
         prof.on = false; // not during the load
         r.model = try load(d, &ckpt);
         prof.on = prof_on;
-        r.acts = try Acts.init(d);
+        var exl3 = r.model.head.exl3 != null;
+        for (&r.model.layers) |*l| exl3 = exl3 or l.mixer_in.exl3 != null or l.mixer_out.exl3 != null or l.gu.exl3 != null or l.down.exl3 != null;
+        r.acts = try Acts.init(d, exl3);
+        fwd.exl3ResetXscr(); // the module-global Xt staging dies with the previous runner's device context
         r.store(); // slot 0: the states the load allocated
         try d.fill(r.acts.zeros, @as(u16, 0), maxRows() * 48 * 128 * 2);
         try d.fill(r.acts.ones, @as(f32, 1.0), maxRows() * 48 * 4);
