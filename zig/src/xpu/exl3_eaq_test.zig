@@ -107,3 +107,57 @@ test "the attention layers are every fourth from the fourth" {
     for (0..r.LAYERS) |i| n += @intFromBool(r.isAttention(i));
     try std.testing.expectEqual(@as(usize, 16), n);
 }
+
+test "a repacked synthetic EXL3 directory opens and completes the 27B table" {
+    const repack = core.eaq_repack;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    var src = std.testing.tmpDir(.{});
+    defer src.cleanup();
+    var dst = std.testing.tmpDir(.{});
+    defer dst.cleanup();
+    try repack.writeSynthetic(gpa, io, src.dir, .{});
+
+    var why: eaq.Why = .{};
+    const got = try repack.repack(
+        gpa,
+        io,
+        try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{std.mem.sliceTo(&src.sub_path, 0)}),
+        try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{std.mem.sliceTo(&dst.sub_path, 0)}),
+        &why,
+    );
+    try std.testing.expectEqual(@as(usize, 1), got.mul1_values);
+
+    var pack = try r.openPack(gpa, io, try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{std.mem.sliceTo(&dst.sub_path, 0)}), &why);
+    defer pack.deinit();
+    var table = r.map(gpa, &pack, &why) catch |e| {
+        std.debug.print("map refused: {s} — why: '{s}'\n", .{ @errorName(e), why.text() });
+        return e;
+    };
+    defer table.deinit(gpa);
+    try std.testing.expect(table.complete);
+    try std.testing.expect(table.head != null and table.head.?.q != null);
+    try std.testing.expect(table.head.?.q.?.codebook == core.exl3_format.Codebook.mul1);
+    try std.testing.expect(table.embed != null and table.embed.?.dense);
+
+    // every slot of every one of the 64 layers is filled exactly once: attention layers
+    // contribute q|k|v + o + gate|up + down (7), GDN layers qkv|z|a|b + out + gate|up + down (8)
+    try std.testing.expectEqual(@as(usize, 16 * 7 + 48 * 8), table.projections.len);
+    var counts: [r.LAYERS][4]u8 = std.mem.zeroes([r.LAYERS][4]u8);
+    for (table.projections) |m| counts[m.layer][@intFromEnum(m.slot)] += 1;
+    for (0..r.LAYERS) |l| {
+        const parts: [4]u8 = if (r.isAttention(l)) .{ 3, 1, 2, 1 } else .{ 4, 1, 2, 1 };
+        for (counts[l], 0..) |n, s| try std.testing.expectEqual(parts[s], n);
+    }
+    // the GDN gate entries the pack serves dense are mapped dense, with no trellis quantities
+    var dense_a: usize = 0;
+    for (table.projections) |m| {
+        if (m.slot == .mixer_in and m.part >= 2 and !r.isAttention(m.layer)) {
+            try std.testing.expect(m.dense and m.q == null);
+            dense_a += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 96), dense_a); // a and b of every GDN layer
+}

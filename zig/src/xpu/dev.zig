@@ -1,6 +1,8 @@
 //! Low-level XPU device plumbing for the Qwen3.8-27B runner: safetensors shards, the Level Zero device, profiling.
 const std = @import("std");
 const ze = @import("ze");
+const core = @import("core");
+const exl3_eaq = @import("exl3_eaq.zig");
 const safetensors = @import("safetensors.zig");
 const q = @import("qwen27.zig");
 const fwd = @import("forward.zig");
@@ -58,7 +60,64 @@ pub const Checkpoint = struct {
         for (c.tensors.items) |t| if (std.mem.endsWith(u8, t.name, name)) return true;
         return false;
     }
+
+    /// The EAQ-aware open (hasEaq's yes): the reader's verdict first — exl3_eaq.openPack
+    /// (the config's eaq block, the manifest against the hash config.json states, the
+    /// marker, every shard's size and sha256, family qwen3_5, no fp8 entry) and
+    /// exl3_eaq.map (every entry onto the 27B layer table: the complete Table, head and
+    /// embedding included, fused parts agreed on K and codebook) — and only then the
+    /// pack's shards, which are plain safetensors, through the very addShard the stock
+    /// index feeds: the tensors view is the stock one, so every downstream lookup and the
+    /// load.zig dispatch (isExl3 → loadExl3) see the pack as a set of admitted shards.
+    /// The manifest and marker gate the door; they form no second load path. Any refusal
+    /// names itself on the Why and opens nothing.
+    pub fn openEaq(c: *Checkpoint, dir: []const u8) !void {
+        var why: core.eaq_container.Why = .{};
+        const io = std.Io.Threaded.global_single_threaded.io(); // pack verification is sync reads only
+        var pack = exl3_eaq.openPack(alloc, io, dir, &why) catch |err| {
+            std.debug.print("EAQ: {s} refused: {s} ('{s}')\n", .{ dir, @errorName(err), why.text() });
+            return err;
+        };
+        defer pack.deinit(); // the Table borrows its arena: freed after the shard maps below
+        why = .{};
+        var table = exl3_eaq.map(alloc, &pack, &why) catch |err| {
+            std.debug.print("EAQ: {s} maps to no Table: {s} ('{s}')\n", .{ dir, @errorName(err), why.text() });
+            return err;
+        };
+        defer table.deinit(alloc);
+        if (!table.complete) {
+            std.debug.print("EAQ: {s}: the Table is incomplete: a layer slot, the head or the embedding has no entry\n", .{dir});
+            return error.EaqIncomplete;
+        }
+        var n_trellis: usize = 0;
+        for (pack.entries) |e| n_trellis += @intFromBool(e.format == .trellis);
+        const hex = std.fmt.bytesToHex(pack.manifest_sha256, .lower);
+        std.debug.print("  eaq: pack verified — family {s}, layout {s}, {s}, manifest {s}\n", .{ pack.family, core.eaq_container.layout, pack.version, &hex });
+        std.debug.print("       {d} shards hashed, {d} entries ({d} trellis, {d} dense), Table: {d} projections, {d} others, head and embedding present\n", .{
+            pack.shards.len, pack.entries.len, n_trellis, pack.entries.len - n_trellis, table.projections.len, table.others.len });
+        // the same view the stock index path builds: every manifest shard, mmap for the
+        // tensors' bytes, header parsed into c.headers; names keep the HF wrapper, which
+        // Checkpoint.get and the loader's canonExl3 already strip
+        for (pack.shards) |s| {
+            const path = try std.fmt.allocPrintSentinel(alloc, "{s}", .{s.path}, 0);
+            errdefer alloc.free(path);
+            try c.addShard(path);
+            alloc.free(path);
+        }
+    }
 };
+
+/// The dispatch's probe (qwen27.zig Runner.init): does the model dir hold the EAQ
+/// manifest (core/eaq_container.zig manifest_name)? A stock pack answers no and takes the
+/// index path untouched.
+pub fn hasEaq(dir: []const u8) bool {
+    const path = std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ dir, core.eaq_container.manifest_name }, 0) catch return false;
+    defer alloc.free(path);
+    const fd = open(path.ptr, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
 
 // ---------------------------------------------------------------- device
 

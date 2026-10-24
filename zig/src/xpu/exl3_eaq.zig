@@ -363,16 +363,18 @@ pub fn map(gpa: std.mem.Allocator, pack: *const eaq.Pack, why: ?*eaq.Why) (Error
     errdefer gpa.free(table.projections);
     table.others = try others.toOwnedSlice(gpa);
     errdefer gpa.free(table.others);
-    // fused parts of one slot must agree on K (same input width) and on the trellis
-    // style (halves, codebook): they were one projection before packing
+    // fused parts of one slot must agree on K (same input width) and on the codebook
+    // (every part must be mul1 — enforced at the dictionary check); halves may differ
+    // per part: the stock 2.0bpw quantizer mixes precision inside a fused group
+    // (layer 3's q at bits 2, k/v at bits 3), and each Mapped carries its own Quant.
     for (table.projections, 0..) |p, i| {
         if (i > 0 and p.layer == table.projections[i - 1].layer and p.slot == table.projections[i - 1].slot and p.part > 0) {
             const prev = table.projections[i - 1];
             if (prev.q != null and p.q != null) {
                 const a = prev.q.?;
                 const b = p.q.?;
-                if (a.k != b.k or a.halves != b.halves or a.codebook != b.codebook) {
-                    fail(why, "layer {d} {s}: part {d} disagrees with part {d} on K, halves or codebook", .{ p.layer, @tagName(p.slot), p.part, prev.part });
+                if (a.k != b.k or a.codebook != b.codebook) {
+                    fail(why, "layer {d} {s}: part {d} disagrees with part {d} on K or codebook", .{ p.layer, @tagName(p.slot), p.part, prev.part });
                     return error.MismatchedFusedK;
                 }
             }

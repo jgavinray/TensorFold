@@ -174,7 +174,8 @@ pub const Runner = struct {
     taps_on: bool = false,
     on_taps: ?struct { ctx: *anyopaque, f: *const fn (*anyopaque, *anyopaque, u32) anyerror!void } = null,
 
-    /// Loads `dir` (MLX affine 4/64 or GPTQ 4/128) onto the first Arc Pro B70 (PCI id 0xe223), room for `context` rows.
+    /// Loads `dir` (MLX affine 4/64, GPTQ 4/128, or an EAQ pack — dev.Checkpoint.openEaq) onto the
+    /// first Arc Pro B70 (PCI id 0xe223), room for `context` rows.
     pub fn init(dir: []const u8, context: u32) !*Runner {
         if (live) return error.RunnerOpen;
         // the process's own options first, then this open's environment: an earlier open's XPU_* settings stay out
@@ -205,7 +206,11 @@ pub const Runner = struct {
         if (prefill_int4 and (rot_on == 0 or !prefill_int8)) return error.Int4NeedsRotatedWeightsAndInt8;
         var ckpt: Checkpoint = .{};
         errdefer ckpt.deinit();
-        {
+        if (dev.hasEaq(dir)) { // an EAQ pack (core/eaq_container.zig): the reader's verdict — openPack + map —
+            // and then the pack's own shards through the very index path's addShard, so the
+            // tensor view and the load.zig dispatch below see the stock pack's tensors
+            try ckpt.openEaq(dir);
+        } else {
             const index_path = try std.fmt.allocPrintSentinel(alloc, "{s}/model.safetensors.index.json", .{dir}, 0);
             defer alloc.free(index_path);
             const fd = open(index_path.ptr, 0);

@@ -13,3 +13,20 @@ pub fn tests(b: *std.Build, all: *std.Build.Step) void {
     host.setCwd(b.path("."));
     step.dependOn(&host.step);
 }
+
+/// The repacker CLI: `zig build eaq-repack` installs `zig-out/bin/tf-eaq-repack`.
+pub fn repack(b: *std.Build) void {
+    const target = b.graph.host;
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "tokenizer", .module = tokenizer }} });
+    const reader = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/exl3_eaq.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "core", .module = core }} });
+    const exe = b.addExecutable(.{ .name = "tf-eaq-repack", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/eaq_repack_cli.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "exl3_eaq", .module = reader } },
+    }) });
+    b.step("eaq-repack", "Build tf-eaq-repack: rewrite a stock EXL3 directory into an EAQ pack")
+        .dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
