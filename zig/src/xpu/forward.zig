@@ -15,6 +15,7 @@ const LAYERS = q.LAYERS;
 const MASK_WORDS = q.MASK_WORDS;
 const Model = loader.Model;
 const Proj = loader.Proj;
+const Layer = loader.Layer;
 const SPLIT = q.SPLIT;
 const limits = @import("limits.zig");
 const ST_B = q.ST_B;
@@ -182,6 +183,13 @@ pub fn gemm(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *any
 
 /// `gemm` with the path chosen by the caller: `wide`, the nGEN prompt GEMMs whatever the rows (a prompt's chunk).
 pub fn gemmRows(d: *Dev, pscr: *anyopaque, h: *anyopaque, ahi: *anyopaque, alo: *anyopaque, w: Proj, out: *anyopaque, m: u32, wide: bool, wscr: ?*anyopaque) !void {
+    if (w.dense16) |slab| { // the calibration slab (spec 1.4): exl3_prompt16 straight over the fp16
+        // [K, n] slab, forward_exl3's wide branch without the per-part dequant; the entry runs wide
+        if (!wide) return error.CalibNarrow; // H8: calib.layerForward never decodes
+        try d.launch(d.k.exl3_prompt16, .{ .x = @intCast((m + 127) / 128), .y = @intCast(w.n / 128) }, .{ h, slab, out, @as(i32, @intCast(m)), @as(i32, @intCast(w.n)), @as(i32, @intCast(w.k)) });
+        if (gemm_hook) |f| try f(d, h, w, out, m);
+        return;
+    }
     if (w.exl3) |hx| { return exl3fwd.gemmRows(d, hx, wscr, h, ahi, alo, w, out, m, wide); } // null wscr is fine narrow: the GEMVs stage their own Xt (forward_exl3.xscratch)
     const M: i32 = @intCast(m);
     const N: i32 = @intCast(w.n);
@@ -307,11 +315,57 @@ pub var gdn_probe: ?*const fn (*Dev, *Acts, *anyopaque, u32, usize) anyerror!voi
 /// prompt: a prompt chunk, prompt kernels at any rows; tree: rows see their ancestors; multi: one row a slot.
 pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, multi: ?struct { mt: *anyopaque, pos: *anyopaque, max_pos: u32 } = null };
 
-/// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; ≤ 16 non-prompt rows: GDN serial.
-pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
-    const want = mode.want != .none;
-    if (ids.len > q.maxRows()) return error.TooManyRows; // the scratch holds maxRows, padded to 64
-    const T: u32 = @intCast(ids.len);
+/// What one layer's kernels run over: the rows, the first row's position, the `Mode` flags they
+/// read (prompt / want / stash / taps / tree / multi), and the calibration capture to fill (null: none).
+/// `first`: the rows arrive as a fully summed stream (calib.layerForward, spec 1.4's H6): the
+/// body's first norm skips the residual add, because the caller's stream carries no pending `r`.
+pub const Batch = struct { T: u32, p0: u32, mode: Mode = .{}, capture: ?*Capture = null, first: bool = false };
+
+/// A capture pass (eaq-ldlq-spec-fable.md 1.4): one fp32 device Hessian per site (`gemm_probe`'s
+/// five sites: 0 mixer in [K = D], 1 mixer out [K = 6144], 2 gate|up [K = D], 3 down [K = FF],
+/// 4 the head [K = D]) over the lower 128x128 tiles, the real rows accumulated per site, and the
+/// two staging buffers the syrk reads. A null `h[site]` captures nothing at that site. The staging
+/// is shared across the sites — the in-order command list serializes a batch's sites, and rows
+/// T..Tp of both are the staging's own zeros, never the acts' stale rows (§2.2, H4). Owned by the
+/// calibration driver (`calib.initCapture`); its Hessian pass reads back `h` (host finalize and
+/// damping are spec 2.4, not this file).
+pub const Capture = struct {
+    h: [5]?*anyopaque = @splat(null), // fp32 [K_s, K_s] device Hessians, lower 128x128 tiles only
+    rows: [5]u64 = @splat(0), // real rows accumulated per site (pad rows excluded)
+    xpad: *anyopaque, // fp16 [Tp_max, FF]: the site's staged rows, compact [Tp, K] at pitch K
+    xt: *anyopaque, // fp16 [FF, Tp_max]: X^T staging, compact [K, Tp] at pitch Tp
+    tp_max: u32, // rows xpad and xt are sized for (a multiple of 64)
+};
+
+/// Queue one site's Hessian term on the in-order list (spec 1.1: the hook fires after the site's
+/// GEMM was queued and while the input buffer is still intact — queue order is the buffer's
+/// safety): copy the T real rows of the site's fp16 input into xpad, zero-fill T..Tp (stale rows
+/// and 0 x Inf would poison H — the syrk must never read them: H4, T-HESS-4), transpose into xt,
+/// and accumulate H += xt . xpad with exl3_syrk32 over the lower tiles (K is a site constant, all
+/// a multiple of 128; Tp = roundup(T, 64); the real T, never the GDN pad tp — H4).
+pub fn capture(d: *Dev, cp: ?*Capture, comptime site: usize, comptime K: usize, src: *anyopaque, T: u32) !void {
+    const c = cp orelse return;
+    const hp = c.h[site] orelse return;
+    if (T == 0 or T > c.tp_max or c.tp_max % 64 != 0) return error.CalibCaptureRows;
+    const Tp = (T + 63) / 64 * 64;
+    try copy(d, c.xpad, src, @as(usize, T) * K * 2);
+    if (Tp > T) try d.fill(off(c.xpad, @as(usize, T) * K * 2), @as(u16, 0), @as(usize, Tp - T) * K * 2);
+    try d.launch(d.k.transpose16, .{ .x = @intCast(K / 16), .y = @intCast(Tp / 16) }, .{ c.xpad, c.xt, @as(i32, @intCast(T)), @as(i32, @intCast(Tp)), @as(i32, @intCast(K)) });
+    try d.launch(d.k.exl3_syrk32, .{ .x = @intCast(K / 128), .y = @intCast(K / 128) }, .{ c.xt, c.xpad, hp, @as(i32, @intCast(K)), @as(i32, @intCast(Tp)), @as(i32, 1) });
+    c.rows[site] += T;
+}
+
+/// One layer's kernels over a batch: the body of `forward`'s layer loop, verbatim, so the
+/// serving paths and the calibration driver (calib.layerForward) share the GDN state handling —
+/// the conv ping-pong flip, the neutral padding rows, the wide chunking, `rec`'s accumulation —
+/// in one place. `forward` calls it per layer; the calibration driver calls it wide over rows
+/// of a device residual stream with `Batch.first` set, so the first norm skips the residual
+/// add (the stream already carries it — the H6 pairing) and the syrk hooks fire at the
+/// capture sites.
+pub fn layerBody(d: *Dev, m: *Model, a: *Acts, l: *Layer, i: usize, b: Batch) !void {
+    const T = b.T;
+    const p0 = b.p0;
+    const mode = b.mode;
     const wide = T > 16 or mode.prompt; // the prompt kernels: a prompt chunk cuts the same bits at any length
     const t32: i32 = @intCast(T);
     const tp = (T + 63) / 64 * 64; // GDN chunk rows (padded)
@@ -329,106 +383,117 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
     const q8os: ?*anyopaque = if (q8out) a.sa else null;
     const table = if (mode.tree) a.tree else a.chain;
     const mpos: ?*anyopaque = if (mode.multi) |mm| mm.pos else null;
+    const probe = p0 == 0 and i == 0;
+    try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (b.first or i == 0) @as(i32, 0) else @as(i32, 1)), gs, q8a, q8s, q8ms, q.rot_on });
+    if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
+    // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
+    const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
+    if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
+    try a8(d, a, min_in, D, T, 1);
+    try capture(d, b.capture, 0, D, min_in, T);
+    try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
+    if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
+    if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
+    if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
+    if (l.attn) {
+        const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
+        const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+        const ns = (ctx + SPLIT - 1) / SPLIT;
+        try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree, mt, mpos, q.kv8, kvCap() });
+        if (wide and q.kv_i8) {
+            try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), kvCap() });
+        } else if (wide) {
+            try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0) });
+        } else {
+            try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
+            try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
+        }
+        if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
+        try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
+    } else {
+        const cin = l.conv[l.conv_cur].?;
+        const cout = l.conv[1 - l.conv_cur].?;
+        const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
+        if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
+        if (wide)
+            try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = 5 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
+        else
+            try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
+        if (wide and tp > T) { // neutral padding rows: the state does not move
+            const pad = tp - T;
+            const cp = struct {
+                fn f(dd: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+                    try ze.check(dd.g.api.zeCommandListAppendMemoryCopy(dd.list, dst, src, n, null, 0, null));
+                }
+            }.f;
+            try cp(d, off(a.k, T * 16 * 128 * 2), a.zeros, pad * 16 * 128 * 2);
+            try cp(d, off(a.v, T * 48 * 128 * 2), a.zeros, pad * 48 * 128 * 2);
+            try cp(d, off(a.beta, T * 48 * 4), a.zeros, pad * 48 * 4);
+            try cp(d, off(a.g, T * 48 * 4), a.ones, pad * 48 * 4);
+        }
+        if (!wide) {
+            if (mode.stash) { // inputs, for Runner.commit's replay
+                const st = l.stash.?;
+                try copy(d, off(st, ST_Q), a.q, T * 16 * 128 * 2);
+                try copy(d, off(st, ST_K), a.k, T * 16 * 128 * 2);
+                try copy(d, off(st, ST_V), a.v, T * 48 * 128 * 2);
+                try copy(d, off(st, ST_G), a.g, T * 48 * 4);
+                try copy(d, off(st, ST_B), a.beta, T * 48 * 4);
+                try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
+            }
+            // verification: post-block state to rec_save, rec keeps the entry; tree: states to acts.sl
+            try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48, .z = if (mode.multi != null) T else 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
+        } else {
+            const nc: i32 = @intCast(tp / 64);
+            const ncu: u32 = tp / 64;
+            const hk: i32 = 16;
+            const hv: i32 = 48;
+            try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = 48 }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
+            try d.launch(d.k.gdn_state, .{ .x = 48 }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
+            try d.launch(d.k.gdn_out, .{ .x = ncu, .y = 48 }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
+            if (gdn_probe) |f| if (p0 == 0) try f(d, a, l.rec.?, T, i);
+        }
+        if (probe) {
+            try dumpBuf(d, "q0", a.q, T * 2048, .bf16);
+            try dumpBuf(d, "k0", a.k, T * 2048, .bf16);
+            try dumpBuf(d, "v0", a.v, T * 6144, .bf16);
+            try dumpBuf(d, "g0", a.g, T * 48, .f32);
+            try dumpBuf(d, "beta0", a.beta, T * 48, .f32);
+            try dumpBuf(d, "y0", a.y, T * 6144, .bf16);
+        }
+        try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
+        if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
+    }
+    try a8(d, a, a.h, 6144, T, 2);
+    try capture(d, b.capture, 1, 6144, a.h, T);
+    try pgemm(d, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
+    if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
+    if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
+    try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+    try a8(d, a, a.h, D, T, 4);
+    if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
+    try capture(d, b.capture, 2, D, a.h, T);
+    const act = try mlpIn(d, a, l.gu, T, gs, q8on, wide);
+    try a8(d, a, act, 17408, T, 8);
+    try capture(d, b.capture, 3, FF, act, T);
+    try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
+    if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
+    if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
+    if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
+        try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
+}
+
+/// One forward over `ids` (< q.maxRows() rows) at p0..; the last row's greedy token; ≤ 16 non-prompt rows: GDN serial.
+pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mode) !?i32 {
+    const want = mode.want != .none;
+    if (ids.len > q.maxRows()) return error.TooManyRows; // the scratch holds maxRows, padded to 64
+    const T: u32 = @intCast(ids.len);
+    const wide = T > 16 or mode.prompt; // the prompt kernels: a prompt chunk cuts the same bits at any length
     try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.ids, ids.ptr, ids.len * 4, null, 0, null));
     errdefer d.settle(); // the queued copy reads the caller's ids: an error returns only once the queue is idle
     try embedRows(d, m, a.ids, a.x, T);
     if (p0 == 0) try dump(d, a, T, "embed", false);
-    for (&m.layers, 0..) |*l, i| {
-        try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.in_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, if (i == 0) 0 else 1), gs, q8a, q8s, q8ms, q.rot_on });
-        const probe = p0 == 0 and i == 0;
-        if (probe) try dumpBuf(d, "h0", a.h, T * D, .f16);
-        // W4A8 study: the GEMM reads a quantized copy (in r, free until mixer_out); the dense a/b gates read h as is
-        const min_in = if (q.a8_group != 0 and wide and q.a8_sites & 1 != 0) a.r else a.h;
-        if (min_in != a.h) try copy(d, a.r, a.h, T * D * 2);
-        try a8(d, a, min_in, D, T, 1);
-        try pgemm(d, a, min_in, l.mixer_in, a.p, T, q8on, 0, false, wide);
-        if (gemm_probe) |f| try f(d, a, l.mixer_in, min_in, T, i, 0);
-        if (l.ab) |ab| try d.launch(d.k.dense_rows, .{ .x = (T + 15) / 16, .y = 96 / 16 }, .{ a.h, ab, a.p, t32, @as(i32, GDN_IN), @as(i32, 16384) });
-        if (probe) try dumpBuf(d, "p0", a.p, T * GDN_IN, .f16);
-        if (l.attn) {
-            const ctx = if (mode.multi) |mm| mm.max_pos + 1 else p0 + T; // tree rows see fewer slices
-            const mt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
-            const ns = (ctx + SPLIT - 1) / SPLIT;
-            try d.launch(d.k.attn_prep, .{ .x = T }, .{ a.p, l.qn.?, l.kn.?, m.invf, a.q, l.kc.?, l.vc.?, @as(i32, @intCast(p0)), EPS, tree, mt, mpos, q.kv8, kvCap() });
-            if (wide and q.kv_i8) {
-                try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), kvCap() });
-            } else if (wide) {
-                try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0) });
-            } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
-                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
-            }
-            if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
-            try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
-        } else {
-            const cin = l.conv[l.conv_cur].?;
-            const cout = l.conv[1 - l.conv_cur].?;
-            const gmt: ?*anyopaque = if (mode.multi) |mm| off(mm.mt, i * 16 * 8 * 8) else null;
-            if (mode.multi == null) l.conv_cur = 1 - l.conv_cur; // multi: each slot's flips after the forward
-            if (wide)
-                try d.launch(d.k.gdn_pre_rows, .{ .x = (T + 7) / 8, .y = 5 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32 })
-            else
-                try d.launch(d.k.gdn_pre, .{ .x = T, .y = 40 }, .{ a.p, cin, cout, l.conv_w.?, l.alog.?, l.dt.?, a.q, a.k, a.v, a.g, a.beta, t32, tree, gmt });
-            if (wide and tp > T) { // neutral padding rows: the state does not move
-                const pad = tp - T;
-                const cp = struct {
-                    fn f(dd: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
-                        try ze.check(dd.g.api.zeCommandListAppendMemoryCopy(dd.list, dst, src, n, null, 0, null));
-                    }
-                }.f;
-                try cp(d, off(a.k, T * 16 * 128 * 2), a.zeros, pad * 16 * 128 * 2);
-                try cp(d, off(a.v, T * 48 * 128 * 2), a.zeros, pad * 48 * 128 * 2);
-                try cp(d, off(a.beta, T * 48 * 4), a.zeros, pad * 48 * 4);
-                try cp(d, off(a.g, T * 48 * 4), a.ones, pad * 48 * 4);
-            }
-            if (!wide) {
-                if (mode.stash) { // inputs, for Runner.commit's replay
-                    const st = l.stash.?;
-                    try copy(d, off(st, ST_Q), a.q, T * 16 * 128 * 2);
-                    try copy(d, off(st, ST_K), a.k, T * 16 * 128 * 2);
-                    try copy(d, off(st, ST_V), a.v, T * 48 * 128 * 2);
-                    try copy(d, off(st, ST_G), a.g, T * 48 * 4);
-                    try copy(d, off(st, ST_B), a.beta, T * 48 * 4);
-                    try copy(d, off(st, ST_P), a.p, T * GDN_IN * 2);
-                }
-                // verification: post-block state to rec_save, rec keeps the entry; tree: states to acts.sl
-                try d.launch(d.k.gdn_step, .{ .x = 16, .y = 48, .z = if (mode.multi != null) T else 1 }, .{ a.q, a.k, a.v, a.g, a.beta, l.rec.?, if (mode.stash) l.rec_save.? else l.rec.?, a.y, t32, nul, tree, a.sl, gmt });
-            } else {
-                const nc: i32 = @intCast(tp / 64);
-                const ncu: u32 = tp / 64;
-                const hk: i32 = 16;
-                const hv: i32 = 48;
-                try d.launch(d.k.gdn_prep, .{ .x = ncu, .y = 48 }, .{ a.k, a.v, a.g, a.beta, a.la, a.wb, a.u0, hk, hv, nc, @as(i32, 0) });
-                try d.launch(d.k.gdn_state, .{ .x = 48 }, .{ a.k, a.wb, a.u0, a.la, l.rec.?, l.rec.?, a.hs, a.vn, hk, hv, nc });
-                try d.launch(d.k.gdn_out, .{ .x = ncu, .y = 48 }, .{ a.q, a.k, a.la, a.hs, a.vn, a.y, hk, hv, nc });
-                if (gdn_probe) |f| if (p0 == 0) try f(d, a, l.rec.?, T, i);
-            }
-            if (probe) {
-                try dumpBuf(d, "q0", a.q, T * 2048, .bf16);
-                try dumpBuf(d, "k0", a.k, T * 2048, .bf16);
-                try dumpBuf(d, "v0", a.v, T * 6144, .bf16);
-                try dumpBuf(d, "g0", a.g, T * 48, .f32);
-                try dumpBuf(d, "beta0", a.beta, T * 48, .f32);
-                try dumpBuf(d, "y0", a.y, T * 6144, .bf16);
-            }
-            try d.launch(d.k.gated_norm, .{ .x = T }, .{ a.y, a.p, l.gnorm.?, a.h, a.ahi, a.alo, EPS, gs, q.rot_on, q8oa, q8os, q8ms });
-            if (probe) try dumpBuf(d, "o0", a.h, T * 6144, .f16);
-        }
-        try a8(d, a, a.h, 6144, T, 2);
-        try pgemm(d, a, a.h, l.mixer_out, a.r, T, q8out, 0, q.int4_sites & 2 != 0, wide);
-        if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
-        if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
-        try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
-        try a8(d, a, a.h, D, T, 4);
-        if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
-        const act = try mlpIn(d, a, l.gu, T, gs, q8on, wide);
-        try a8(d, a, act, 17408, T, 8);
-        try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
-        if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
-        if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
-        if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
-            try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
-    }
+    for (&m.layers, 0..) |*l, i| try layerBody(d, m, a, l, i, .{ .T = T, .p0 = p0, .mode = mode });
     if (!want and q.dump_h == null) { // x is per token: nothing carries to the next chunk
         try d.sync();
         return null;

@@ -9,6 +9,8 @@ pub const Api = struct {
     zeDriverGet: *const fn (*u32, ?[*]H) callconv(.c) u32,
     zeDeviceGet: *const fn (H, *u32, ?[*]H) callconv(.c) u32,
     zeDeviceGetProperties: *const fn (H, *DeviceProperties) callconv(.c) u32,
+    zeDeviceGetComputeProperties: *const fn (H, *ComputeProperties) callconv(.c) u32,
+    zeDeviceGetCacheProperties: *const fn (H, *u32, ?[*]CacheProperties) callconv(.c) u32,
     zeContextCreate: *const fn (H, *const ContextDesc, *H) callconv(.c) u32,
     zeCommandQueueCreate: *const fn (H, H, *const QueueDesc, *H) callconv(.c) u32,
     zeCommandQueueExecuteCommandLists: *const fn (H, u32, [*]H, H) callconv(.c) u32,
@@ -20,6 +22,7 @@ pub const Api = struct {
     zeCommandListHostSynchronize: *const fn (H, u64) callconv(.c) u32,
     zeCommandListAppendLaunchKernel: *const fn (H, H, *const GroupCount, H, u32, ?[*]H) callconv(.c) u32,
     zeCommandListAppendMemoryCopy: *const fn (H, ?*anyopaque, ?*const anyopaque, usize, H, u32, ?[*]H) callconv(.c) u32,
+    zeCommandListAppendMemoryFill: *const fn (H, ?*anyopaque, ?*const anyopaque, usize, usize, H, u32, ?[*]H) callconv(.c) u32,
     zeCommandListAppendBarrier: *const fn (H, H, u32, ?[*]H) callconv(.c) u32,
     zeMemAllocDevice: *const fn (H, *const DeviceAllocDesc, usize, usize, H, *?*anyopaque) callconv(.c) u32,
     zeMemAllocHost: *const fn (H, *const HostAllocDesc, usize, usize, *?*anyopaque) callconv(.c) u32,
@@ -156,6 +159,28 @@ pub const pool_host_visible: u32 = 1 << 0;
 pub const pool_kernel_timestamp: u32 = 1 << 2;
 pub const EventDesc = extern struct { stype: u32 = 0x11, pNext: ?*const anyopaque = null, index: u32, signal: u32 = 1 << 2, wait: u32 = 1 << 2 };
 pub const KernelTimestampResult = extern struct { global_start: u64 = 0, global_end: u64 = 0, context_start: u64 = 0, context_end: u64 = 0 };
+
+/// ze_device_compute_properties_t (ze_api.h): the layout and stype of the official header.
+pub const ComputeProperties = extern struct {
+    stype: u32 = 0x4, // ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES
+    pNext: ?*anyopaque = null,
+    maxTotalGroupSize: u32 = 0,
+    maxGroupSizeX: u32 = 0,
+    maxGroupSizeY: u32 = 0,
+    maxGroupSizeZ: u32 = 0,
+    maxGroupCountX: u32 = 0,
+    maxGroupCountY: u32 = 0,
+    maxGroupCountZ: u32 = 0,
+    maxSharedLocalMemory: u32 = 0,
+    numSubGroupSizes: u32 = 0,
+    subGroupSizes: [8]u32 = @splat(0), // ZE_SUBGROUPSIZE_COUNT
+};
+pub const CacheProperties = extern struct {
+    stype: u32 = 0x9, // ZE_STRUCTURE_TYPE_DEVICE_CACHE_PROPERTIES
+    pNext: ?*anyopaque = null,
+    flags: u32 = 0,
+    cacheSize: usize = 0,
+};
 
 pub fn check(r: u32) Error!void {
     if (r != 0) {
@@ -324,6 +349,17 @@ pub const Gpu = struct {
     pub fn immediateUnordered(g: *Gpu, ordinal: u32) Error!H {
         var l: H = null;
         try check(g.api.zeCommandListCreateImmediate(g.context, g.device, &.{ .ordinal = ordinal, .flags = 0, .mode = 2, .priority = 0 }, &l));
+        return keep(&g.owned.lists, l, g.api.zeCommandListDestroy);
+    }
+
+    /// Async-mode immediate list (ZE_IMMEDIATE_COMMAND_LIST_SYNCHRONIZATION_MODE_ASYNC =
+    /// 0): appends dispatch to the device without the mode-2 per-append host block — the
+    /// quantize loop's batching (the synchronous list pays a submission round trip on
+    /// every launch). In-order like `immediate`; zeCommandListHostSynchronize still
+    /// drains everything dispatched on it.
+    pub fn immediateAsync(g: *Gpu, ordinal: u32, priority: u32) Error!H {
+        var l: H = null;
+        try check(g.api.zeCommandListCreateImmediate(g.context, g.device, &.{ .ordinal = ordinal, .flags = queue_in_order, .mode = 0, .priority = priority }, &l));
         return keep(&g.owned.lists, l, g.api.zeCommandListDestroy);
     }
 

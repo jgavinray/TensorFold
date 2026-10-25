@@ -19,6 +19,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "decode", "zig/kernels/xpu/qwen27/decode.cl", "" },
         .{ "exl3", "zig/kernels/xpu/qwen27/exl3.cl", "" },
         .{ "exl3_h", "zig/kernels/xpu/qwen27/exl3_h.cl", "" },
+        .{ "exl3_enc", "zig/kernels/xpu/qwen27/exl3_enc.cl", "" },
+        .{ "calib", "zig/kernels/xpu/qwen27/calib.cl", "" },
+        .{ "ldlq", "zig/kernels/xpu/qwen27/ldlq.cl", "" },
         .{ "gemm", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=64" },
         .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
@@ -26,13 +29,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
-        // the EXL3 GEMVs are small-register latency kernels: 256 GRF halves their occupancy
-        const exl3_family = std.mem.endsWith(u8, k[1], "exl3.cl") or std.mem.endsWith(u8, k[1], "exl3_h.cl");
+        // the EXL3 kernels stream memory: the 256-GRF flag would only halve their occupancy
+        const exl3_family = std.mem.endsWith(u8, k[1], "exl3.cl") or std.mem.endsWith(u8, k[1], "exl3_h.cl") or std.mem.endsWith(u8, k[1], "exl3_enc.cl") or std.mem.endsWith(u8, k[1], "calib.cl") or std.mem.endsWith(u8, k[1], "ldlq.cl");
         const base_opts = if (exl3_family) opts[0 .. opts.len - " -cl-intel-256-GRF-per-thread".len] else opts; // drop only the GRF flag, keep anything else opts gains
         const inc = if (exl3_family) "" else " -I zig/kernels/xpu/qwen27";
         c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}{s}", .{ base_opts, k[2], inc }), "-output_no_suffix", "-output", k[0], "-out_dir" });
         c.setCwd(b.path("."));
-        if (!exl3_family) { // exl3.cl and exl3_h.cl include nothing; skip the extra rebuild triggers
+        if (!exl3_family) { // the exl3 files include nothing; skip the extra rebuild triggers
             for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
         }
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));
@@ -66,6 +69,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const decode align(8) = @embedFile("decode.bin").*;
         \\pub const exl3 align(8) = @embedFile("exl3.bin").*;
         \\pub const exl3_h align(8) = @embedFile("exl3_h.bin").*;
+        \\pub const exl3_enc align(8) = @embedFile("exl3_enc.bin").*;
+        \\pub const calib align(8) = @embedFile("calib.bin").*;
+        \\pub const ldlq align(8) = @embedFile("ldlq.bin").*;
         \\pub const gemm align(8) = @embedFile("gemm.bin").*;
         \\pub const gemm128 align(8) = @embedFile("gemm128.bin").*;
         \\pub const gdn align(8) = @embedFile("gdn.bin").*;
@@ -99,11 +105,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const install = b.addInstallArtifact(exe, .{});
     b.step("xpu-qwen27", "Build the Qwen3.8-27B XPU forward runner (needs ocloc, a C++17 compiler and nGEN headers)").dependOn(&install.step);
     // device tests: a skip message and exit 0 without a Level Zero device or a model (`xpu-tests` is Nemotron's, -Dxpu)
-    const tests_step = b.step("xpu-qwen27-tests", "Build the 27B XPU device tests (tf-xpu-qwen27-means-test, -seam-test, -close-test)");
+    const tests_step = b.step("xpu-qwen27-tests", "Build the 27B XPU device tests (tf-xpu-qwen27-means-test, -seam-test, -close-test, -ldlq-test, -halfstep-test)");
     for ([_][2][]const u8{
         .{ "tf-xpu-qwen27-means-test", "zig/src/xpu/means_test.zig" },
         .{ "tf-xpu-qwen27-seam-test", "zig/src/xpu/seam_test.zig" },
         .{ "tf-xpu-qwen27-close-test", "zig/src/xpu/close_test.zig" },
+        .{ "tf-xpu-qwen27-ldlq-test", "zig/src/xpu/ldlq_test.zig" },
+        .{ "tf-xpu-qwen27-halfstep-test", "zig/src/xpu/halfstep_test.zig" }, // T-HS-4..7 + the T-HS-6 golden (eaq-halfstep-spec-fable.md section 4)
     }) |t| {
         const m = b.createModule(.{ .root_source_file = b.path(t[1]), .target = target, .optimize = optimize, .link_libc = true });
         m.addImport("xpu_qwen27_kernels", embedded);

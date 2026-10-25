@@ -23,8 +23,7 @@ pub const Part = struct {
     bias: ?*anyopaque = null, // PR 4 never fills it: any bias part refuses the pack
     n0: u32, // first column of this part inside the fused Proj.n
     n: u32, // the part's real N (before padding)
-    halves: u8, // 2 * bits, whole (4..16); the reader-side twin is exl3_eaq.zig:36-44
-    bits: u8, // halves / 2, in 1..8 (the kernel's int `bits` argument; the kernels are ring-safe at nw = 8)
+    halves: u8, // the oracle's Width.halves, 2..16, whole or odd (mul1's half steps); the reader-side twin is exl3_eaq.zig:36-44
     codebook: core.exl3_format.Codebook, // admitted only as .mul1
     dense: bool = false, // eaq.dense/0 part served via the int4/fp16 route instead (PR 4: only lm_head)
 };
@@ -46,7 +45,6 @@ pub const Style = enum { f16, f16_16, words };
 pub const Group = struct {
     prefix: []const u8,
     halves: u8,
-    bits: u8,
     k: u32,
     n: u32,
     codebook: core.exl3_format.Codebook,
@@ -67,17 +65,18 @@ fn partName(prefix: []const u8, part: []const u8, suffix: []const u8) ![]const u
 
 /// Admits one trellis group by prefix: the `admit` checks one-to-one
 /// (core/exl3_load.zig:134-158; EAQ twin exl3_eaq.zig:160-276) plus the PR 4 refusals —
-/// whole widths (the kernels take an int bits 2..8; an odd halves would decode to a
-/// truncated, wrong answer, exl3.cl:64), the mul1 codebook (its tables are baked into every
-/// kernel, exl3.cl:14,33,84,147), and no bias part (no kernel argument consumes one).
+/// the mul1 codebook (its tables are baked into every kernel, exl3.cl:14,33,84,147) and
+/// no bias part (no kernel argument consumes one). Widths are shape-derived, halves 2..16,
+/// odd included: the step-5 device kernels take the same `halves` the kernels' arg trap
+/// bounds (exl3_h.cl), so the loader adds no width refusal of its own.
 pub fn admitGroup(c: *const Checkpoint, prefix: []const u8) !Group {
-    var g: Group = .{ .prefix = prefix, .halves = 0, .bits = 0, .k = 0, .n = 0, .codebook = .inst3, .style = .f16 };
+    var g: Group = .{ .prefix = prefix, .halves = 0, .k = 0, .n = 0, .codebook = .inst3, .style = .f16 };
     const tr = try c.get(try partName(prefix, "", ".trellis"));
     if (!std.mem.eql(u8, tr.dtype, "I16") or tr.rank != 3) {
         refuse("group {s}: trellis is {s} rank {d}, not I16 rank 3", .{ prefix, tr.dtype, tr.rank });
         return error.BadTrellisPart;
     }
-    const words16 = tr.shape[2]; // the trellis's last dim is 16 * bits
+    const words16 = tr.shape[2]; // the trellis's last dim is 8 * halves
     if (words16 % 8 != 0 or words16 / 8 < 2 or words16 / 8 > 16) { // core/exl3_load.zig:136-137
         refuse("group {s}: trellis last dim {d} is not 8 times a halves count in 2..16", .{ prefix, words16 });
         return error.BadTrellisPart;
@@ -106,15 +105,10 @@ pub fn admitGroup(c: *const Checkpoint, prefix: []const u8) !Group {
         refuse("group {s}: the mul1 marker is not the magic word", .{prefix});
         return error.BadTrellisPart;
     }
-    if (g.halves % 2 != 0) { // the mul1 half steps have no device path (exl3.cl:64)
-        refuse("group {s}: halves {d} is odd (a mul1 half step); no device path exists", .{ prefix, g.halves });
-        return error.Exl3HalfWidth;
-    }
-    g.bits = g.halves / 2;
-    if (g.bits < 1 or g.bits > 8) { // the kernel traps (exl3_h.cl:24,166; exl3.cl:215) accept 1..8; bits=1 is oracle-verified on-card
-        refuse("group {s}: bits {d} outside the kernels' 1..8", .{ prefix, g.bits });
-        return error.Exl3BitsRange;
-    }
+    // Step 5 (eaq-halfstep-spec-fable.md section 2.1): the odd-halves refusal and the
+    // bits range check are gone. The shape-derived 2..16 bound above is the kernels'
+    // arg trap (exl3_h.cl halves < 2 || halves > 16) exactly, and an odd-halves mcg or
+    // inst3 group already refused as Exl3Codebook at the step above.
     // Exactly one scale style, both sides present and consistently shaped (exl3_eaq.zig:240-267).
     const h_suh = c.has(try partName(prefix, "", ".suh"));
     const h_svh = c.has(try partName(prefix, "", ".svh"));
@@ -208,9 +202,10 @@ pub fn projectionExl3(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: 
     for (parts) |p| {
         const g = try admitGroup(c, try partName(prefix, p, ""));
         // fused parts of one slot were one projection before packing: they share the input
-        // dim K, and every part must be mul1 (admitGroup refuses the rest). Bits may differ
-        // per part — the stock packs mix precision inside a fused group (layer 3's q/k) —
-        // and each Part carries its own tr/suh/svh/bits, so no agreement is needed there.
+        // dim K, and every part must be mul1 (admitGroup refuses the rest). Halves may
+        // differ per part — the stock packs mix precision inside a fused group (layer 3's
+        // q/k), and step 5 admits odd widths — and each Part carries its own
+        // tr/suh/svh/halves, so no agreement is needed there.
         if (groups.items.len > 0 and (g.k != k or g.codebook != groups.items[0].codebook)) {
             refuse("{s}{s}: fused parts disagree with part 0 on K or codebook", .{ prefix, p });
             return error.MismatchedFusedK;
@@ -244,7 +239,7 @@ pub fn projectionExl3(d: *Dev, c: *const Checkpoint, prefix: []const u8, parts: 
                 try uploadSigns(d, try c.get(try partName(g.prefix, "", ".sv")), g.n / 16, svh);
             },
         }
-        try device_parts.append(alloc, .{ .tr = tr, .suh = suh, .svh = svh, .n0 = n0, .n = g.n, .halves = g.halves, .bits = g.bits, .codebook = g.codebook });
+        try device_parts.append(alloc, .{ .tr = tr, .suh = suh, .svh = svh, .n0 = n0, .n = g.n, .halves = g.halves, .codebook = g.codebook });
         n0 += g.n; // fused parts stack on N in slot order; the pad beyond n_total stays in nt
     }
     const hx = try alloc.create(Exl3);

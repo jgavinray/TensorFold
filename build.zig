@@ -86,6 +86,9 @@ pub fn build(b: *std.Build) void {
     @import("zig/build/checkpoint_security.zig").tests(b, test_step);
     @import("zig/build/xpu_eaq_host.zig").tests(b, test_step);
     @import("zig/build/xpu_eaq_host.zig").repack(b);
+    @import("zig/build/xpu_eaq_host.zig").encodeTests(b, test_step);
+    @import("zig/build/xpu_eaq_host.zig").ldlqTests(b, test_step);
+    @import("zig/build/xpu_eaq_host.zig").halfstepTests(b, test_step);
     if (b.graph.host.result.os.tag == .macos) {
         const step5_mods = metalEngineModules(b, b.graph.host, .Debug, draft_ids);
         const empty = b.addWriteFiles().add("step5-compile-only.metallib", "");
@@ -154,6 +157,9 @@ pub fn build(b: *std.Build) void {
     hip_build.steps(b, target, optimize, build_options, test_step);
     exlr8_build.hostTests(b, target, test_step);
     xpu_build.steps(b, target, optimize, build_options);
+    @import("zig/build/xpu_kl.zig").steps(b, target, optimize); // xpu-eaq-kl: the KL gate (pack side + statistic)
+    @import("zig/build/xpu_quant.zig").steps(b, target, optimize); // xpu-eaq-quant: the fresh-quant driver (spec §5.5)
+    @import("zig/build/xpu_ref.zig").steps(b, target, optimize); // xpu-eaq-ref: the dense reference (spec §5.1/§5.5)
     video_build.steps(b, target, test_step);
     const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
     const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{

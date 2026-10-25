@@ -661,8 +661,10 @@ fn hostGemmExl3(ps: []const Exl3Part, xh: []const f16, R: usize, nt: usize, ref:
 /// The EXL3 probe: the two decode GEMV paths on 1 and 8 rows, the fused prompt GEMM (dequant128_c
 /// plus the one DPAS prompt16) on all rows, the device's own dequant slab, and the host references
 /// on NS rows — the same table as the int4 sites, the prompt row named for the DPAS kernel and the
-/// dequant row measuring the fp16 the prompt GEMM reads against the FP64 oracle (the PR 3 bounds
-/// language: accepted worst 2^-8 of the RMS weight, RMS 2^-11). The head runs the decode rows only:
+/// dequant row measuring the fp16 the prompt GEMM reads against the FP64 oracle (the accepted
+/// metrics, fable ruling: RMS 2^-11, worst-COLUMN 2^-8; single element 0.02 with 2^-8 as the
+/// Gaussian-tail reference — the "PR 3 bounds" wording described Gaussian-tail data, not a bound).
+/// The head runs the decode rows only:
 /// its rows are always <= 16 and its full-width dequant slab is the 2.54 GB the design refuses.
 fn exl3Probe(d: *Dev, a: *Acts, w: Proj, x: *anyopaque, T: u32, layer: usize, site: u32) !void {
     if (T < NS or (layer < q.LAYERS and std.mem.indexOfScalar(usize, &LAYERS_ON, layer) == null)) return;

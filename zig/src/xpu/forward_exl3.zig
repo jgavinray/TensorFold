@@ -47,12 +47,12 @@ fn slotName(k: u32, n: u32, head: bool) []const u8 {
 /// n0, the fused parts' column total sumn, the row count M, the width), plus the four
 /// device pointers it touches. dev.launch's own line and drain follow it.
 fn trLaunch(call: u32, slot: []const u8, role: []const u8, part: u32, nparts: u32,
-    name: []const u8, gx: u32, gy: u32, K: i32, NT: i32, N: i32, n0: i32, sumn: i32, M: i32, bits: i32,
+    name: []const u8, gx: u32, gy: u32, K: i32, NT: i32, N: i32, n0: i32, sumn: i32, M: i32, halves: i32,
     p0: *anyopaque, p1: ?*anyopaque, p2: ?*anyopaque, p3: ?*anyopaque) void {
     std.debug.print(
-        \\EXL3TR call={d} layer~{d} {s} {s} {d}/{d} {s} gx={d} gy={d} K={d} NT={d} sumn={d} N={d} n0={d} M={d} bits={d} P0={x} P1={x} P2={x} P3={x}
+        \\EXL3TR call={d} layer~{d} {s} {s} {d}/{d} {s} gx={d} gy={d} K={d} NT={d} sumn={d} N={d} n0={d} M={d} halves={d} P0={x} P1={x} P2={x} P3={x}
         \\
-    , .{ call, @divTrunc(call - 1, 4), slot, role, part, nparts, name, gx, gy, K, NT, sumn, N, n0, M, bits,
+    , .{ call, @divTrunc(call - 1, 4), slot, role, part, nparts, name, gx, gy, K, NT, sumn, N, n0, M, halves,
         @intFromPtr(p0), ptrBits(p1), ptrBits(p2), ptrBits(p3) });
 }
 
@@ -98,10 +98,10 @@ pub fn gemmRows(d: *dev.Dev, hx: *const exl3_model.Exl3, wscr: ?*anyopaque, h: *
             const gx: u32 = @intCast(w.k / 128);
             const gy: u32 = (p.n + 127) / 128;
             if (tr) trLaunch(call, slot, "dequant", @intCast(pi), nparts, "exl3_dequant128_c", gx, gy,
-                K, NT, @intCast(p.n), @intCast(p.n0), sumn, @intCast(m), @intCast(p.bits), p.tr, p.suh, p.svh, s);
+                K, NT, @intCast(p.n), @intCast(p.n0), sumn, @intCast(m), @intCast(p.halves), p.tr, p.suh, p.svh, s);
             try d.launch(d.k.exl3_dequant128_c, .{ .x = gx, .y = gy }, .{
                 p.tr,        p.suh,   p.svh,   s,           K,
-                @as(i32, @intCast(p.n)), NT, @as(i32, @intCast(p.bits)), @as(i32, @intCast(p.n0)),
+                @as(i32, @intCast(p.n)), NT, @as(i32, @intCast(p.halves)), @as(i32, @intCast(p.n0)),
             });
         }
         // one fused GEMM over the whole padded NT: A is the raw fp16 activations [m, K],
@@ -151,36 +151,36 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
     const mi: i32 = @intCast(m);
     for (hx.parts, 0..) |p, pi| {
         const N: i32 = @intCast(p.n);
-        const bits: i32 = @intCast(p.bits); // whole widths only; the loader refuses odd halves (contract section 6)
+        const halves: i32 = @intCast(p.halves); // the part's own width, 2..16 (step 5: odd halves are mul1's half steps)
         const y = off(out, @as(usize, p.n0) * 2);
         const gx: u32 = @intCast(p.n / 16);
         // (a) the part's entry: suh then H_K, into the staging row block the GEMV reads
         if (tr) trLaunch(call, slot, "xform", @intCast(pi), nparts, "exl3_xform_h", gxk, m, K, NT,
-            N, @intCast(p.n0), sumn, mi, bits, h, p.suh, xt, null);
+            N, @intCast(p.n0), sumn, mi, halves, h, p.suh, xt, null);
         try d.launch(d.k.exl3_xform_h, .{ .x = gxk, .y = m }, .{ h, p.suh, xt, K, mi });
         // (b) the raw trellis words against the transformed row; kslices = 1 (the layout
         // note above), the whole K range in one slice.
         if (m == 1) {
             if (tr) trLaunch(call, slot, "gemv1", @intCast(pi), nparts, "exl3_decode2_t1_h", gx, 1,
-                K, NT, N, @intCast(p.n0), sumn, 1, bits, p.tr, xt, y, null);
+                K, NT, N, @intCast(p.n0), sumn, 1, halves, p.tr, xt, y, null);
             try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = 1 },
-                .{ p.tr, xt, y, K, N, @as(i32, 1), bits, @as(i32, 1), NT });
+                .{ p.tr, xt, y, K, N, @as(i32, 1), halves, @as(i32, 1), NT });
         } else {
             // rows 2..16: the kernels hold eight rows a launch — the same kernel at row
             // offsets 0 and 8 when m > 8, X advanced by 8 rows of K halves and Y by 8 rows
             // of the pitch NT (the kernel's Y indexing: (ks·T + t)·NT + …, exl3_h.cl:74).
             if (tr) trLaunch(call, slot, "gemv8a", @intCast(pi), nparts, "exl3_decode2_h", gx, 1,
-                K, NT, N, @intCast(p.n0), sumn, @intCast(@min(m, 8)), bits, p.tr, xt, y, null);
+                K, NT, N, @intCast(p.n0), sumn, @intCast(@min(m, 8)), halves, p.tr, xt, y, null);
             try d.launch(d.k.exl3_decode2_h, .{ .x = gx, .y = 1 },
-                .{ p.tr, xt, y, K, N, @as(i32, @intCast(@min(m, 8))), bits, @as(i32, 1), NT });
+                .{ p.tr, xt, y, K, N, @as(i32, @intCast(@min(m, 8))), halves, @as(i32, 1), NT });
             if (m > 8) {
                 const x2 = off(xt, 8 * @as(usize, @intCast(K)) * 2);
                 const y2 = off(y, 8 * @as(usize, @intCast(NT)) * 2);
                 if (tr) trLaunch(call, slot, "gemv8b", @intCast(pi), nparts, "exl3_decode2_h", gx, 1,
-                    K, NT, N, @intCast(p.n0), sumn, @intCast(m - 8), bits, p.tr, x2, y2, null);
+                    K, NT, N, @intCast(p.n0), sumn, @intCast(m - 8), halves, p.tr, x2, y2, null);
                 try d.launch(d.k.exl3_decode2_h, .{ .x = gx, .y = 1 }, .{
                     p.tr, x2,   y2,   K, N, @as(i32, @intCast(m - 8)),
-                    bits, @as(i32, 1), NT,
+                    halves, @as(i32, 1), NT,
                 });
             }
         }
@@ -188,7 +188,7 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
         // multiple of 128, so no block straddles), then svh
         const gxn: u32 = @intCast(p.n / 128);
         if (tr) trLaunch(call, slot, "yscale", @intCast(pi), nparts, "exl3_yscale_h", gxn, m, K, NT,
-            N, @intCast(p.n0), sumn, mi, bits, y, p.svh, null, null);
+            N, @intCast(p.n0), sumn, mi, halves, y, p.svh, null, null);
         try d.launch(d.k.exl3_yscale_h, .{ .x = gxn, .y = m }, .{ y, p.svh, N, NT, mi });
     }
 }

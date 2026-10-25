@@ -16,7 +16,10 @@ const kvBytes = fwd.kvBytes;
 const off = dev.off;
 
 /// An int4 projection in the GEMM layout (words, fp16 scales, biases); `wide` picks the kernel family, `ilv` gate|up.
-pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool, gs: u32 = 64, ilv: bool = false, exl3: ?*const exl3_model.Exl3 = null };
+/// `dense16` (the calibration driver, eaq-ldlq-spec-fable.md 1.4): the Proj is a placeholder whose
+/// weights are the fp16 [K, n] slab itself (already rotation- and scale-baked, `n` the NT pitch);
+/// gemmRows runs the prompt GEMM over the slab directly. null on every serving path.
+pub const Proj = struct { w: *anyopaque, s: *anyopaque, bg: *anyopaque, n: u32, k: u32, wide: bool, gs: u32 = 64, ilv: bool = false, exl3: ?*const exl3_model.Exl3 = null, dense16: ?*anyopaque = null };
 
 pub const Layer = struct {
     in_norm: *anyopaque,
@@ -267,18 +270,20 @@ fn canonExl3(name: []const u8) []const u8 {
     return name;
 }
 
-/// Qwen3.8-27B from a stock EXL3 checkpoint (mul1 codebook, whole bits): every projection a
-/// trellis handle (Proj.exl3, buffers built by exl3_model.projectionExl3), the embedding and
-/// the GDN a/b gates dense F16, and the head on its own path — trellis at stored width when
-/// the pack ships lm_head.trellis, else the seed head's own 4/64 quantization. Every refusal
-/// (the Table.complete mirror below and the exl3_model.admitGroup checks) lands before the
-/// first device allocation; only after them does the GPTQ path's alloc-and-upload pattern run.
-pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
-    var m: Model = undefined;
+/// One admitted fused part: the stored prefix and its admitted group (loadExl3's admission table).
+pub const Entry = struct { prefix: []const u8, g: exl3_model.Group, seen: usize = 0 };
+
+/// The verdict of loadExl3's admission: the admitted parts, the census summary and whether
+/// the pack ships lm_head.trellis.
+pub const Admission = struct { entries: []Entry, summary: exl3_model.Summary, head_g: ?exl3_model.Group };
+
+/// The host-side admission loadExl3 runs before its first device allocation: the
+/// Table.complete mirror, the dense F16 gate rule, the head and the full .trellis census.
+/// publish() re-runs it on the finished pack — writer and reader share one source of truth.
+pub fn admitExl3(c: *const Checkpoint) !Admission {
     // ---- admission, no allocation: every layer's four slots, the head and the embedding
     // present before upload (the Table.complete mirror, exl3_eaq.zig:381-388 with the
     // countSlot rule); the first missing or unservable entry names itself and refuses ----
-    const Entry = struct { prefix: []const u8, g: exl3_model.Group, seen: usize = 0 };
     var entries: std.ArrayList(Entry) = .empty;
     var summary: exl3_model.Summary = .{};
     var head_g: ?exl3_model.Group = null;
@@ -393,6 +398,20 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
         exl3_model.refuse("lm_head claimed by {d} trellis tensors", .{head_seen});
         return error.DuplicateProjection;
     }
+    return .{ .entries = entries.items, .summary = summary, .head_g = head_g };
+}
+
+/// Qwen3.8-27B from a stock EXL3 checkpoint (mul1 codebook, whole bits): every projection a
+/// trellis handle (Proj.exl3, buffers built by exl3_model.projectionExl3), the embedding and
+/// the GDN a/b gates dense F16, and the head on its own path — trellis at stored width when
+/// the pack ships lm_head.trellis, else the seed head's own 4/64 quantization. Every refusal
+/// (the Table.complete mirror below and the exl3_model.admitGroup checks) lands before the
+/// first device allocation; only after them does the GPTQ path's alloc-and-upload pattern run.
+pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
+    var m: Model = undefined;
+    const adm = try admitExl3(c);
+    const summary = adm.summary;
+    const head_g = adm.head_g;
     // ---- upload: the admitted shapes become device buffers (contract section 2) ----
     // The embedding: F16 as stored, or widened host-side from BF16 (the EXL3 packs store BF16;
     // embed_dense reads F16). An oddly placed shard is copied to an aligned host buffer first.
@@ -478,7 +497,7 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
     // admitted shapes, not from model output.
     var tr_bytes: usize = 0;
     var sc_bytes: usize = 0;
-    for (entries.items) |en| {
+    for (adm.entries) |en| {
         const bytes = exl3_model.partBytes(en.g);
         tr_bytes += bytes.tr;
         sc_bytes += bytes.scales;
@@ -489,8 +508,8 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
         sc_bytes += bytes.scales;
     }
     std.debug.print("  exl3: {d} groups admitted (mul1 {d}, inst3 {d}, mcg {d}): scales suh/svh {d}, su/sv {d}, bias {d}\n", .{ summary.groups, summary.mul1, summary.inst3, summary.mcg, summary.suh_svh, summary.su_sv, summary.bias });
-    std.debug.print("        halves:", .{});
-    for (summary.bits, 0..) |n, h| if (n != 0) std.debug.print(" {d}b:{d}", .{ h, n });
+    std.debug.print("  bits:", .{}); // the histogram keys halves; print the bits each index means (2.5b style, one decimal)
+    for (summary.bits, 0..) |n, h| if (n != 0) std.debug.print(" {d}.{d}b:{d}", .{ h / 2, (h % 2) * 5, n });
     std.debug.print("\n        dense: model.embed_tokens F16, linear_attn.in_proj_a/b F16 48x{d}, lm_head {s}\n", .{ D, if (head_g != null) "trellis (fp16 GEMV path)" else "F16 (quantized to 4/64 at load)" });
     std.debug.print("        device bytes: trellis {d}, scales {d}\n", .{ tr_bytes, sc_bytes });
     return m;

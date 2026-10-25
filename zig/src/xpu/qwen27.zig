@@ -2,9 +2,18 @@
 const std = @import("std");
 pub const ze = @import("ze");
 const kb = @import("xpu_qwen27_kernels");
-const dev = @import("dev.zig");
-const fwd = @import("forward.zig");
-const loader = @import("load.zig");
+pub const dev = @import("dev.zig"); // pub: the quantizer (quant.zig) shares these files through this module
+pub const fwd = @import("forward.zig");
+pub const calib = @import("calib.zig"); // the fresh-quant calibration entries (eaq-ldlq-spec-fable.md 1.4)
+pub const ldlq = @import("ldlq.zig"); // the block-LDLQ feedback driver (eaq-ldlq-spec-fable.md 4.4)
+comptime {
+    // qwen27.zig is the module root qwen27_main always analyzes; anchor the LDLQ
+    // driver's public surface here so its bodies are compiled now, before the CLI
+    // probe wires a caller (Zig 0.17 analyzes only reachable declarations).
+    _ = .{ ldlq.Driver.init, ldlq.Driver.beginSlot, ldlq.Driver.quantizePart, ldlq.Driver.readEta, ldlq.Driver.decodePart, ldlq.Driver.benchPart, ldlq.PartReport, ldlq.Slot, ldlq.Part };
+}
+pub const loader = @import("load.zig"); // pub for the same reason
+pub const exl3_model = @import("exl3_model.zig"); // already in the graph through load.zig; named for the quantizer
 const multi = @import("runner_multi.zig");
 const slot_states = @import("slot_states.zig");
 pub const limits = @import("limits.zig");
@@ -34,6 +43,7 @@ pub const gemm = fwd.gemm;
 pub const Want = fwd.Want;
 pub const no_q8 = fwd.no_q8;
 pub const Mode = fwd.Mode;
+pub const Capture = fwd.Capture;
 
 pub const alloc = std.heap.c_allocator;
 
@@ -259,6 +269,7 @@ pub const Runner = struct {
         const mm128 = try d.g.module(&kb.gemm128);
         const mw128 = try d.g.module(&kb.ngen_wide128);
         const mn128 = try d.g.module(&kb.ngen_narrow128);
+        const mcl = try d.g.module(&kb.calib); // the calibration kernels (calib.cl): slab upload, X^T staging, the Hessian syrk
         d.k = .{
             .embed = try d.kernel(mg, "embed", 256),
             .add_rmsnorm = try d.kernel(mg, "add_rmsnorm", 128),
@@ -318,6 +329,9 @@ pub const Runner = struct {
             .gdn_out = try d.kernel(mgd, "gdn_out", 128),
             .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
             .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
+            .bf16_to_slab = try d.kernel(mcl, "bf16_to_slab", 256),
+            .transpose16 = try d.kernel(mcl, "transpose16", 256),
+            .exl3_syrk32 = try d.kernel(mcl, "exl3_syrk32", 256),
         };
         // the shared rounds' kernels reach each slot's states through the per-row table (acts.mt)
         for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
@@ -438,6 +452,39 @@ pub const Runner = struct {
         r.last = @intCast((try forward(&r.d, &r.model, &r.acts, &.{id}, r.pos, .{ .taps = r.taps_on })).?);
         r.pos += 1;
         if (r.taps_on) if (r.on_taps) |cb| try cb.f(cb.ctx, r.acts.taps, 1);
+    }
+
+    /// Calibration driver hook (fable's layer-major calibration forward, spec 1.4): the embedding
+    /// rows of one batch of `ids`, at row `row0` of the caller's device fp32 stream `x`
+    /// [rows_total, D] — the stream's start, `calib.embedStream`'s runner-facing twin. A batch is
+    /// at most maxRows() rows; the stream's rows run as long as the corpus.
+    pub fn calibEmbed(r: *Runner, ids: []const u32, x: *anyopaque, row0: u32) !void {
+        const T: u32 = @intCast(ids.len);
+        if (T == 0 or T > maxRows()) return error.TooManyRows;
+        try ze.check(r.d.g.api.zeCommandListAppendMemoryCopy(r.d.list, r.acts.ids, ids.ptr, ids.len * 4, null, 0, null));
+        errdefer r.d.settle(); // the queued copy reads the caller's ids: an error returns only once the queue is idle
+        try calib.embedStream(&r.d, &r.model, &r.acts, r.acts.ids, off(x, @as(usize, row0) * D * 4), T);
+    }
+
+    /// One layer (`i`) over T rows of the device fp32 stream: `calib.layerForward` with the
+    /// runner's guards (the layer exists; the rows' positions stay inside this slot's context,
+    /// counted as in `prompt` — the attention reads its KV cache causally to p0 + T). The four
+    /// weight slabs are the driver's (`calib.Slabs`, filled per layer by `calib.dequantSlot` or
+    /// `calib.uploadDense`); `fresh` zeroes layer i's GDN state, as a new prompt row starts;
+    /// `cap` may be null for a capture-less replay (the apply pass propagating quantized
+    /// activations). The study modes (XPU_A8, the int4 sites) quantize captured activations in
+    /// place: `calib.layerForward` refuses them (H7).
+    pub fn calibLayer(r: *Runner, i: usize, slabs: calib.Slabs, x_in: *anyopaque, x_out: *anyopaque,
+                      T: u32, p0: u32, fresh: bool, cap: ?*calib.Capture) !void {
+        if (i >= LAYERS) return error.NoSuchLayer;
+        if (p0 + T > r.context) return error.ContextFull;
+        try calib.layerForward(&r.d, &r.model, &r.acts, i, slabs, x_in, x_out, T, p0, fresh, cap);
+    }
+
+    /// The sweep's end: the final norm of the stream's rows into fp16 hidden [T, D] (site 4
+    /// captured when `cap.h[4]` is set). Run after layer LAYERS - 1 of the same rows.
+    pub fn calibFinalNorm(r: *Runner, x_in: *anyopaque, hidden: *anyopaque, T: u32, cap: ?*calib.Capture) !void {
+        try calib.finalNorm(&r.d, &r.model, &r.acts, x_in, hidden, T, cap);
     }
 
     /// Verifies a block: `ids` (≤ 16 rows) run from `pos`, each row's greedy token returned; state moves till `commit`.

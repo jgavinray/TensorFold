@@ -132,6 +132,10 @@ fn exitLost(rc: u32) void {
 pub const Dev = struct {
     g: ze.Gpu,
     list: ze.H,
+    /// The quantize loop's batched list (see ze.Gpu.immediateAsync): async-mode appends,
+    /// drained by settle. Null until a Driver takes it; launchOn/fillOn/copyOn name the
+    /// list they append to, and every host read that follows a drained loop settles both.
+    q_list: ze.H = null,
     staging: []u8 = &.{}, // USM host memory: the driver cannot copy from file-backed mmap pages directly
     allocated: usize = 0, // device bytes allocated (frees not counted: buffers live as long as the runner)
     k: struct {
@@ -193,6 +197,10 @@ pub const Dev = struct {
         gdn_out: ze.H,
         ngen_wide: ze.H,
         ngen_narrow: ze.H,
+        // calibration capture (calib.cl): dense bf16 -> slab, X^T staging, H += X^T X
+        bf16_to_slab: ze.H,
+        transpose16: ze.H,
+        exl3_syrk32: ze.H,
     },
 
     /// Waits for the queue, then gives the card back everything made on it (Gpu.close).
@@ -203,6 +211,10 @@ pub const Dev = struct {
 
     /// Waits for every command on the list; callers settle before host memory a queued copy reads or writes goes.
     pub fn settle(d: *Dev) void {
+        if (d.q_list) |l| {
+            const rcq = d.g.api.zeCommandListHostSynchronize(l, std.math.maxInt(u64));
+            if (rcq != 0) lost(rcq);
+        }
         const rc = d.g.api.zeCommandListHostSynchronize(d.list, std.math.maxInt(u64));
         if (rc != 0) lost(rc);
     }
@@ -225,13 +237,24 @@ pub const Dev = struct {
     }
 
     /// Host bytes (any memory, mmap included) to the device, through the USM staging buffer.
+    /// Event-signaled: the list's settle (`d.sync`) returns early on a busy card, and the
+    /// host had been reusing the staging (and launching behind the copy) while the DMA was
+    /// still in flight — the fable 1b ruling's copy-delivery loss. Each chunk rides with a
+    /// host-visible event and the caller blocks until the card really signals.
+    var copy_ev: ze.H = null;
     pub fn copyIn(d: *Dev, dst: *anyopaque, bytes: []const u8) !void {
         if (d.staging.len == 0) d.staging = @as([*]u8, @ptrCast(try d.g.hostAlloc(256 << 20)))[0 .. 256 << 20];
+        if (copy_ev == null) copy_ev = (try d.g.events(1))[0];
         var done: usize = 0;
         while (done < bytes.len) {
             const n = @min(d.staging.len, bytes.len - done);
             @memcpy(d.staging[0..n], bytes[done .. done + n]);
-            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(dst, done), d.staging.ptr, n, null, 0, null));
+            _ = d.g.api.zeEventHostReset(copy_ev);
+            try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, off(dst, done), d.staging.ptr, n, copy_ev, 0, null));
+            const deadline = q.now() + 600;
+            while (d.g.api.zeEventHostSynchronize(copy_ev, 300_000_000_000) != 0) {
+                if (q.now() > deadline) return error.DeviceLost;
+            }
             try d.sync();
             done += n;
         }
@@ -248,6 +271,12 @@ pub const Dev = struct {
     }
 
     pub fn launch(d: *Dev, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
+        try d.launchOn(d.list, k, groups, args);
+    }
+
+    /// launch on an explicit list — the ldlq driver's quantize loop batches its block's
+    /// commands onto Dev.q_list (the sync-mode d.list pays a host round trip per append).
+    pub fn launchOn(d: *Dev, list: ze.H, k: ze.H, groups: ze.GroupCount, args: anytype) !void {
         inline for (args, 0..) |a, i| try d.g.arg(k, i, a);
         var ev: ze.H = null;
         if (q.prof.on) {
@@ -256,7 +285,7 @@ pub const Dev = struct {
             q.prof.kernel[q.prof.used] = k;
             q.prof.used += 1;
         }
-        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(d.list, k, &groups, ev, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendLaunchKernel(list, k, &groups, ev, 0, null));
         if (launchTracing()) { // the drain that pins a device-lost to the command that caused it
             launch_seq += 1;
             std.debug.print("EXL3TR launch #{d} {s} gx={d} gy={d} gz={d}\n", .{
@@ -289,6 +318,15 @@ pub const Dev = struct {
         @memset(host, pattern);
         try d.copyIn(p, std.mem.sliceAsBytes(host));
     }
+
+    /// Device-side pattern fill on `list`: the batched loop's STAT pre-fill rides the
+    /// queue with the launches instead of blocking on the copyIn event per call.
+    pub fn fillOn(d: *Dev, list: ze.H, p: *anyopaque, pattern: anytype, bytes: usize) !void {
+        const T = @TypeOf(pattern);
+        if (bytes % @sizeOf(T) != 0 or @sizeOf(T) > 256) return error.BadDims;
+        const pat: T = pattern;
+        try ze.check(d.g.api.zeCommandListAppendMemoryFill(list, p, &pat, @sizeOf(T), bytes, null, 0, null));
+    }
 };
 
 /// XPU_EXL3_TRACE: every queued command prints and the command list drains, so the last
@@ -304,7 +342,13 @@ fn launchTracing() bool {
 }
 
 pub fn copy(d: *Dev, dst: *anyopaque, src: *anyopaque, n: usize) !void {
-    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dst, src, n, null, 0, null));
+    try copyOn(d, d.list, dst, src, n);
+}
+
+/// copy on an explicit list: a readback ordered after a batched loop's kernels rides
+/// the same list (the list's own drain then covers the copy too).
+pub fn copyOn(d: *Dev, list: ze.H, dst: *anyopaque, src: *anyopaque, n: usize) !void {
+    try ze.check(d.g.api.zeCommandListAppendMemoryCopy(list, dst, src, n, null, 0, null));
     if (launchTracing()) std.debug.print("EXL3TR copy #{d} dst={x} src={x} n={d}\n", .{
         launch_seq, @intFromPtr(dst), @intFromPtr(src), n });
 }

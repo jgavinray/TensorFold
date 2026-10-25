@@ -12,29 +12,37 @@
 
 #define KERNEL(N) __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(N, 1, 1))) kernel
 
-// fp16-output exl3_decode2 (exl3.cl:62), verbatim except: half Y, the NT pitch and the arg
-// trap. Y is the caller's fp16 [rows][NT] (advanced to the part's column base); the slice
-// rows follow the seed kernel's layout ((ks*T + t) rows apart), so the forward launches
-// with kslices = 1 — the shipped layout puts slice sums in disjoint rows and only the
-// probe reduces them host-side. bits must be whole (the loader admits 2..8; the probe uses
-// 4/3/2; half widths would need a reader-side path), T <= 8, and kslices need not divide
-// K/16 — the last slice absorbs the remainder.
-KERNEL(16) void exl3_decode2_h(global const ushort *TR, global const half *X, global half *Y, int K, int N, int T, int bits,
+// fp16-output exl3_decode2 (exl3.cl:62), verbatim except: half Y, the NT pitch, the
+// `halves` width and the arg trap. Y is the caller's fp16 [rows][NT] (advanced to the
+// part's column base); the slice rows follow the seed kernel's layout ((ks*T + t) rows
+// apart), so the forward launches with kslices = 1 — the shipped layout puts slice sums in
+// disjoint rows and only the probe reduces them host-side. `halves` is the oracle's
+// Width.halves — whole widths are halves/2 bits, odd halves are mul1's half-bit steps
+// (the loader admits 2..16, core/exl3_load.zig admitGroup); the frozen fp32 probe kernels
+// in exl3.cl still take whole bits. The per-position window end is the unified
+// E(p) = ((p + 1) * halves) >> 1 (core/exl3_format.zig:78-91 streamEnds), so the lane's
+// first needed bit is lb = 8*lane*halves - 16 and position v starts at
+// a_v = lb + (((v + 1) * halves) >> 1). T <= 8, and kslices need not divide
+// K/16 — the last slice absorbs the remainder. R/nw/strides/offsets are deliberately
+// inline constants, not a small const array: indexing the offsets with the unrolled v
+// forced the array to a non-constant stack allocation whose base register the compiler
+// could not rematerialize (128-byte stack frame, spill ~127).
+KERNEL(16) void exl3_decode2_h(global const ushort *TR, global const half *X, global half *Y, int K, int N, int T, int halves,
                                int kslices, int NT) {
-  if (bits < 1 || bits > 8 || K % 16 != 0 || kslices < 1) return; // workgroup-uniform arg trap
+  if (halves < 2 || halves > 16 || K % 16 != 0 || kslices < 1) return; // workgroup-uniform arg trap
   const int nt = get_group_id(0), ks = get_group_id(1), lane = get_sub_group_local_id();
-  const int per = K / 16 / kslices, kt0 = ks * per, R = 256 * bits, nw = 8 * bits;
+  const int per = K / 16 / kslices, kt0 = ks * per, R = 128 * halves, nw = 4 * halves;
   const int kt_end = ks == kslices - 1 ? K / 16 : kt0 + per;
   float acc0[8], acc1[8], acc0b[8], acc1b[8];
   __attribute__((opencl_unroll_hint))
   for (int t = 0; t < 8; t++) acc0[t] = acc1[t] = acc0b[t] = acc1b[t] = 0.0f;
-  const int lo = (16 * lane + 1) * bits - 16;          // the lane's first needed bit, may be negative
+  const int lb = 8 * lane * halves - 16;               // the lane's first needed bit, may be negative
   for (int kt = kt0; kt < kt_end; kt++) {
-    global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 16 * bits);
+    global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 8 * halves);
     __attribute__((opencl_unroll_hint))
     for (int v = 0; v < 16; v++) {
-      const int a_v = lo + v * bits;                   // the window's start bit, unwrapped
-      const int u = (a_v >= 0 ? a_v : a_v - 31) / 32;  // floor division; -1 at most, since lo >= -16 + bits
+      const int a_v = lb + (((v + 1) * halves) >> 1);  // the window's start bit, unwrapped: E(16*lane + v) - 16
+      const int u = (a_v >= 0 ? a_v : a_v - 31) / 32;  // floor division; -1 at most, since lb >= -15
       const int uu = u < 0 ? u + nw : u;               // the ring word holding the window's first bit
       const uint w0 = tw[uu], w1 = tw[uu + 1 == nw ? 0 : uu + 1];
       const int s = a_v - u * 32;
@@ -80,21 +88,24 @@ KERNEL(16) void exl3_decode2_h(global const ushort *TR, global const half *X, gl
 
 // T == 1 fast path of exl3_decode2_h: no token loop, scalar accumulators and one
 // activation load per weight. Same math and output as exl3_decode2_h with T = 1 (Y is that
-// one row); T must be 1 and bits whole, like the general kernel, and the last K slice
-// absorbs a non-divisor kslices remainder.
-KERNEL(16) void exl3_decode2_t1_h(global const ushort *TR, global const half *X, global half *Y, int K, int N, int T, int bits,
+// one row); T must be 1, like the general kernel takes halves 2..16, and the last K slice
+// absorbs a non-divisor kslices remainder. The window starts here use the av form of the
+// unified E(p) = ((p + 1) * halves) >> 1: a_v = lb + (((v + 1) * halves) >> 1) shifted by
+// R = 128 * halves into [R - 16, 2R), so the ring word index is a plain positive shift.
+// Offsets stay inline constants — same spill-budget rule as exl3_decode2_h.
+KERNEL(16) void exl3_decode2_t1_h(global const ushort *TR, global const half *X, global half *Y, int K, int N, int T, int halves,
                                    int kslices, int NT) {
-  if (T != 1 || bits < 1 || bits > 8 || K % 16 != 0 || kslices < 1) return; // workgroup-uniform arg trap
+  if (T != 1 || halves < 2 || halves > 16 || K % 16 != 0 || kslices < 1) return; // workgroup-uniform arg trap
   const int nt = get_group_id(0), ks = get_group_id(1), lane = get_sub_group_local_id();
-  const int per = K / 16 / kslices, kt0 = ks * per, R = 256 * bits, nw = 8 * bits;
+  const int per = K / 16 / kslices, kt0 = ks * per, R = 128 * halves, nw = 4 * halves;
   const int kt_end = ks == kslices - 1 ? K / 16 : kt0 + per;
   float acc0 = 0.0f, acc1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
-  const int lo = (16 * lane + 1) * bits - 16;
+  const int lb = 8 * lane * halves - 16;
   for (int kt = kt0; kt < kt_end; kt++) {
-    global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 16 * bits);
+    global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 8 * halves);
     __attribute__((opencl_unroll_hint))
     for (int v = 0; v < 16; v++) {
-      const int a_v = lo + v * bits;                   // the window's start bit, unwrapped
+      const int a_v = lb + (((v + 1) * halves) >> 1);  // the window's start bit, unwrapped: E(16*lane + v) - 16
       const int av = a_v + R;                          // shifted into [R - 16, 2R)
       const int w0i = av >> 5;                         // a_v >= 0: the ring word plus nw; a_v < 0: nw - 1
       const int uu = w0i >= nw ? w0i - nw : w0i;       // the ring word holding the window's first bit
@@ -162,26 +173,28 @@ static float rot128_lane(float v[8], int lane) {
 }
 
 KERNEL(256) void exl3_dequant128_c(global const ushort *TR, global const half *SUH, global const half *SVH,
-                                   global half *W, int K, int N, int NT, int bits, int n0) {
-  if (K % 128 != 0 || NT % 128 != 0 || bits < 1 || bits > 8 || n0 % 16 != 0) return; // workgroup-uniform trap
+                                   global half *W, int K, int N, int NT, int halves, int n0) {
+  if (K % 128 != 0 || NT % 128 != 0 || halves < 2 || halves > 16 || n0 % 16 != 0) return; // workgroup-uniform trap
   const int bk = get_group_id(0), bn = get_group_id(1);
   const int sg = get_sub_group_id(), lane = get_sub_group_local_id();
-  const int nw = 8 * bits;
+  const int nw = 4 * halves;
   local half blk[128][130];
   for (int i = get_local_id(0); i < 128 * 130; i += 256) blk[i / 130][i % 130] = 0;
   barrier(CLK_LOCAL_MEM_FENCE);
-  // phase A: decode; subgroup sg takes kt' = sg/2 and nt' = (sg&1)*4 + [0,4)
+  // phase A: decode; subgroup sg takes kt' = sg/2 and nt' = (sg&1)*4 + [0,4). The window
+  // starts follow the unified E(p) = ((p + 1) * halves) >> 1 (core/exl3_format.zig:78-91),
+  // inline constants per the exl3_decode2_h spill-budget rule.
   const int kt0 = (sg >> 1) * 16, nt0 = (sg & 1) * 64;
-  const int lo = (16 * lane + 1) * bits - 16;
+  const int lb = 8 * lane * halves - 16;
   __attribute__((opencl_unroll_hint))
   for (int ti = 0; ti < 4; ti++) {
     const int tn_g = bn * 8 + (sg & 1) * 4 + ti;
     if (tn_g < N / 16) {
-      global const uint *tw = (global const uint *)(TR + ((long)(bk * 8 + (sg >> 1)) * (N / 16) + tn_g) * 16 * bits);
+      global const uint *tw = (global const uint *)(TR + ((long)(bk * 8 + (sg >> 1)) * (N / 16) + tn_g) * 8 * halves);
       const int nt_col = nt0 + ti * 16;
       __attribute__((opencl_unroll_hint))
       for (int v = 0; v < 16; v++) {
-        const int a_v = lo + v * bits;                   // the window's start bit, unwrapped
+        const int a_v = lb + (((v + 1) * halves) >> 1);   // the window's start bit, unwrapped: E(16*lane + v) - 16
         const int u = (a_v >= 0 ? a_v : a_v - 31) / 32;  // floor division
         const int uu = u < 0 ? u + nw : u;               // the ring word holding the window's first bit
         const uint w0 = tw[uu], w1 = tw[uu + 1 == nw ? 0 : uu + 1];
