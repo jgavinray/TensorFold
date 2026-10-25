@@ -255,8 +255,8 @@ Not supported here:
 ### EXL3 checkpoints (experimental)
 
 @vcruz305 wrote this path, the shared EXL3 module and the Flash Next loader, in
-[#42](https://github.com/ashhart/TensorFold/pull/42). The native engine serves no EXL3 pack yet; its reference decoder
-is `zig/src/core/exl3_format.zig`, with a Metal projection in `zig/src/core/exl3_projection.zig`.
+[#42](https://github.com/ashhart/TensorFold/pull/42). The native engine has no Flash Next EXL3 path yet; its reference
+decoder is `zig/src/core/exl3_format.zig`, with a Metal projection in `zig/src/core/exl3_projection.zig`.
 
 The CUDA engine also serves EXL3 packs of Flash Next (`quant_method: exl3`) on one GPU through the shared EXL3
 module ([EXL3 weights](exl3.md)): any codebook, and a width per tensor, so mixed-K packs whose experts range from

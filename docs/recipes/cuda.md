@@ -53,8 +53,9 @@ whose CUDA engine reads it declares `EXL3_VARIANT = "any"`, and TensorFold check
 downloading. The dense linear layer, its plan and its measured throughput are in [EXL3 weights](exl3.md);
 `python -m tensorfold.cuda.exl3.inspect MODEL_DIR` prints what a checkpoint holds.
 The module is at the [`v0.6.6` tag](https://github.com/ashhart/TensorFold/tree/v0.6.6/src/tensorfold/cuda/exl3)
-([#42](https://github.com/ashhart/TensorFold/pull/42)). The native engine serves no EXL3 pack yet; its reference
-decoder is `zig/src/core/exl3_format.zig`.
+([#42](https://github.com/ashhart/TensorFold/pull/42)). The native engine serves GLM-5.3-Flash's EXL3 experts on CUDA,
+and the Intel XPU engine's 27B runner reads stock EXL3 and EAQ packs (the XPU full-checkpoint qualification is
+pending); its reference decoder is `zig/src/core/exl3_format.zig`.
 
 ## Checkpoints
 

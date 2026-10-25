@@ -9,7 +9,7 @@ Battlemage G31, 32 GB) directly through **Level Zero**, with no PyTorch, no SYCL
 | | |
 |---|---|
 | Model | Qwen3.8-27B (`model_type` `qwen3_5`: 48 GDN layers + 16 attention layers) |
-| Formats | MLX affine 4-bit, group size 64 (`mlx-q4g64`); GPTQ symmetric 4-bit, group size 128 (`gptq-int4-g128`) |
+| Formats | MLX affine 4-bit, group size 64 (`mlx-q4g64`); GPTQ symmetric 4-bit, group size 128 (`gptq-int4-g128`); EXL3 trellis packs, stock or EAQ (`mul1`, widths 1 to 8 bits, half steps included) |
 | Measured checkpoints | GPTQ: [`SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16`](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16) (revision `9d189a60`), with its tokenizer as published; full recipe: [RECIPE-qwen38-27b-b70.md](RECIPE-qwen38-27b-b70.md) |
 | Drafts | DFlash2 (`--drafter`), best-first tree of 15 nodes, greedy and sampled |
 | Serving | several streams (`--parallel N`, 8 by default, the engine's "lanes" host): shared rounds, a lone stream runs as a DFlash2 tree (also with `--parallel 1`) |
@@ -27,12 +27,31 @@ compiler), a C++17 compiler and the oneDNN nGEN headers.
 ```sh
 zig build xpu-native -Doptimize=ReleaseFast -Dngen-include=<path to ngen>   # zig-out/xpu/bin/tensorfold-native
 zig build xpu-qwen27 -Doptimize=ReleaseFast -Dngen-include=<path to ngen>   # xpu-qwen27 test executable
+zig build xpu-eaq-quant -Doptimize=ReleaseFast -Dngen-include=<path to ngen> # zig-out/bin/xpu-eaq-quant
+zig build xpu-eaq-kl    -Doptimize=ReleaseFast -Dngen-include=<path to ngen> # zig-out/bin/xpu-eaq-kl
 ```
 
 Device tests: `zig build xpu-qwen27-tests -Doptimize=ReleaseFast -Dngen-include=<path to ngen>`, then `zig-out/bin/tf-xpu-qwen27-means-test` (group means against FP64, no model), `zig-out/bin/tf-xpu-qwen27-seam-test MODEL` (or `TF_XPU_QWEN27=MODEL`: a prompt cut at 64, 1024 or whole gives the same logits) and `zig-out/bin/tf-xpu-qwen27-close-test MODEL` (three opens and closes give the card back); each prints `skipped:` and exits 0 without a Level Zero device or a model. Nemotron's op tests stay `zig build -Dxpu xpu-tests`.
 
 The OpenCL C kernels are compiled by `ocloc` for `-Dxpu-device` (default `bmg`). The prompt GEMMs are generated as
 ISA by nGEN at build time (`zig/tools/xpu/w4_ngen.cpp`); everything is embedded in the executable.
+
+Host gates run in `zig build test`: `test-xpu-eaq` (the EAQ reader on synthetic packs), `test-exl3-encode` (the
+trellis encoder's reference) and `test-exl3-ldlq` (the fp64 block-LDLQ arbiter). `zig build eaq-repack` installs
+`tf-eaq-repack`, which rewrites a stock EXL3 directory into an EAQ pack.
+
+### Fresh quantization and the KL gate
+
+`xpu-eaq-quant` runs the fresh-quant pipeline from a bf16 source directory to an EAQ pack (calibration capture,
+Hessians, block LDL and LDLQ, then the pack writer); `xpu-eaq-kl` scores a pack on held-out eval rows against a
+reference logits file, or against itself with `--self`:
+
+```sh
+xpu-eaq-quant SRC OUT --calib rows.i32 --rows 100 --cols 2048 --bits 3 --head-bits 4 --seed 1
+xpu-eaq-kl OUT --prompts eval.i32 --ref ref_logits.f32 --report kl.json
+```
+
+Both use the same `ocloc`, C++17 compiler and nGEN headers as `xpu-qwen27`; their `--help` text lists the options.
 
 ## Running
 
@@ -122,18 +141,26 @@ DPAS. The gate|up GEMM alone sustains 146 TFLOPS fp16 and ~209 TOPS in int8.
 | File | Role |
 |---|---|
 | `zig/src/xpu/ze.zig` | Level Zero access: memory, modules, kernels, command lists |
-| `zig/src/xpu/qwen27.zig` | The model: loading (MLX, GPTQ), layer-by-layer forward, `Runner` (`prompt`, `step`, `verify`, `verifyTree`, `commit`, `commitPath`; slots `select`, `verifyMulti`, `keepMulti`) |
+| `zig/src/xpu/qwen27.zig` | The model: loading (MLX, GPTQ, EXL3, EAQ), layer-by-layer forward, `Runner` (`prompt`, `step`, `verify`, `verifyTree`, `commit`, `commitPath`; slots `select`, `verifyMulti`, `keepMulti`) |
 | `zig/src/xpu/drafter.zig` | DFlash2: tap context, proposed block, selector, best-first tree, `treeRound` |
 | `zig/src/native/xpu.zig` | The hook into the server: the "lanes" host for every `--parallel` |
 | `zig/src/native/xpu_lanes.zig` | The `lanes` backend: slots, shared rounds (`verifyMulti`, `keepMulti`), lone stream as a tree (`lone`) |
 | `zig/src/xpu/qwen27_main.zig` | Test executable: oracle, contracts, profiles, probes |
-| `zig/kernels/xpu/qwen27/*.cl` | OpenCL C kernels: decode int4 GEMM, chunked and serial GDN, decode attention, norms, SwiGLU, int8 quantization, drafter |
+| `zig/src/xpu/exl3_encode.zig` | EXL3 trellis encoder on the card: `Encoder`, `queryLimits`, the 32-byte per-tile statistics |
+| `zig/src/xpu/calib.zig` | Calibration capture: fp16 weight slabs, the five linear-input sites, fp32 Hessians |
+| `zig/src/xpu/ldlq.zig` | Block LDLQ: one part at a time, strips, encoder launches, rank-16 feedback, `PartReport` |
+| `zig/src/xpu/kl.zig`, `kl_main.zig`, `kl_stats.zig` | The KL gate: candidate logits over the eval rows, the fp64 statistic, the `xpu-eaq-kl` CLI |
+| `zig/src/xpu/quant.zig`, `quant_main.zig` | The fresh-quant pipeline and the `xpu-eaq-quant` CLI |
+| `zig/src/core/exl3_encode.zig`, `eaq_write.zig`, `exl3_ldl.zig`, `exl3_ldlq_ref.zig` | Host references and the pack writer: the scalar Viterbi encoder, the EAQ writer, fp64 block LDL and the fp64 LDLQ arbiter |
+| `zig/build/xpu_kl.zig`, `xpu_quant.zig`, `xpu_eaq_host.zig` | Build steps and host gates for the KL gate, the quantizer and the EAQ reader/encoder |
+| `zig/kernels/xpu/qwen27/*.cl` | OpenCL C kernels: decode int4 GEMM, chunked and serial GDN, decode attention, norms, SwiGLU, int8 quantization, drafter, EXL3 decode/prompt, the trellis encoder, calibration, LDLQ, the KL head GEMM |
+| `zig/kernels/xpu/qwen27/exl3_enc.cl`, `calib.cl`, `ldlq.cl`, `eaq_kl.cl` | The fresh-quant kernels: the tail-biting Viterbi encoder, slab upload/transpose/fp32 Hessian GEMM, the LDLQ strip/feedback/eta kernels and the KL gate's fp32-output head GEMM |
 | `zig/kernels/xpu/qwen27/decode.cl` (`attn_prompt`, `attn_prompt8`) | Prompt attention: FlashAttention-2 on DPAS in oneDNN's orientation (S = K·Qᵀ, one query per lane, softmax within the lane); bf16 or int8 cache |
 | `zig/tools/xpu/w4_ngen.cpp`, `w4_prompt.hpp`, `w4a8_prompt.hpp` | nGEN generator of the prompt GEMMs: int4 fp16 (`w4g_dpb`, `w4g_s4dpb`, SwiGLU epilogue), W4A8 (`w4a8`) and W4A4 (`w4a4`) |
 | `zig/build/xpu.zig` | Build steps |
 
-No core file is modified: the backend uses the core's lane host and its lone driver (`Lone.resumes`) as they are;
-`build.zig` only adds the XPU steps.
+The port adds its own core modules and their exports; the core's lane host and lone driver (`Lone.resumes`) are used
+as they are. `build.zig` only adds the XPU steps.
 
 ## Test executable
 
@@ -154,10 +181,16 @@ xpu-qwen27 MODEL --bench=4096 2      # synthetic prompt of 4,096 tokens (caution
 | `XPU_CHUNK`, `XPU_CTX` | rows per prompt chunk (1,024), context (4,096) |
 | `XPU_OVERLAP_PROBE`, `XPU_GEMM_ZEBIN`, `XPU_A8_ZEBIN` (+ `XPU_A8_PROJ`) | probes: GEMM/GDN overlap, fp16 or W4A8 GEMM in a loop |
 
+`xpu-qwen27 --enc-probe` runs the trellis encoder's device checks (limits, self-consistency, host parity at seven
+widths, exact dequant, throughput); `xpu-qwen27 --calib-probe PACK_DIR IDS_FILE` runs the calibration capture and
+Hessian gates; `tf-xpu-qwen27-ldlq-test` (from `zig build xpu-qwen27-tests`) runs the block-LDLQ checks.
+
 ## Limitations
 
 - A single model: the 27B dimensions are constants (`qwen27.zig`) and some shapes are written into the kernels (GDN
   of 128, attention of 256, head ratio 6).
 - On very repetitive text, where copies are enough, the drafter pass of the shared rounds costs a few percent at 4-8
   streams. No response resume yet (`decode_chunk`).
-- 4-bit formats only (MLX g64, symmetric GPTQ g128). W4A8 requires GPTQ g128.
+- The serving formats are MLX affine 4-bit g64, symmetric GPTQ 4-bit g128, and EXL3/EAQ `mul1` trellis packs at any
+  width from 1 to 8 bits, `mul1` half steps (odd halves) included. The frozen fp32 probe kernels stay at whole bits.
+  W4A8 requires GPTQ g128; W4A4 needs rotated weights and W4A8.

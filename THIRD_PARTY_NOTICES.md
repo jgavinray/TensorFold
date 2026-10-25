@@ -317,6 +317,17 @@ TensorFold. What they follow or copy:
   MIT License, Copyright © 2025 Turboderp; see [the license text](LICENSES/MIT.txt). The device kernels
   `zig/kernels/xpu/qwen27/exl3.cl` and `exl3_h.cl` are TensorFold's, written to that format spec. The engine runs
   none of ExLlamaV3's code and bundles no captured kernel binaries or model weights.
+- The fresh-quant path's trellis encoder, block LDL and block LDLQ follow QTIP's formulation as ExLlamaV3 carries it.
+  `zig/src/core/exl3_encode.zig`, `zig/src/xpu/exl3_encode.zig` and `zig/kernels/xpu/qwen27/exl3_enc.cl` implement
+  QTIP's tail-biting Viterbi search, applied to ExLlamaV3's `mul1` ring trellis; `zig/src/core/exl3_ldl.zig`
+  implements its block LDL factorization; and `zig/src/xpu/ldlq.zig`, `zig/kernels/xpu/qwen27/ldlq.cl` and
+  `zig/src/core/exl3_ldlq_ref.zig` implement its last-to-first block LDLQ feedback. QTIP is Cornell RelaxML's
+  ([qtip](https://github.com/Cornell-RelaxML/qtip), [arXiv 2406.11235](https://arxiv.org/abs/2406.11235);
+  "QTIP: Quantization with Trellises and Incoherence Processing", NeurIPS 2024), and
+  ExLlamaV3's MIT-licensed implementation carries the same formulation under the Turboderp attribution above.
+  TensorFold's encoder, LDL and LDLQ code is its own, written to the formulation and checked against its own host
+  references; no QTIP code is included or linked. QTIP's code is licensed under the
+  [GNU GPL v3](https://github.com/Cornell-RelaxML/qtip/blob/main/LICENSE).
 
 ## Fish Audio Drama 3 on CUDA
 

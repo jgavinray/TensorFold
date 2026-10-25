@@ -7,10 +7,12 @@ GLM-5.3-Flash.
 ## Where it stands
 
 - The native engine has the format and a reference decoder in core (`zig/src/core/exl3_format.zig`, @akol1, #496),
-  and Metal has a standalone EXL3 projection (`zig/src/core/exl3_projection.zig`, @akol1, #681). No model serves an
-  EXL3 checkpoint in this release.
-- CUDA projections and routed experts on this format are in review (#740, #741, #806). A model needs them and a loader
-  for its EXL3 tensors before it can serve a checkpoint; the 27B on CUDA is the first planned.
+  and Metal has a standalone EXL3 projection (`zig/src/core/exl3_projection.zig`, @akol1, #681). The Intel XPU
+  engine's 27B runner reads stock EXL3 packs and EAQ containers (full-checkpoint device qualification is pending),
+  and its fresh-quant path carries a tail-biting Viterbi encoder (`zig/src/core/exl3_encode.zig`,
+  `zig/kernels/xpu/qwen27/exl3_enc.cl`).
+- CUDA projections and routed experts on this format are in the native CUDA build (#740, #741, #806); GLM-5.3-Flash's
+  two-rank engine runs its routed experts on them. The 27B's native CUDA path does not read EXL3 yet.
 - The Python engine served EXL3 on CUDA from 0.3.6 to 0.6.6 through the module @vcruz305 wrote (#42): every codebook,
   widths 1 to 8 mixed per tensor, a row-invariant linear for 1 to 128 rows, and grouped routed experts, for the 27B,
   Flash Next and mixed-width packs. It is at the
@@ -209,5 +211,6 @@ under real routing) included. The program that records them runs the Python engi
 NCCL (output-column cuts, input-row cuts with fp32 partials summed rank 0 first, and the experts' intermediate cut)
 and checks every rank's bytes and the sums the same way.
 
-No family serves EXL3 natively yet: the Metal projection (#681) and these CUDA pieces are what a family's engine
-takes, through `qlinear` and `exl3_experts`.
+The Intel XPU 27B runner serves EXL3 natively, and on CUDA GLM-5.3-Flash's two-rank engine runs the common EXL3
+operators; the Metal projection (#681) and these CUDA pieces are what a family's engine takes, through `qlinear` and
+`exl3_experts`.

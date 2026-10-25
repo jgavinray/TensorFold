@@ -17,13 +17,21 @@ nGEN, and is embedded in the executables.
 | [`zig/src/xpu/ze.zig`](../../zig/src/xpu/ze.zig) | Level Zero binding: device (found by PCI id), memory, modules, kernels, in-order command lists, kernel timestamps. A missing symbol or a failed call stops everything. |
 | [`zig/src/xpu/qwen27.zig`](../../zig/src/xpu/qwen27.zig) | The model's shape and `Runner`, the object the host drives (prompt, step, verify, commit, slots). |
 | [`zig/src/xpu/dev.zig`](../../zig/src/xpu/dev.zig) | Safetensors reader (mmap), the Level Zero device wrapper (`Dev`), kernel profiling. |
-| [`zig/src/xpu/load.zig`](../../zig/src/xpu/load.zig) | Weights onto the device: int4 projections (MLX and GPTQ) and the layer table. |
+| [`zig/src/xpu/load.zig`](../../zig/src/xpu/load.zig) | Weights onto the device: int4 projections (MLX and GPTQ), EXL3/EAQ trellis parts and the layer table. |
 | [`zig/src/xpu/forward.zig`](../../zig/src/xpu/forward.zig) | Activations, prompt GEMM dispatch (fp16, W4A8, W4A4) and `forward`, one pass over the layers. |
 | [`zig/src/xpu/runner_multi.zig`](../../zig/src/xpu/runner_multi.zig) | Shared verify rounds across slots (`verifyMulti`, `keepPaths`, `stepMulti`). |
 | [`zig/src/xpu/slot_states.zig`](../../zig/src/xpu/slot_states.zig) | Slot state allocation and the prompt cache's snapshots (`saveSlot`, `restoreSlot`). |
 | [`zig/src/xpu/drafter.zig`](../../zig/src/xpu/drafter.zig) | The DFlash2 drafter: per-slot contexts, batched lattice. |
 | [`zig/src/xpu/drafter_tree.zig`](../../zig/src/xpu/drafter_tree.zig) | The draft tree policy (best-first search over the lattice) and `treeRound`. |
 | [`zig/src/xpu/qwen27_main.zig`](../../zig/src/xpu/qwen27_main.zig) | The `xpu-qwen27` test and profiling executable. |
+| [`zig/src/xpu/exl3_encode.zig`](../../zig/src/xpu/exl3_encode.zig) | The EXL3 tail-biting Viterbi encoder on the card: `Encoder`, `queryLimits`, the 32-byte per-tile statistics. |
+| [`zig/src/xpu/calib.zig`](../../zig/src/xpu/calib.zig) | The quantizer's calibration capture: fp16 weight slabs, the five linear-input sites, fp32 Hessians. |
+| [`zig/src/xpu/ldlq.zig`](../../zig/src/xpu/ldlq.zig) | Block LDLQ: the per-part strip/encode/feedback loop and `PartReport`. |
+| [`zig/src/xpu/kl.zig`](../../zig/src/xpu/kl.zig), [`kl_main.zig`](../../zig/src/xpu/kl_main.zig), [`kl_stats.zig`](../../zig/src/xpu/kl_stats.zig) | The KL gate: candidate logits over the eval rows, the fp64 statistic and the `xpu-eaq-kl` CLI. |
+| [`zig/src/xpu/quant.zig`](../../zig/src/xpu/quant.zig), [`quant_main.zig`](../../zig/src/xpu/quant_main.zig) | The fresh-quant pipeline and the `xpu-eaq-quant` CLI. |
+| [`zig/src/core/exl3_encode.zig`](../../zig/src/core/exl3_encode.zig), [`eaq_write.zig`](../../zig/src/core/eaq_write.zig), [`exl3_ldl.zig`](../../zig/src/core/exl3_ldl.zig), [`exl3_ldlq_ref.zig`](../../zig/src/core/exl3_ldlq_ref.zig) | Host references and the EAQ writer: the scalar Viterbi encoder, the pack writer, fp64 block LDL and the fp64 LDLQ arbiter. |
+| [`zig/build/xpu_kl.zig`](../../zig/build/xpu_kl.zig), [`xpu_quant.zig`](../../zig/build/xpu_quant.zig), [`xpu_eaq_host.zig`](../../zig/build/xpu_eaq_host.zig) | Build steps and host gates for the KL gate, the quantizer and the EAQ reader/encoder. |
+| [`zig/tools/xpu/calib_evalprompts.py`](../../zig/tools/xpu/calib_evalprompts.py) | Builds the KL gate's held-out eval rows; the calibration corpus enumeration, tokenizer path and caps are inlined from `calib_tokenize.py`, so it runs from this repository on the calibration host with the mlx-ref venv. |
 | [`zig/src/native/xpu.zig`](../../zig/src/native/xpu.zig) | The server's entry point for the XPU engine (`open`), the lane host's setup and the prompt cache's hooks. |
 | [`zig/src/native/xpu_lanes.zig`](../../zig/src/native/xpu_lanes.zig) | The **lane host** backend (`--parallel N`): slots, shared rounds, lone driver, structured output. |
 | [`zig/kernels/xpu/qwen27/*.cl`](../../zig/kernels/xpu/qwen27) | OpenCL C kernels (section 5); `glue.cl` includes `glue_attn.cl` and `glue_quant.cl`. |
@@ -33,8 +41,8 @@ nGEN, and is embedded in the executables.
 | [`tools/xpu/`](../../tools/xpu) | Quality studies: `a8_study.py` (W4A8), `head_study.py` (the requantized output head). |
 | [`tools/bench_openai.py`](../../tools/bench_openai.py), [`tools/bench_concurrent.py`](../../tools/bench_concurrent.py) | Server benches; `bench_concurrent.py --alone --serial` also checks the bit-for-bit contracts end to end. |
 
-The port modifies no core file: it plugs into the core's lane host and its lone driver (`Lone.resumes`) as they
-are; `build.zig` only adds the XPU steps.
+The port adds its own core modules and their exports; the core's lane host and lone driver (`Lone.resumes`) are
+used as they are. `build.zig` only adds the XPU steps.
 
 ## 2. Building
 
@@ -45,6 +53,8 @@ headers of oneDNN.
 ```sh
 zig build xpu-native -Doptimize=ReleaseFast -Dngen-include=<path to ngen>   # zig-out/xpu/bin/tensorfold-native
 zig build xpu-qwen27 -Doptimize=ReleaseFast -Dngen-include=<path to ngen>   # test executable xpu-qwen27
+zig build xpu-eaq-quant -Doptimize=ReleaseFast -Dngen-include=<path to ngen> # zig-out/bin/xpu-eaq-quant
+zig build xpu-eaq-kl    -Doptimize=ReleaseFast -Dngen-include=<path to ngen> # zig-out/bin/xpu-eaq-kl
 zig build grammar    -Dxgrammar=<xgrammar checkout>                         # libtfgrammar, structured output
 ```
 
@@ -52,15 +62,19 @@ Build options defined in [`zig/build/xpu.zig`](../../zig/build/xpu.zig) and
 [`zig/build/grammar.zig`](../../zig/build/grammar.zig): `-Docloc=` (default `ocloc`), `-Dxpu-device=` (default `bmg`,
 the `ocloc` device name), `-Dngen-include=` (default `ngen`), `-Dxgrammar=`.
 
-What the two XPU steps do (they share the same embedded kernels):
+What the serving XPU steps do (they share the same embedded kernels):
 
-1. Each `.cl` file is compiled by `ocloc` with `-cl-std=CL3.0 -cl-intel-256-GRF-per-thread`:
-   `glue`, `decode`, `gemm` (with `-DGSZ=64`), `gemm128` (the same file with `-DGSZ=128`), `gdn` (from
-   `gdn_chunk.cl`) and `drafter`.
+1. Each `.cl` file is compiled by `ocloc` with `-cl-std=CL3.0`: `glue`, `decode`, `exl3`, `exl3_h`, `exl3_enc`,
+   `calib`, `ldlq`, `gemm` (with `-DGSZ=64`), `gemm128` (the same file with `-DGSZ=128`), `gdn` (from
+   `gdn_chunk.cl`) and `drafter`. The serving kernels get `-cl-intel-256-GRF-per-thread`; the memory-bound exl3
+   family (`exl3`, `exl3_h`, `exl3_enc`, `calib`, `ldlq` and the KL gate's `eaq_kl`) is compiled without it.
 2. `w4_ngen.cpp` is built for the host and **run at build time** to produce the nine prompt-GEMM binaries (zebin):
    `ngen_wide`, `ngen_narrow`, `ngen_wide128`, `ngen_narrow128`, `ngen_swiglu`, `ngen_swiglu128`, `ngen_a8`,
    `ngen_a8_swiglu`, `ngen_a4` (the options each gets are listed in `zig/build/xpu.zig`).
 3. Everything is embedded with `@embedFile` into the `xpu_qwen27_kernels` module that `qwen27.zig` imports as `kb`.
+
+The quantizer and the KL gate compile their own image lists in `zig/build/xpu_quant.zig` and `zig/build/xpu_kl.zig`,
+mirroring the serving list plus `eaq_kl.cl` for the gate.
 
 `xpu-native` is `tensorfold-native` with the XPU engines linked in (`native/xpu.zig`).
 
@@ -79,16 +93,19 @@ refused and everything else works.
 1. Reads the option variables (section 9) into module-level switches.
 2. Looks for a file named `hadamard128` in the checkpoint directory: if present, the weights are Hadamard-rotated
    (`rot_on`) and every GEMM input is rotated where it is produced.
-3. Memory-maps the safetensors shards listed in `model.safetensors.index.json`.
+3. Memory-maps the checkpoint: an EAQ pack's manifest shards after `Checkpoint.openEaq` has run the reader's
+   `openPack` and `map` verdicts (family, manifest hash, marker, every shard's size and sha256, a complete layer
+   table); otherwise the safetensors shards listed in `model.safetensors.index.json`.
 4. Opens the Level Zero device whose PCI id is `0xe223` (the B70), creates one in-order immediate command list, loads
    the embedded modules and creates every kernel with its work-group size.
 5. Calls `load`, which picks the format from the tensors: a checkpoint with `in_proj_qkv.qweight` is **GPTQ**
-   (`GS = 128`, `loadGptq`), otherwise **MLX affine** (`GS = 64`). Projections are repacked on the GPU into the GEMM
-   layout (`repack`, `repack_gptq`); in the GPTQ case the output head is requantized to affine 4/64 with MLX's
-   algorithm (`quantize_mlx`).
+   (`GS = 128`, `loadGptq`); one with EXL3 trellis groups is **EXL3** (`GS = 64`, `loadExl3`), and an EAQ pack's
+   trellis parts take that path too; otherwise **MLX affine** (`GS = 64`). Projections are repacked on the GPU into
+   the GEMM layout (`repack`, `repack_gptq`); in the GPTQ case the output head is requantized to affine 4/64 with
+   MLX's algorithm (`quantize_mlx`).
 6. Allocates the activations (`Acts`) and slot 0's states.
 
-A `Proj` is one fused projection in GEMM layout: packed words `[K/8, N]`, scales and biases `[K/gs, N]`, `N` padded
+An int4 `Proj` is one fused projection in GEMM layout: packed words `[K/8, N]`, scales and biases `[K/gs, N]`, `N` padded
 to the 256-column tile, and a `wide` flag (wide shapes use the GEMM family without K slices, narrow ones the sliced
 family; see section 5). Projections are fused by stacking on N: gate|up (interleaved by blocks of 16 columns so the
 prompt GEMM can apply SwiGLU in its epilogue), q|k|v, the GDN input projections.
@@ -188,6 +205,12 @@ conventions in its header comment; read those before changing a reduction order.
 | | `kv_move` | Moves a kept path's K/V rows to consecutive positions, in depth order. |
 | | `attn_prompt`, `attn_prompt8` | Prompt attention: FlashAttention-2 on DPAS, causal, bf16 cache and int8 cache (Q·Kᵀ in int8 DPAS, P·V in fp16). |
 | | `exl3_gemv` | EXL3 decode probe (speed measurement only; `XPU_EXL3_PROBE`). |
+| `exl3.cl` | `exl3_decode2`, `exl3_decode2_t1`, `exl3_dequant128`, `exl3_prompt16` | The EXL3 decode and prompt paths: the shuffle-free GEMVs, the exact-integer `mul1` block dequant with the fused 128-point rotations and scales, and the fp16 DPAS prompt GEMM. |
+| `exl3_h.cl` | `exl3_decode2_h`, `exl3_decode2_t1_h`, `exl3_dequant128_c`, `exl3_xform_h`, `exl3_yscale_h` | The fp16-output twins of the decode GEMVs, the fused-column-base dequant, and the per-part input rotation (`exl3_xform_h`) and output scale (`exl3_yscale_h`) the runner's EXL3 forward uses. |
+| `exl3_enc.cl` | `exl3_encode` | The tail-biting Viterbi encoder: two pinned passes over the 65,536-state `mul1` ring, ping-pong costs, pass-2 back-pointers, the packed ring and the 32-byte per-tile statistics; the optional WHAT output writes the decoded values for LDLQ. |
+| `calib.cl` | `bf16_to_slab`, `transpose16`, `exl3_syrk32` | The quantizer's calibration kernels: dense bf16 weights into an fp16 slab, the captured rows' transpose (rows past T zeroed) and the fp32 `H += X^T X` accumulation over the lower 128x128 tiles. |
+| `ldlq.cl` | `strip_f16`, `strip_diff`, `ldlq_update`, `ldlq_eta`, `strip_decode` | Block LDLQ: the fp16 target strip with its clamp counter, the error against the original weight, the rank-16 feedback, the eta reduction and the standalone strip decoder. |
+| `eaq_kl.cl` | `eaq_gemm32`, `eaq_copy16` | The KL gate's fp32-output head GEMM (`exl3_prompt16`'s tile with a float C store) and the same-list copy that makes the GEMM's A rows resident. |
 | `gdn_chunk.cl` | `gdn_prep`, `gdn_state`, `gdn_out` | Chunked GDN for prompts (64-token chunks on bf16 DPAS, state in fp32): per-chunk preparation, the serial state recurrence across chunks, and the output. |
 | `gemm.cl` | `w4_*`, `w4n_*`, `w4s3_*`, `w4k*` | Weight-only int4 GEMM families, compiled for group 64 or 128. The retained decode/verification kernels are `w4k1_decode`, `w4k1_d64` (wide shapes) and `w4k_dsplit` (narrow); the others are earlier families and sweeps kept as references (`w4_*` is the g64 fp16-dequantization reference). `rowsum`, `rowsum_hl` and `w4s3_reduce` are helpers. |
 | `drafter.cl` | `dconv`, `dprep`, `dattn`, `rowsums_rows`, `taps_in`, `to_res`, `topk_part`, `quantize4` | DFlash2: grouped two-tap dynamic convolution, q/k/v preparation with a ring cache, block attention, tap handling, top-16 of the logits rows, load-time int4 quantization. |
@@ -294,6 +317,9 @@ Test-runner-only variables (`qwen27_main.zig`): `XPU_DRAFTER=DIR` (drafted decod
 `XPU_VERIFY_TEST`, `XPU_MULTI_TEST=N`, `XPU_ROWS_PROBE`, `XPU_OVERLAP_PROBE`, `XPU_EXL3_PROBE`,
 `XPU_GEMM_ZEBIN`, `XPU_A8_ZEBIN` with `XPU_A8_PROJ` (`gu`, `in`, `out`, `down`). Section 10 describes the tests.
 
+The quantizer's host LDL reads `EAQ_LDL_THREADS` (worker count), `EAQ_LDL_PANEL` (Cholesky panel width, a multiple of
+16) and `EAQ_LDL_PHASES=1` (a per-call phase breakdown); `EAQ_LDL_TIMING=1` enables the factorization timing test.
+
 ## 10. The test runner and the correctness contracts
 
 ```sh
@@ -319,6 +345,12 @@ The server-level versions of the same contracts are run with
 [`tools/bench_concurrent.py`](../../tools/bench_concurrent.py) `--alone --serial`: every concurrent reply's token hash
 must equal the same request alone, and the alone run must equal the same request with `"draft": false`, for greedy and
 sampled requests. `zig build test` covers the core.
+
+The fresh-quant gates: `zig build test` runs `test-xpu-eaq` (the EAQ reader on synthetic packs), `test-exl3-encode`
+(the encoder's host reference) and `test-exl3-ldlq` (the fp64 LDLQ arbiter). On the card, `xpu-qwen27 --enc-probe`
+checks the encoder's limits, self-consistency, host parity at seven widths, exact dequant and throughput;
+`--calib-probe PACK_DIR IDS_FILE` checks the capture against the serving forward and the Hessian against a host fp64
+reference; `tf-xpu-qwen27-ldlq-test` (from `zig build xpu-qwen27-tests`) runs the block-LDLQ checks.
 
 When changing a kernel, the quickest honest check is: `xpu-qwen27` with `XPU_VERIFY_TEST=1`,
 `XPU_DRAFTER=<drafter dir> XPU_TREE=15` and `XPU_MULTI_TEST=<n>` on real token ids (not `--bench`), then
