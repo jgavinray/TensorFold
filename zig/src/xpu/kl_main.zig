@@ -34,6 +34,7 @@
 //! Until a reference carries a passing sidecar, every KL table stays void.
 const std = @import("std");
 const kl = @import("kl.zig");
+const band = @import("canary_band.zig"); // the single-source canary band (canary-band-ruling.md)
 
 const usage =
     \\usage: xpu-eaq-kl PACK_DIR --prompts eval.i32 (--ref ref_logits.f32 | --self | --dump-ref out.f32)
@@ -232,6 +233,10 @@ const RefSidecar = struct {
     argmax_mode_frac: f64 = 1,
     distinct_argmax: usize = 0,
     top5_constant: bool = true,
+    heldout_rows: u32 = 0, // 0 = the producer predates row classes: every row is natural
+    watch_rows: []const u32 = &.{},
+    ladder_ref: []const u8 = "",
+    ladder_ok: bool = false,
     pass: bool = false,
 };
 
@@ -270,17 +275,39 @@ fn requireRefSidecar(gpa: std.mem.Allocator, ref_path: []const u8, prompts_path:
         refuse(ref_path, "sidecar {s}: head input is frozen — max cosine(first 64, their mean) {d:.4} >= 0.99", .{ spath, sc.head_input_cosine_max });
     if (sc.canary_row.len != sc.rows)
         refuse(ref_path, "sidecar {s}: canary_row holds {d} values, the dump has {d} rows", .{ spath, sc.canary_row.len, sc.rows });
-    if (sc.canary_agg < 0.45 or sc.canary_agg > 0.85)
-        refuse(ref_path, "sidecar {s}: aggregate teacher-forced top-1 {d:.4} outside the 0.45-0.85 canary band", .{ spath, sc.canary_agg });
+    const heldout: u32 = if (sc.heldout_rows == 0) sc.rows else @min(sc.heldout_rows, sc.rows);
+    { // the aggregate is over the NATURAL rows only (canary-band-ruling.md); recompute so a
+    // sidecar cannot certify an aggregate its own row values do not produce.
+        var sum: f64 = 0;
+        for (sc.canary_row[0..heldout]) |t| sum += t;
+        const agg = sum / @as(f64, @floatFromInt(@max(heldout, 1)));
+        if (@abs(agg - sc.canary_agg) > 1e-6)
+            refuse(ref_path, "sidecar {s}: aggregate {d:.6} is not the mean of its natural rows (recomputed {d:.6})", .{ spath, sc.canary_agg, agg });
+    }
+    if (sc.canary_agg < band.natural_floor or sc.canary_agg > band.natural_watch_high)
+        refuse(ref_path, "sidecar {s}: natural-row aggregate teacher-forced top-1 {d:.4} outside the {d:.2}-{d:.2} canary band", .{ spath, sc.canary_agg, band.natural_floor, band.natural_watch_high });
     for (sc.canary_row, 0..) |v, r| {
-        if (v < 0.45 or v > 0.85) refuse(ref_path, "sidecar {s}: row {d} teacher-forced top-1 {d:.4} outside the 0.45-0.85 canary band", .{ spath, r, v });
+        if (r < heldout) {
+            if (v < band.natural_floor or v > band.natural_ceiling)
+                refuse(ref_path, "sidecar {s}: natural row {d} teacher-forced top-1 {d:.4} outside the {d:.2}-{d:.2} canary band", .{ spath, r, v, band.natural_floor, band.natural_ceiling });
+        } else {
+            if (v > band.random_fabrication_ceiling)
+                refuse(ref_path, "sidecar {s}: random probe row {d} teacher-forced top-1 {d:.4} > {d:.2} — random tokens must predict nothing (fabrication)", .{ spath, r, v, band.random_fabrication_ceiling });
+            if (r < sc.nll_row.len and sc.nll_row[r] < band.random_nll_floor)
+                refuse(ref_path, "sidecar {s}: random probe row {d} mean teacher-forced NLL {d:.3} < {d:.2} = ln V - 2 — fabrication signature", .{ spath, r, sc.nll_row[r], band.random_nll_floor });
+        }
+    }
+    for (sc.canary_row[0..heldout]) |v| {
+        if ((v < band.natural_watch_low or v > band.natural_watch_high) and (!sc.ladder_ok or sc.ladder_ref.len == 0))
+            refuse(ref_path, "sidecar {s}: a natural row sits outside the {d:.2}-{d:.2} unwatched band and the torch-oracle ladder has not endorsed the reference (ladder_ok {}, ladder_ref '{s}') — run the ladder and republish", .{
+                spath, band.natural_watch_low, band.natural_watch_high, sc.ladder_ok, sc.ladder_ref });
     }
     if (sc.nll_row.len != sc.rows)
         refuse(ref_path, "sidecar {s}: nll_row holds {d} values, the dump has {d} rows", .{ spath, sc.nll_row.len, sc.rows });
-    if (sc.nll_mean >= 4.0)
-        refuse(ref_path, "sidecar {s}: mean teacher-forced NLL {d:.3} >= 4 nats", .{ spath, sc.nll_mean });
-    for (sc.nll_row, 0..) |v, r| {
-        if (v > 6.0) refuse(ref_path, "sidecar {s}: row {d} mean teacher-forced NLL {d:.3} > 6 nats", .{ spath, r, v });
+    if (sc.nll_mean >= band.nll_mean_ceiling)
+        refuse(ref_path, "sidecar {s}: natural-row mean teacher-forced NLL {d:.3} >= {d:.1} nats", .{ spath, sc.nll_mean, band.nll_mean_ceiling });
+    for (sc.nll_row[0..heldout], 0..) |v, r| {
+        if (v > band.nll_row_ceiling) refuse(ref_path, "sidecar {s}: row {d} mean teacher-forced NLL {d:.3} > {d:.0} nats", .{ spath, r, v, band.nll_row_ceiling });
     }
     if (sc.argmax_mode_frac >= 0.10)
         refuse(ref_path, "sidecar {s}: argmax mode covers {d:.4} of positions >= 0.10 (no-invariance)", .{ spath, sc.argmax_mode_frac });

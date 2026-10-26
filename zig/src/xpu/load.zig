@@ -452,7 +452,7 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
     }
     m.embed_s = null;
     m.embed_b = null;
-    m.norm = try vecTensor(d, c, "model.norm.weight", false);
+    m.norm = try vecTensor(d, c, "model.norm.weight", true); // the Qwen3_5 norm is x·rsqrt·(1+w): both packs store gamma − 1 verbatim
     if (head_g != null) {
         m.head = try exl3_model.projectionExl3(d, c, "lm_head", &.{""}, true, 0, true);
     } else {
@@ -472,12 +472,12 @@ pub fn loadExl3(d: *Dev, c: *const Checkpoint) !Model {
                 return std.fmt.allocPrint(alloc, "{s}{s}", .{ pp, sx }) catch unreachable;
             }
         }.n;
-        l.* = .{ .in_norm = try vecTensor(d, c, f(p, "input_layernorm.weight"), false), .post_norm = try vecTensor(d, c, f(p, "post_attention_layernorm.weight"), false), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try exl3_model.projectionExl3(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, 0, false), .down = try exl3_model.projectionExl3(d, c, f(p, "mlp."), &.{"down_proj"}, false, 0, false) };
+        l.* = .{ .in_norm = try vecTensor(d, c, f(p, "input_layernorm.weight"), true), .post_norm = try vecTensor(d, c, f(p, "post_attention_layernorm.weight"), true), .attn = isAttention(i), .mixer_in = undefined, .mixer_out = undefined, .gu = try exl3_model.projectionExl3(d, c, f(p, "mlp."), &.{ "gate_proj", "up_proj" }, true, 0, false), .down = try exl3_model.projectionExl3(d, c, f(p, "mlp."), &.{"down_proj"}, false, 0, false) };
         if (l.attn) {
             l.mixer_in = try exl3_model.projectionExl3(d, c, f(p, "self_attn."), &.{ "q_proj", "k_proj", "v_proj" }, true, 0, false);
             l.mixer_out = try exl3_model.projectionExl3(d, c, f(p, "self_attn."), &.{"o_proj"}, false, 0, false);
-            l.qn = try vecTensor(d, c, f(p, "self_attn.q_norm.weight"), false);
-            l.kn = try vecTensor(d, c, f(p, "self_attn.k_norm.weight"), false);
+            l.qn = try vecTensor(d, c, f(p, "self_attn.q_norm.weight"), true);
+            l.kn = try vecTensor(d, c, f(p, "self_attn.k_norm.weight"), true);
             l.kc = try d.alloc_(kvBytes());
             l.vc = try d.alloc_(kvBytes());
         } else {

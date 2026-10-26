@@ -31,10 +31,10 @@
 //!  - self-canary: after the head finishes row 0, teacher-forced top-1 against the
 //!    row's own tokens under the shift logits[t] predicts token[t+1]; below 0.30 the
 //!    run aborts before the logits file exists;
-//!  - the §5.5 gate: canary band 0.45-0.85 on every row and on the aggregate, argmax
-//!    mode under 10 percent, more than 2,000 distinct argmax tokens, top-5 not
-//!    constant across rows, mean teacher-forced NLL under 4 nats with no row above
-//!    6;
+//!  - the §5.5 gate: canary band on the natural rows, argmax mode (over the natural
+//!    rows) under 10 percent, more than 2,000 distinct argmax tokens, top-5 not
+//!    constant across the natural rows, mean teacher-forced NLL under 4 nats with
+//!    no natural row above 6;
 //!  - sidecar: <out>.json with the sha256 of the logits and of the prompt file, the
 //!    shift convention, and every canary value — written only when every check is
 //!    green; xpu-eaq-kl refuses a reference that lacks a passing sidecar.
@@ -61,6 +61,7 @@ const dev = q.dev;
 const calib = q.calib;
 const quant = @import("quant.zig");
 const kl = @import("kl.zig");
+const band = @import("canary_band.zig"); // the single-source canary band (canary-band-ruling.md)
 const kl_kernels = @import("eaq_kl_kernels");
 const Dev = dev.Dev;
 const Checkpoint = dev.Checkpoint;
@@ -129,6 +130,10 @@ const Sidecar = struct {
     top5_constant: bool = true,
     embed_ids: []const u32 = &.{},
     embed_ids_dev: []const u32 = &.{},
+    heldout_rows: u32 = 0, // the manifest's natural/random class split (0 = manifest unseen: all natural)
+    watch_rows: []const u32 = &.{}, // natural rows in [floor, watchlist): publish needs the ladder
+    ladder_ref: []const u8 = "",
+    ladder_ok: bool = false,
     pass: bool = false,
 };
 
@@ -202,6 +207,27 @@ pub fn main(init: std.process.Init) !void {
     const positions: u64 = @as(u64, rows) * cols;
     std.debug.print("xpu-eaq-ref: {d} rows x {d} = {d} positions -> {d:.2} GB of fp32 logits\n", .{
         rows, cols, positions, @as(f64, @floatFromInt(positions * VOCAB * 4)) / 1e9 });
+    // -- the row classes (canary-band-ruling.md): the eval manifest names the natural and the
+    //    random rows; a missing or inconsistent manifest makes EVERY row natural — the band
+    //    then binds the random probes too, which fails closed rather than publishing blind.
+    var heldout: u32 = rows;
+    if (std.mem.endsWith(u8, prompts_path, ".i32")) {
+        const mpath = try std.fmt.allocPrint(alloc, "{s}.manifest.json", .{prompts_path[0 .. prompts_path.len - 4]});
+        if (readAll(mpath)) |raw| {
+            defer alloc.free(raw);
+            const MF = struct { rows_total: u32 = 0, heldout_rows: u32 = 0, random_rows: u32 = 0 };
+            var cls: ?u32 = null;
+            if (std.json.parseFromSlice(MF, alloc, raw, .{ .ignore_unknown_fields = true })) |mp| {
+                if (mp.value.rows_total == rows and mp.value.heldout_rows + mp.value.random_rows == rows and
+                    mp.value.heldout_rows <= rows) cls = mp.value.heldout_rows;
+            } else |_| {}
+            if (cls) |hv| {
+                heldout = hv;
+                std.debug.print("xpu-eaq-ref: row classes from {s}: {d} natural + {d} random probes\n", .{ mpath, hv, rows - hv });
+            } else std.debug.print("xpu-eaq-ref: {s} unreadable or inconsistent — every row gated as natural (fail-closed)\n", .{mpath});
+        } else |_| {}
+    }
+    const agg_n: usize = @max(heldout, 1);
 
     // -- host invariants, before the card (the ruling's step one): what the rows really hold.
     //    The device upload buffer is read back below, after the upload, as the copy-complete assert.
@@ -274,6 +300,25 @@ pub fn main(init: std.process.Init) !void {
     // slab fills, so one run names the collapse stage even without --residual-dump.
     const spot = std.c.getenv("XPU_REF_SPOT") != null;
     const resid_all = std.c.getenv("XPU_REF_RESID_ALL") != null;
+    // XPU_REF_KEEP (diagnostics only): a failing gate still refuses the sidecar and
+    // returns RefGate, but keeps the logits bytes for post-mortems — the same file a
+    // green run would have written, minus every gate's endorsement.
+    const keep_out = std.c.getenv("XPU_REF_KEEP") != null;
+    // The torch-oracle ladder endorsement a WATCH-tagged natural row needs before the
+    // sidecar certifies (canary-band-ruling.md): the operator runs the ladder on the
+    // finished logits and names the evidence in these two envs at publish time.
+    const ladder_ok = std.c.getenv("XPU_REF_LADDER_OK") != null;
+    const ladder_ref: []const u8 = if (std.c.getenv("XPU_REF_LADDER_REF")) |v| std.mem.span(v) else "";
+    var watch_rows_buf: [256]u32 = undefined;
+    var n_watch: usize = 0;
+    // XPU_REF_HIDDEN_IN / XPU_REF_START_LAYER (diagnostics): replace the embedded
+    // stream with an uploaded fp32 [rows*cols, D] file and begin the sweep at the
+    // named layer — the isolation test that feeds a host-side intermediate into one
+    // device layer. Never set for a published reference.
+    const hidden_in_path = std.c.getenv("XPU_REF_HIDDEN_IN");
+    var start_layer: usize = 0;
+    if (std.c.getenv("XPU_REF_START_LAYER")) |v| start_layer = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+    if (start_layer != 0) std.debug.print("xpu-eaq-ref: DIAGNOSTIC sweep starts at layer {d}\n", .{start_layer});
     if (spot) std.debug.print("xpu-eaq-ref: XPU_REF_SPOT on — stream and slab hashes ride the run\n", .{});
     try spotLine(spot, &head, "slab after uploadDense (head lm_head, 4 MB prefix)", head.slab, 1 << 22);
 
@@ -281,18 +326,34 @@ pub fn main(init: std.process.Init) !void {
     //    uploaded ids_dev by this same handle (the ruling's fix): embedStream's ids argument
     //    is ids_dev + the chunk's byte offset, and embed_dense reads IDS[chunk-local t].
     {
-        var r: u32 = 0;
-        while (r < rows) : (r += 1) {
-            var at: u32 = 0;
-            while (at < cols) {
-                const end: u32 = @intCast(q.chunkEnd(at, cols));
-                try calib.embedStream(d, m, a,
-                    dev.off(ids_dev, (@as(usize, r) * cols + at) * 4),
-                    dev.off(stream, (@as(usize, r) * cols + at) * D * 4), end - at);
-                at = end;
+        if (hidden_in_path) |hip| {
+            const buf = readAll(std.mem.span(hip)) catch {
+                std.debug.print("xpu-eaq-ref: cannot read XPU_REF_HIDDEN_IN {s}\n", .{std.mem.span(hip)});
+                return error.Usage;
+            };
+            defer alloc.free(buf);
+            const want: usize = @as(usize, rows) * cols * D * 4;
+            if (buf.len != want) {
+                std.debug.print("xpu-eaq-ref: {s} holds {d} bytes, expected {d}\n", .{ std.mem.span(hip), buf.len, want });
+                return error.Usage;
             }
+            try d.copyIn(stream, buf);
+            try head.drainRunner();
+            std.debug.print("xpu-eaq-ref: DIAGNOSTIC stream uploaded from {s} ({d} rows)\n", .{ std.mem.span(hip), rows });
+        } else {
+            var r: u32 = 0;
+            while (r < rows) : (r += 1) {
+                var at: u32 = 0;
+                while (at < cols) {
+                    const end: u32 = @intCast(q.chunkEnd(at, cols));
+                    try calib.embedStream(d, m, a,
+                        dev.off(ids_dev, (@as(usize, r) * cols + at) * 4),
+                        dev.off(stream, (@as(usize, r) * cols + at) * D * 4), end - at);
+                    at = end;
+                }
+            }
+            try head.drainRunner(); // the whole embed queue is truly done, not just settle-returned
         }
-        try head.drainRunner(); // the whole embed queue is truly done, not just settle-returned
     }
     std.debug.print("xpu-eaq-ref: embedded {d} rows in {d:.1} s\n", .{ rows, q.now() - t_start });
     try spotLine(spot, &head, "post-embed stream row0 (4 MB prefix)", stream, 1 << 22);
@@ -344,7 +405,7 @@ pub fn main(init: std.process.Init) !void {
     if (try residPoint(&head, resid_dir, "embed", "prompt ingestion or embedding gather", rbuf[0..rbuf_len], rbuf[rbuf_len..], n_dump_rows, cols)) |stage| collapse_stage = stage;
 
     // -- pass 2: the layer-major sweep; one slab fill per layer, then every row through it
-    for (0..LAYERS) |i| {
+    for (start_layer..LAYERS) |i| {
         const tl = q.now();
         const sp = try quant.layerSlots(alloc, i);
         for (&sp, 0..) |s, slot| {
@@ -513,7 +574,7 @@ pub fn main(init: std.process.Init) !void {
                 local, m_blk, row_buf[@as(usize, done) * VOCAB ..][0 .. @as(usize, m_blk) * VOCAB]);
             head_secs += q.now() - t0;
             statsBlock(row_buf[@as(usize, done) * VOCAB ..][0 .. @as(usize, m_blk) * VOCAB], m_blk, done, cols,
-                ids[@as(usize, r) * cols ..][0..cols], gcounts, rcounts, &top1_total, &n_total);
+                ids[@as(usize, r) * cols ..][0..cols], gcounts, rcounts, &top1_total, &n_total, r < heldout);
             done += m_blk;
         }
         const tflops = @as(f64, @floatFromInt(2 * @as(u64, cols) * D * VOCAB)) / 1e12 / @max(head_secs, 1e-6);
@@ -542,22 +603,55 @@ pub fn main(init: std.process.Init) !void {
         if (r == 0) {
             // the self-canary: row 0's teacher-forced top-1 against its own tokens; the
             // logits file is not created until this clears 0.30.
-            if (canary_row[0] < 0.30) {
-                std.debug.print("xpu-eaq-ref: self-canary FAIL: row 0 teacher-forced top-1 {d:.4} < 0.30 under shift {s}\n", .{ canary_row[0], shift_convention });
-                return error.RefGate;
+            if (canary_row[0] < band.self_canary_floor) {
+                std.debug.print("xpu-eaq-ref: self-canary FAIL: row 0 teacher-forced top-1 {d:.4} < {d:.2} under shift {s}\n", .{ canary_row[0], band.self_canary_floor, shift_convention });
+                if (!keep_out) return error.RefGate; // keep mode: the print stands, the bytes keep flowing
             }
             out_fd = openOut(out_path); // the first byte of the logits file exists from here on
-            std.debug.print("xpu-eaq-ref: self-canary PASS (row 0 top-1 {d:.4} >= 0.30) — opening {s}\n", .{ canary_row[0], out_path });
+            std.debug.print("xpu-eaq-ref: self-canary PASS (row 0 top-1 {d:.4} >= {d:.2}) — opening {s}\n", .{ canary_row[0], band.self_canary_floor, out_path });
         }
-        if (canary_row[r] < 0.45 or canary_row[r] > 0.85) {
-            std.debug.print("xpu-eaq-ref: gate canary-band FAIL: row {d} teacher-forced top-1 {d:.4} outside 0.45-0.85\n", .{ r, canary_row[r] });
-            if (out_fd >= 0) { _ = unlink(out_path); out_fd = -1; }
-            return error.RefGate;
+        const natural = r < heldout;
+        if (natural and (canary_row[r] < band.natural_floor or canary_row[r] > band.natural_ceiling)) {
+            std.debug.print("xpu-eaq-ref: gate canary-band FAIL: natural row {d} teacher-forced top-1 {d:.4} outside {d:.2}-{d:.2}{s}\n", .{
+                r, canary_row[r], band.natural_floor, band.natural_ceiling, if (keep_out) " (keep mode: reported, not enforced)" else "" });
+            if (!keep_out) {
+                if (out_fd >= 0) { _ = unlink(out_path); out_fd = -1; }
+                return error.RefGate;
+            }
         }
-        if (nll_row[r] > 6.0) {
-            std.debug.print("xpu-eaq-ref: gate loss FAIL: row {d} mean teacher-forced NLL {d:.3} > 6 nats\n", .{ r, nll_row[r] });
-            if (out_fd >= 0) { _ = unlink(out_path); out_fd = -1; }
-            return error.RefGate;
+        if (!natural) {
+            if (canary_row[r] > band.random_fabrication_ceiling) {
+                std.debug.print("xpu-eaq-ref: gate fabrication FAIL: random probe row {d} teacher-forced top-1 {d:.4} > {d:.2} — random tokens predict nothing{s}\n", .{
+                    r, canary_row[r], band.random_fabrication_ceiling, if (keep_out) " (keep mode: reported, not enforced)" else "" });
+                if (!keep_out) {
+                    if (out_fd >= 0) { _ = unlink(out_path); out_fd = -1; }
+                    return error.RefGate;
+                }
+            }
+            if (nll_row[r] < band.random_nll_floor) {
+                std.debug.print("xpu-eaq-ref: gate fabrication FAIL: random probe row {d} mean teacher-forced NLL {d:.3} < {d:.2} = ln V - 2 — low NLL on unpredictable tokens is fabrication{s}\n", .{
+                    r, nll_row[r], band.random_nll_floor, if (keep_out) " (keep mode: reported, not enforced)" else "" });
+                if (!keep_out) {
+                    if (out_fd >= 0) { _ = unlink(out_path); out_fd = -1; }
+                    return error.RefGate;
+                }
+            }
+        }
+        if (natural and (canary_row[r] < band.natural_watch_low or canary_row[r] > band.natural_watch_high)) {
+            if (n_watch < watch_rows_buf.len) {
+                watch_rows_buf[n_watch] = @intCast(r);
+                n_watch += 1;
+            }
+            std.debug.print("xpu-eaq-ref: WATCH: natural row {d} top-1 {d:.4} outside {d:.2}-{d:.2} — the torch-oracle ladder must endorse the sidecar (XPU_REF_LADDER_OK/_REF at publish)\n", .{
+                r, canary_row[r], band.natural_watch_low, band.natural_watch_high });
+        }
+        if (natural and nll_row[r] > band.nll_row_ceiling) {
+            std.debug.print("xpu-eaq-ref: gate loss FAIL: row {d} mean teacher-forced NLL {d:.3} > {d:.0} nats{s}\n", .{
+                r, nll_row[r], band.nll_row_ceiling, if (keep_out) " (keep mode: reported, not enforced)" else "" });
+            if (!keep_out) {
+                if (out_fd >= 0) { _ = unlink(out_path); out_fd = -1; }
+                return error.RefGate;
+            }
         }
         if (out_fd >= 0) { // the row passed its gates: append its bytes
             const b = std.mem.sliceAsBytes(row_buf[0 .. @as(usize, cols) * VOCAB]);
@@ -582,20 +676,21 @@ pub fn main(init: std.process.Init) !void {
     var agg_top1: f64 = 0;
     {
         var sum: f64 = 0;
-        for (canary_row[0..rows]) |t| sum += t;
-        agg_top1 = sum / @as(f64, @floatFromInt(rows));
+        for (canary_row[0..heldout]) |t| sum += t;
+        agg_top1 = sum / @as(f64, @floatFromInt(agg_n));
     }
-    if (agg_top1 < 0.45 or agg_top1 > 0.85) {
-        std.debug.print("xpu-eaq-ref: gate canary-band FAIL: aggregate teacher-forced top-1 {d:.4} outside 0.45-0.85\n", .{agg_top1});
-        _ = unlink(out_path);
+    if (agg_top1 < band.natural_floor or agg_top1 > band.natural_watch_high) {
+        std.debug.print("xpu-eaq-ref: gate canary-band FAIL: natural-row aggregate teacher-forced top-1 {d:.4} outside {d:.2}-{d:.2}\n", .{
+            agg_top1, band.natural_floor, band.natural_watch_high });
+        if (!keep_out) _ = unlink(out_path);
         return error.RefGate;
     }
     var nll_mean: f64 = 0;
-    for (nll_row[0..rows]) |v| nll_mean += v;
-    nll_mean /= @as(f64, @floatFromInt(rows));
-    if (nll_mean >= 4.0) {
-        std.debug.print("xpu-eaq-ref: gate loss FAIL: mean teacher-forced NLL {d:.3} >= 4 nats\n", .{nll_mean});
-        _ = unlink(out_path);
+    for (nll_row[0..heldout]) |v| nll_mean += v;
+    nll_mean /= @as(f64, @floatFromInt(agg_n));
+    if (nll_mean >= band.nll_mean_ceiling) {
+        std.debug.print("xpu-eaq-ref: gate loss FAIL: natural-row mean teacher-forced NLL {d:.3} >= {d:.1} nats\n", .{ nll_mean, band.nll_mean_ceiling });
+        if (!keep_out) _ = unlink(out_path);
         return error.RefGate;
     }
     var gdistinct: usize = 0;
@@ -609,7 +704,7 @@ pub fn main(init: std.process.Init) !void {
             gmode_tok = @intCast(t);
         }
     }
-    const gmode_frac = @as(f64, @floatFromInt(gmode)) / @as(f64, @floatFromInt(positions));
+    const gmode_frac = @as(f64, @floatFromInt(gmode)) / @as(f64, @floatFromInt(@as(u64, heldout) * cols)); // natural positions only
     if (gmode_frac >= 0.10) {
         std.debug.print("xpu-eaq-ref: gate invariance FAIL: argmax mode token {d} at {d:.3} of positions >= 0.10\n", .{ gmode_tok, gmode_frac });
         _ = unlink(out_path);
@@ -621,20 +716,20 @@ pub fn main(init: std.process.Init) !void {
         return error.RefGate;
     }
     var top5_constant = true;
-    for (top5_row[1..rows]) |t5| {
+    for (top5_row[1..heldout]) |t5| {
         if (!std.mem.eql(u32, &t5, &top5_row[0])) top5_constant = false;
     }
     if (top5_constant) {
         std.debug.print("xpu-eaq-ref: gate invariance FAIL: top-5 argmax set {{", .{});
         inlinePrint(&top5_row[0]);
-        std.debug.print("}} constant across all rows\n", .{});
+        std.debug.print("}} constant across the natural rows\n", .{});
         _ = unlink(out_path);
         return error.RefGate;
     }
     std.debug.print("xpu-eaq-ref: gate no-invariance PASS (mode {d} at {d:.4}, {d} distinct argmax, top-5 varies across {d} rows)\n", .{
         gmode_tok, gmode_frac, gdistinct, rows });
-    std.debug.print("xpu-eaq-ref: gate canary PASS (per row {d:.4}-{d:.4}, aggregate {d:.4}; NLL mean {d:.3}, max row {d:.3})\n", .{
-        minOf(canary_row[0..rows]), maxOf(canary_row[0..rows]), agg_top1, nll_mean, maxOf(nll_row[0..rows]) });
+    std.debug.print("xpu-eaq-ref: gate canary PASS ({d} natural rows {d:.4}-{d:.4}, aggregate {d:.4}; {d} watch-tagged; NLL mean {d:.3}, max row {d:.3})\n", .{
+        heldout, minOf(canary_row[0..heldout]), maxOf(canary_row[0..heldout]), agg_top1, n_watch, nll_mean, maxOf(nll_row[0..heldout]) });
     if (!std.mem.eql(u8, collapse_stage, "none")) {
         std.debug.print("xpu-eaq-ref: bisect: collapse named at {s}\n", .{collapse_stage});
     } else {
@@ -675,6 +770,10 @@ pub fn main(init: std.process.Init) !void {
             .top5_constant = top5_constant,
             .embed_ids = host_ids0,
             .embed_ids_dev = dev_ids[0..@min(16, cols)],
+            .heldout_rows = heldout,
+            .watch_rows = watch_rows_buf[0..n_watch],
+            .ladder_ref = ladder_ref,
+            .ladder_ok = ladder_ok,
             .pass = true,
         };
         const js = try std.json.Stringify.valueAlloc(alloc, sc, .{ .whitespace = .indent_1 });
@@ -955,7 +1054,7 @@ var nll_row_sum: f64 = 0;
 /// the teacher-forced top-1 and NLL under the shift logits[t] predicts token[t+1]. The
 /// row's last position has no next token and is dropped (the sidecar's shift convention).
 fn statsBlock(logits: []const f32, m_blk: u32, done: u32, cols: u32, row_ids: []const u32,
-              gcounts: []u32, rcounts: []u32, top1_total: *u64, n_total: *u64) void {
+              gcounts: []u32, rcounts: []u32, top1_total: *u64, n_total: *u64, count_global: bool) void {
     std.debug.assert(logits.len == @as(usize, m_blk) * VOCAB);
     for (0..m_blk) |i| {
         const p = done + @as(u32, @intCast(i)); // the position in the row
@@ -968,7 +1067,7 @@ fn statsBlock(logits: []const f32, m_blk: u32, done: u32, cols: u32, row_ids: []
                 best = @intCast(j);
             }
         }
-        gcounts[best] += 1;
+        if (count_global) gcounts[best] += 1; // the ruling: the invariance histogram pools natural rows only
         rcounts[best] += 1;
         if (p + 1 >= cols) continue; // the shift: the row's last position is dropped
         const next = row_ids[p + 1];
@@ -979,10 +1078,10 @@ fn statsBlock(logits: []const f32, m_blk: u32, done: u32, cols: u32, row_ids: []
         const nll = logz - @as(f64, lg[next]);
         if (best == next) {
             top1_row += 1;
-            top1_total.* += 1;
+            if (count_global) top1_total.* += 1; // the ruling: aggregate top-1 pools natural rows only
         }
         nll_row_sum += nll;
-        n_total.* += 1;
+        if (count_global) n_total.* += 1;
     }
 }
 

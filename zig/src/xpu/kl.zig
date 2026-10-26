@@ -421,14 +421,22 @@ pub const Head = struct {
         try h.evWait(h.ev[3]);
     }
 
-    /// Truly drain the runner list before a gate command rides another list: append a
-    /// 4-byte self-copy at C to the runner's own list and block on its event. The list's
-    /// settle and the driver's HostSynchronize both return success early on a busy card,
-    /// so "the dequant/fwd work is done" is only provable through an event on that list.
+    /// Truly drain the runner list before a gate command rides another list. A memory
+    /// copy CANNOT be the marker: the driver dispatches copies to the copy engine and
+    /// kernels to the compute engine with no cross-engine order inside one immediate
+    /// list, so a 4-byte self-copy completes while the queued kernels are still
+    /// in flight — every download that follows then reads the stream mid-sweep (the
+    /// resid/s63 forensic reads, the head-input checksums). The marker is a compute
+    /// kernel instead — eaq_copy16 of one ushort at C, in-order on the compute engine
+    /// behind every queued kernel — and the caller's download can only be enqueued
+    /// after this returns, which is what orders the copy engine behind the kernels.
     pub fn drainRunner(h: *Head) !void {
         const g = &h.d.g;
+        const one: u32 = 1;
+        inline for (.{ h.c, h.c, one }, 0..) |arg, i| try g.arg(h.copy16, i, arg);
         _ = g.api.zeEventHostReset(h.ev[4]);
-        try ze.check(g.api.zeCommandListAppendMemoryCopy(h.d.list, h.c, h.c, 4, h.ev[4], 0, null));
+        try ze.check(g.api.zeCommandListAppendLaunchKernel(h.d.list, h.copy16,
+            &ze.GroupCount{ .x = 1, .y = 1, .z = 1 }, h.ev[4], 0, null));
         try h.evWait(h.ev[4]);
     }
 };
@@ -1401,9 +1409,10 @@ pub fn run(req: Options) !Report {
     var hd: ?*Head = null;
     var head_nt: usize = q.VOCAB; // the head's slab pitch, bound at init so no buffer width can read hd before it exists
     var armed = false;
-    errdefer if (armed) disarmDrain();
-    errdefer if (hd) |h| h.deinit();
-    errdefer if (rp) |r| r.deinit();
+    // (no errdefer twins of the defers below: an error return that fires them must not
+    // deinit the runner or head a second time — Dev.deinit twice calls settle on the
+    // closed Gpu, whose api pointers are gone; the defers register the instant the
+    // resources exist, which retires the errdefer pattern for rp, hd and armed.)
     var cap_fd: c_int = -1;
     var runner_logits: []const f32 = &.{};
     var prompts_s: f64 = 0;
@@ -1416,6 +1425,8 @@ pub fn run(req: Options) !Report {
         rp = r;
         armed = true;
         armDrain(&r.d);
+        defer if (rp) |rr| rr.deinit(); // registered the moment the runner exists
+        defer if (armed) disarmDrain(); // disarms ahead of the runner's settle, as the old order did
         const rows = try alloc.alloc([]const u32, seq_rows);
         for (0..seq_rows) |i| rows[i] = @alignCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(ids[i * o.cols ..][0 .. o.cols])));
         const t0 = q.now();
@@ -1427,9 +1438,9 @@ pub fn run(req: Options) !Report {
         std.debug.print("  prompts: {d:.1} s, hidden {d} B\n", .{ prompts_s, cap.bytes });
         hbuf = try alloc.alloc(u16, o.block * q.D);
     }
-    defer if (rp) |r| r.deinit();
+
     defer if (hd) |h| h.deinit();
-    defer if (armed) disarmDrain();
+
     defer if (hbuf.len != 0) alloc.free(hbuf);
     defer if (cap_fd >= 0) { _ = close(cap_fd); };
 
