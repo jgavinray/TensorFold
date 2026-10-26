@@ -125,6 +125,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const test_exe = b.addExecutable(.{ .name = "xpu-eaq-quant-tests", .root_module = test_mod });
     const test_install = b.addInstallArtifact(test_exe, .{});
     b.step("xpu-eaq-quant-tests", "Host tests for the quant driver: progress roundtrip, head merge, synthetic-pack admission (no device needed)").dependOn(&test_install.step);
+    const frag_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/fragcheck.zig"), .target = target, .optimize = optimize, .link_libc = true }); // host-only pack verifier: the T-LDLQ-5 file-decode referee, no device
+    frag_mod.addImport("xpu_qwen27_kernels", embedded);
+    frag_mod.addImport("ze", ze_mod);
+    frag_mod.addImport("core", core_mod);
+    frag_mod.addImport("qwen27", qwen27);
+    const frag_exe = b.addExecutable(.{ .name = "xpu-fragcheck", .root_module = frag_mod });
+    const frag_install = b.addInstallArtifact(frag_exe, .{});
+    b.step("xpu-fragcheck", "Host-only fragment verifier: decode a written pack file's own bytes through the exl3 oracle and score them against the source (no device needed)").dependOn(&frag_install.step);
     const install = b.addInstallArtifact(exe, .{});
     b.step("xpu-eaq-quant", "Build the fresh-quant driver (bf16 source -> EAQ pack: capture, H, LDL, LDLQ, fragments, §Q3 report; needs ocloc, a C++17 compiler and nGEN headers)").dependOn(&install.step);
 }

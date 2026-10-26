@@ -71,3 +71,37 @@ pub fn repack(b: *std.Build) void {
     b.step("eaq-repack", "Build tf-eaq-repack: rewrite a stock EXL3 directory into an EAQ pack")
         .dependOn(&b.addInstallArtifact(exe, .{}).step);
 }
+
+/// The mixed half-step tooling (T-HS-10): `zig build eaq-mixed-plan` installs
+/// tf-eaq-mixed-plan, which turns an allocator plan into the explicit-width plan the
+/// driver takes through --plan; `zig build eaq-frag-merge` installs tf-eaq-frag-merge,
+/// which merges per-layer trellis fragments over a full-width dense source into the
+/// mixed pack through the writer and proves it with the reader — host-only, the same
+/// module set as the repacker (eaq_write rides along as its own module, the driver's
+/// wiring's pattern, zig/build/xpu_quant.zig:115-116).
+pub fn tools(b: *std.Build) void {
+    const target = b.graph.host;
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "tokenizer", .module = tokenizer }} });
+    const reader = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/exl3_eaq.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "core", .module = core }} });
+    const writer = b.createModule(.{ .root_source_file = b.path("zig/src/core/eaq_write.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    writer.addImport("core", core);
+    const plan = b.addExecutable(.{ .name = "tf-eaq-mixed-plan", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/eaq_mixed_plan_cli.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{.{ .name = "core", .module = core }},
+    }) });
+    b.step("eaq-mixed-plan", "Build tf-eaq-mixed-plan: the T-HS-10 explicit-width plan from an allocator plan")
+        .dependOn(&b.addInstallArtifact(plan, .{}).step);
+    const merge = b.addExecutable(.{ .name = "tf-eaq-frag-merge", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/eaq_frag_merge_cli.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "exl3_eaq", .module = reader }, .{ .name = "eaq_write", .module = writer } },
+    }) });
+    b.step("eaq-frag-merge", "Build tf-eaq-frag-merge: merge per-layer fragments into the mixed half-step pack")
+        .dependOn(&b.addInstallArtifact(merge, .{}).step);
+}

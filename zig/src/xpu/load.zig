@@ -173,7 +173,19 @@ pub fn projectionQuantized(d: *Dev, c: *const Checkpoint, name: []const u8, wide
 /// A small weight to bf16 on the device; `centred`: a GPTQ RMSNorm weight stored as gamma − 1 gets its 1 back.
 pub fn vecTensor(d: *Dev, c: *const Checkpoint, name: []const u8, centred: bool) !*anyopaque {
     const t = try c.get(name);
-    if (std.mem.eql(u8, t.dtype, "BF16")) return d.upload(t.bytes);
+    if (std.mem.eql(u8, t.dtype, "BF16")) {
+        if (!centred) return d.upload(t.bytes);
+        const nb = t.bytes.len / 2;
+        const bout = try alloc.alloc(u16, nb);
+        defer alloc.free(bout);
+        for (bout, 0..) |*o, i| { // gamma − 1 stored bf16: the 1 back, ties-to-even
+            const hi: u16 = @bitCast(std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little));
+            const v: f32 = @bitCast(@as(u32, hi) << 16);
+            const u: u32 = @bitCast(v + 1.0);
+            o.* = @intCast((u + 0x8000 + ((u >> 16) & 1)) >> 16);
+        }
+        return d.upload(std.mem.sliceAsBytes(bout));
+    }
     if (!std.mem.eql(u8, t.dtype, "F16")) return error.UnexpectedDtype;
     const n = t.bytes.len / 2;
     const out = try alloc.alloc(u16, n);

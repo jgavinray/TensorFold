@@ -251,7 +251,7 @@ const N4: u32 = 256;
 
 /// run + compare one (halves, part): the device slab against core.exl3_format.dequantize
 /// on the same trellis words.
-fn deqRun(d: *q.Dev, k_dq: q.ze.H, p: *Deq4, halves: u32, bits_arg: bool) !struct { worst: f32, rel: f32, rms: f32 } {
+fn deqRun(d: *q.Dev, k_dq: q.ze.H, p: *Deq4, halves: u32, bits_arg: bool) !struct { worst: f32, rel: f32, rms: f32, ulp: u32 } {
     const tr_dev = try d.upload(std.mem.sliceAsBytes(p.tr));
     defer d.g.free(tr_dev);
     const suh_dev = try d.upload(std.mem.sliceAsBytes(p.suh));
@@ -278,34 +278,40 @@ fn deqRun(d: *q.Dev, k_dq: q.ze.H, p: *Deq4, halves: u32, bits_arg: bool) !struc
 
     var worst: f32 = 0;
     var rel: f32 = 0;
+    var ulp: u32 = 0;
     var sumsq: f64 = 0;
     for (0..@as(usize, K4) * N4) |at| {
         const ref: f32 = @floatCast(want[at]);
-        const dv = @abs(ref - @as(f32, @as(f16, @bitCast(got[at]))));
+        const got_h: f16 = @bitCast(got[at]);
+        const dv = @abs(ref - @as(f32, got_h));
         if (dv > worst) worst = dv;
         const r = dv / @max(@abs(ref), 1e-6);
         if (r > rel) rel = r;
+        // the envelope rule (section 4): the distance to the oracle's own f16, in ulps —
+        // the kernel's f32 accumulators may move the f16 store by one step at the tails,
+        // which an absolute max over gaussian tails would flag as an odd-halves defect.
+        ulp = @max(ulp, hs.f16UlpDist(@as(f16, @floatCast(want[at])), got_h));
         sumsq += want[at] * want[at];
     }
-    return .{ .worst = worst, .rel = rel, .rms = @floatCast(@sqrt(sumsq / @as(f64, @floatFromInt(K4 * N4)))) };
+    return .{ .worst = worst, .rel = rel, .rms = @floatCast(@sqrt(sumsq / @as(f64, @floatFromInt(K4 * N4)))), .ulp = ulp };
 }
 
 fn tHS4(d: *q.Dev, k_dq: q.ze.H, bits_arg: bool) !u32 {
-    var env: f32 = 0;
+    var env: u32 = 0; // the even halves' worst ulp distance, the odd halves' ceiling
     for (even_halves) |hh| {
         var part = try Deq4.init(0x4548_0000 + hh, hh);
         defer part.deinit();
         const m = try deqRun(d, k_dq, &part, hh, bits_arg);
-        std.debug.print("T-HS-4 halves={d} (even) [128,256] suh=svh=1: dequant-vs-oracle max {d:.6} rel {d:.4} rms {d:.4}\n", .{ hh, m.worst, m.rel, m.rms });
-        env = @max(env, m.worst);
+        std.debug.print("T-HS-4 halves={d} (even) [128,256] suh=svh=1: dequant-vs-oracle max {d:.6} rel {d:.4} rms {d:.4} ulp {d}\n", .{ hh, m.worst, m.rel, m.rms, m.ulp });
+        env = @max(env, m.ulp);
     }
     var fails: u32 = 0;
     for (odd_halves) |hh| {
         var part = try Deq4.init(0x4548_0000 + hh, hh);
         defer part.deinit();
         const m = try deqRun(d, k_dq, &part, hh, bits_arg);
-        const pass = m.worst <= env and m.worst <= 0.02 * m.rms;
-        std.debug.print("T-HS-4 halves={d} [128,256] suh=svh=1: dequant-vs-oracle max {d:.6} rel {d:.4} rms {d:.4} (even envelope {d:.6}): {s}\n", .{ hh, m.worst, m.rel, m.rms, env, if (pass) "PASS" else "FAIL" });
+        const pass = m.ulp <= env and m.worst <= 0.02 * m.rms;
+        std.debug.print("T-HS-4 halves={d} [128,256] suh=svh=1: dequant-vs-oracle max {d:.6} rel {d:.4} rms {d:.4} ulp {d} (even envelope ulp {d}): {s}\n", .{ hh, m.worst, m.rel, m.rms, m.ulp, env, if (pass) "PASS" else "FAIL" });
         if (!pass) fails += 1;
     }
     return fails;
@@ -377,7 +383,12 @@ fn gemvCell(d: *q.Dev, ks: Kernels, g: *Gemv5, halves: u32, m: u32, bits_arg: bo
     if (m == 1) {
         hs.gemvT1Transcribe(g.tr, halves, K5, N5, N5, xt_host, y_tr);
     } else {
-        hs.gemvTranscribe(g.tr, halves, K5, N5, N5, xt_host, m, y_tr, null);
+        // the forward's own split: the kernel holds eight rows a launch, so the mirror
+        // transcribes eight rows a call (gemvTranscribe caps rows at the kernel's 8) —
+        // the second call answers the second launch's rows 8..15 at the y2 base.
+        const r0: u32 = @min(m, 8);
+        hs.gemvTranscribe(g.tr, halves, K5, N5, N5, xt_host[0 .. @as(usize, r0) * K5], r0, y_tr[0 .. @as(usize, r0) * N5], null);
+        if (m > 8) hs.gemvTranscribe(g.tr, halves, K5, N5, N5, xt_host[@as(usize, 8) * K5 ..], @intCast(m - 8), y_tr[@as(usize, 8) * N5 ..], null);
     }
     const y_fin = try gpa.alloc(f16, @as(usize, m) * N5);
     defer gpa.free(y_fin);
@@ -726,16 +737,22 @@ fn readFile(path: [:0]const u8) !Reader {
     const size: usize = @intCast(lseek(fd, 0, 2));
     const buf = try gpa.alloc(u8, size);
     var got: usize = 0;
-    while (got < size) {
-        const n = read(fd, buf.ptr + got, size - got);
-        if (n <= 0) return error.GoldenShortRead;
-        got += @intCast(n);
+    var zeros: u32 = 0;
+    while (got < size) { // pread at explicit offsets: the sequential read() returned a spurious EOF-0 on this box
+        const n = std.c.pread(fd, buf.ptr + got, size - got, @intCast(got));
+        if (n > 0) {
+            zeros = 0;
+            got += @intCast(n);
+        } else if (n == 0) {
+            zeros += 1;
+            if (zeros > 64) return error.GoldenShortRead;
+        } else return error.GoldenShortRead;
     }
     return .{ .bytes = buf };
 }
 
 fn writeFile(path: [:0]const u8, bytes: []const u8) !void {
-    const O_WRONLY_CREAT_TRUNC: c_int = 0x4001 | 0o100 | 0o1000; // Linux O_WRONLY|O_CREAT|O_TRUNC
+    const O_WRONLY_CREAT_TRUNC: c_int = 1 | 0o100 | 0o1000; // Linux O_WRONLY|O_CREAT|O_TRUNC
     const fd = open(path, O_WRONLY_CREAT_TRUNC, @as(c_uint, 0o644));
     if (fd < 0) return error.GoldenFileUnwritable;
     defer _ = close(fd);

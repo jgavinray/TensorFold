@@ -159,41 +159,61 @@ pub fn unpackSigns(packed_words: []const i16, out: []f16) void {
     }
 }
 
-fn parityOf(v: usize) usize {
-    return @popCount(v) & 1;
-}
-
 /// Rotate each 128-value block along axis of the row-major [rows, cols] FP64 matrix.
+/// The FWHT butterfly - the same code core.exl3_ldl.rotateBoth runs (T-LDL-3 pins the
+/// two to 1e-12), seven add/sub passes per block instead of 128 length-128 naive
+/// Hadamard dot products: the same transform, ~18x less work per element.
 pub fn rotate(x: []f64, rows: usize, cols: usize, axis: usize) void {
-    const inv = 1.0 / std.math.sqrt(@as(f64, hadamard_dim));
+    const hd = hadamard_dim;
+    const inv = 1.0 / std.math.sqrt(@as(f64, hd));
     if (axis == 0) {
-        var c: usize = 0;
-        while (c < cols) : (c += 1) {
-            var b: usize = 0;
-            while (b < rows / hadamard_dim) : (b += 1) rotateBlock(x, cols, b * hadamard_dim, c, axis, inv);
+        var rb: usize = 0;
+        while (rb < rows) : (rb += hd) {
+            var cb: usize = 0;
+            while (cb < cols) : (cb += hd) {
+                var h: usize = 1;
+                while (h < hd) : (h *= 2) {
+                    var g: usize = 0;
+                    while (g < hd) : (g += 2 * h) {
+                        for (0..h) |j| {
+                            const r1 = (rb + g + j) * cols + cb;
+                            const r2 = r1 + h * cols;
+                            for (0..hd) |c| {
+                                const a = x[r1 + c];
+                                const b = x[r2 + c];
+                                x[r1 + c] = a + b;
+                                x[r2 + c] = a - b;
+                            }
+                        }
+                    }
+                }
+                for (0..hd) |i| {
+                    const base = (rb + i) * cols + cb;
+                    for (0..hd) |c| x[base + c] *= inv;
+                }
+            }
         }
     } else {
-        var r: usize = 0;
-        while (r < rows) : (r += 1) {
+        for (0..rows) |r| {
+            const row = x[r * cols ..][0..cols];
             var b: usize = 0;
-            while (b < cols / hadamard_dim) : (b += 1) rotateBlock(x, cols, r, b * hadamard_dim, axis, inv);
+            while (b < cols) : (b += hd) {
+                const blk = row[b .. b + hd];
+                var h: usize = 1;
+                while (h < hd) : (h *= 2) {
+                    var g: usize = 0;
+                    while (g < hd) : (g += 2 * h) {
+                        for (0..h) |j| {
+                            const a = blk[g + j];
+                            const bb = blk[g + j + h];
+                            blk[g + j] = a + bb;
+                            blk[g + j + h] = a - bb;
+                        }
+                    }
+                }
+                for (0..hd) |i| blk[i] *= inv;
+            }
         }
-    }
-}
-
-fn rotateBlock(x: []f64, cols: usize, base_r: usize, base_c: usize, axis: usize, inv: f64) void {
-    var scratch: [hadamard_dim]f64 = undefined;
-    for (0..hadamard_dim) |i| {
-        var sum: f64 = 0;
-        for (0..hadamard_dim) |j| {
-            const h = (if (parityOf(i & j) == 1) @as(f64, -1.0) else @as(f64, 1.0)) * inv;
-            const v = if (axis == 0) x[(base_r + j) * cols + base_c] else x[base_r * cols + base_c + j];
-            sum += h * v;
-        }
-        scratch[i] = sum;
-    }
-    for (0..hadamard_dim) |i| {
-        if (axis == 0) x[(base_r + i) * cols + base_c] = scratch[i] else x[base_r * cols + base_c + i] = scratch[i];
     }
 }
 

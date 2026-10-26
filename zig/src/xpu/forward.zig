@@ -245,7 +245,14 @@ pub fn dump(d: *Dev, a: *Acts, T: u32, name: []const u8, with_r: bool) !void {
     } else try d.sync();
     const path = try std.fmt.allocPrintSentinel(alloc, "{s}/xpu_x_{s}.f32", .{ dir, name }, 0);
     const fd = creat(path.ptr, 0o644);
-    _ = write(fd, @ptrCast(x.ptr), x.len * 4);
+    var wbuf: [*]const u8 = @ptrCast(x.ptr);
+    var left: usize = x.len * 4;
+    while (left > 0) {
+        const w = write(fd, wbuf, left);
+        if (w <= 0) break;
+        wbuf += @intCast(w);
+        left -= @intCast(w);
+    }
     _ = close(fd);
 }
 
@@ -267,7 +274,14 @@ pub fn dumpBuf(d: *Dev, name: []const u8, p: *anyopaque, n: usize, kind: enum { 
     };
     const path = try std.fmt.allocPrintSentinel(alloc, "{s}/xpu_{s}.f32", .{ dir, name }, 0);
     const fd = creat(path.ptr, 0o644);
-    _ = write(fd, @ptrCast(x.ptr), x.len * 4);
+    var wbuf: [*]const u8 = @ptrCast(x.ptr);
+    var left: usize = x.len * 4;
+    while (left > 0) {
+        const w = write(fd, wbuf, left);
+        if (w <= 0) break;
+        wbuf += @intCast(w);
+        left -= @intCast(w);
+    }
     _ = close(fd);
 }
 
@@ -470,13 +484,19 @@ pub fn layerBody(d: *Dev, m: *Model, a: *Acts, l: *Layer, i: usize, b: Batch) !v
     if (gemm_probe) |f| try f(d, a, l.mixer_out, a.h, T, i, 1);
     if (probe) try dumpBuf(d, "r0", a.r, T * D, .f16);
     try d.launch(if (wide) d.k.add_rmsnorm else d.k.add_rmsnorm_dec, .{ .x = T }, .{ a.x, a.r, l.post_norm, a.h, a.ahi, a.alo, @as(i32, D), EPS, @as(i32, 1), gs, q8a, q8s, q8ms, q.rot_on });
+    if (probe) try dumpBuf(d, "h1", a.h, T * D, .f16);
     try a8(d, a, a.h, D, T, 4);
     if (gemm_probe) |f| try f(d, a, l.gu, a.h, T, i, 2);
     try capture(d, b.capture, 2, D, a.h, T);
     const act = try mlpIn(d, a, l.gu, T, gs, q8on, wide);
+    if (probe) {
+        try dumpBuf(d, "guo", a.p, @as(usize, T) * 2 * FF, .f16);
+        if (act == a.h) try dumpBuf(d, "act", a.h, T * FF, .f16);
+    }
     try a8(d, a, act, 17408, T, 8);
     try capture(d, b.capture, 3, FF, act, T);
     try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
+    if (probe) try dumpBuf(d, "s1", a.r, T * D, .f16);
     if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
     if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
     if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)

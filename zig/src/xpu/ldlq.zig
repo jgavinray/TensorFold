@@ -70,6 +70,14 @@ pub const Driver = struct {
     tr_dev: *anyopaque, // the part trellis [K/16, N/16, 8*halves] for the largest part
     part_scratch: *anyopaque, // ldlq_eta partials [K/16][ceil(n_max/256)] fp32
     eta_dev: ?*anyopaque, // eta strips [K, N] fp32, allocated on first want_eta use
+    /// The final-code decode each block feeds its own feedback (fable's probe-down
+    /// ruling 1): after encodedWhat, strip_decode regenerates the block's codes from
+    /// its own final trellis, so the tail-bitting closure and the clamps reach the
+    /// feedback E and the eta strip - the feedback error and eta_sq describe the codes
+    /// the pack ships. The what strip is encodeWhat's WHAT as written, kept per block
+    /// for the violating-tile dossier; both [k, n_max] fp16 like the eta strip.
+    qf_dev: ?*anyopaque = null, // [k, n_max] fp16: decode of each block's final trellis
+    what_dev: ?*anyopaque = null, // [k, n_max] fp16: encodeWhat's WHAT, want_what-gated
     k_strip: ze.H,
     k_diff: ze.H,
     k_update: ze.H,
@@ -80,6 +88,7 @@ pub const Driver = struct {
     n_max: u32,
     count: u32, // in-flight tiles: a strip of nt tiles is ceil(nt / count) launches
     want_eta: bool = false, // keep the device eta strips for readEta (T-LDLQ-3)
+    want_what: bool = false, // keep the encodeWhat WHAT strips for the readback dossier
     want_proxy: bool = false, // --proxy at test sizes: the host fp64 4.6 loss
     dbg_dump: ?[]const u8 = null, // per-block evidence dump for the T-LDLQ-2 bisect:
     // S16/Q16 after the strip and encode, the block's STAT words, and T32 rows [0,16j)
@@ -156,6 +165,8 @@ pub const Driver = struct {
         const words = dr.w.tileWords();
         if (wq64.len != k * n or tr.len != kblks * nt * words or results.len != kblks * nt) return error.BadDims;
         if (part.sv.len != n or part.s.len != n or part.svh.len != n) return error.BadDims;
+        if (dr.qf_dev == null) dr.qf_dev = try d.alloc_(@as(usize, k) * dr.n_max * 2);
+        if (dr.want_what and dr.what_dev == null) dr.what_dev = try d.alloc_(@as(usize, k) * dr.n_max * 2);
         if (dr.want_eta and dr.eta_dev == null) dr.eta_dev = try d.alloc_(@as(usize, k) * dr.n_max * 4);
 
         // W32 = the one f64 -> f32 rounding of W_q, uploaded; T32 := W32 on the device
@@ -203,14 +214,24 @@ pub const Driver = struct {
                 try dr.enc.encodeWhat(d, dr.s16, 16, n, tr_j, first, @min(dr.count, nt - first), dr.q16, dr.list);
             }
             try dr.enc.readStats(d, results[j * nt ..][0..nt], dr.list);
+            // fable's probe-down ruling 1: redecode the block from its own final
+            // trellis - after encodedWhat's tail-bitting closure and clamps - and
+            // advance the feedback and the eta strip from the codes the pack ships.
+            // The strip_decode launch is in-order on the same list, and the queued
+            // copy freezes encodeWhat's WHAT for the violating-tile dossier.
+            const qf_j = dev.off(dr.qf_dev.?, @as(usize, j) * 16 * n * 2);
+            try d.launchOn(dr.list, dr.k_decode, .{ .x = nt, .y = 1 }, .{
+                tr_j, @as(i32, @intCast(dr.w.halves)), qf_j, ni, @as(i32, @intCast(nt)),
+            });
+            if (dr.what_dev) |wv| try dev.copyOn(d, dr.list, dev.off(wv, @as(usize, j) * 16 * n * 2), dr.q16, 16 * @as(usize, n) * 2);
             try d.launchOn(dr.list, dr.k_diff, .{ .x = ng, .y = 16 }, .{
-                dr.q16, dr.w32, dr.e32, @as(i32, @intCast(j)), ni,
+                qf_j, dr.w32, dr.e32, @as(i32, @intCast(j)), ni,
             });
             if (j > 0) try d.launchOn(dr.list, dr.k_update, .{ .x = j, .y = ng }, .{
                 dr.t32, dr.l32, dr.e32, @as(i32, @intCast(j)), @as(i32, @intCast(16 * j)), ni, @as(i32, @intCast(k)),
             });
             try d.launchOn(dr.list, dr.k_eta, .{ .x = ng }, .{
-                dr.q16, dr.s16, eta_arg, dev.off(dr.part_scratch, @as(usize, j) * ng * 4), @as(i32, @intCast(j)), ni,
+                qf_j, dr.s16, eta_arg, dev.off(dr.part_scratch, @as(usize, j) * ng * 4), @as(i32, @intCast(j)), ni,
             });
             if (dbg_fd >= 0) try dumpBlock(d, dr, &dbg_buf, dbg_fd, j, results[j * nt ..][0..nt], n);
         }
@@ -261,6 +282,22 @@ pub const Driver = struct {
         try readDevBytes(d, dr.list, eta, std.mem.sliceAsBytes(out));
     }
 
+    /// The final-code decode strips (qf_dev): what the block's feedback actually
+    /// consumed, read back for the G1 host-vs-encoder reconstruction check.
+    pub fn readQf(dr: *Driver, d: *dev.Dev, out: []f16, k: u32, n: u32) !void {
+        if (dr.qf_dev == null) return error.QfOff;
+        if (out.len != k * n or k != dr.kdim or n > dr.n_max) return error.BadDims;
+        try readDevBytes(d, dr.list, dr.qf_dev.?, std.mem.sliceAsBytes(out));
+    }
+
+    /// The encodeWhat WHAT strips as the encoder recorded them (want_what), beside
+    /// readQf's final decode: their difference names the violating tiles.
+    pub fn readWhat(dr: *Driver, d: *dev.Dev, out: []f16, k: u32, n: u32) !void {
+        const wv = dr.what_dev orelse return error.WhatOff;
+        if (out.len != k * n or k != dr.kdim or n > dr.n_max) return error.BadDims;
+        try readDevBytes(d, dr.list, wv, std.mem.sliceAsBytes(out));
+    }
+
     /// The raw strip decoder over the last quantizePart's device trellis (the WHAT
     /// oracle of T-LDLQ-6 and the no-rotation dequant of 4.6; exl3_dequant128_c rotates
     /// and scales and is unusable there). Stages through t32, so it must run after the
@@ -278,6 +315,9 @@ pub const Driver = struct {
     /// elapsed ns. Tiles per second = (k/16)*(n/16)*reps / seconds, against the
     /// free-running T8 number. skip_update passes ldlq_update a trapping rows value, so
     /// the difference between the two runs isolates the feedback GEMM's traffic cost.
+    /// It times the pre-ruling loop shape (strip_f16/encodeWhat/strip_diff/ldlq_update/
+    /// ldlq_eta): quantizePart's per-block strip_decode rework is excluded, so 7.4/7.5
+    /// stay comparable and the production cadence rides the block print instead.
     pub fn benchPart(dr: *Driver, d: *dev.Dev, wq64: []const f64, n: u32, reps: u32, skip_update: bool) !u128 {
         if (n == 0 or n % 16 != 0 or n > dr.n_max or wq64.len != dr.kdim * n) return error.BadDims;
         const k = dr.kdim;
