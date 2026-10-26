@@ -254,6 +254,60 @@ if [ "$state" != inactive ] && [ "$state" != failed ]; then
 fi
 log "$UNIT is stopped — card dedicated to the run"
 
+# ------------------------------------------- device check (Main 2026-10-26, fable ruling)
+# Level Zero free bytes vs this run's estimate (--device-check). Short: a root fdinfo scan
+# names the holder — a LIVE client is a refusal (polling will not shrink a serve), our own
+# run is named by the lease, and nothing claimable means kernel reclaim: poll 30 s steps,
+# cap ${DEVICE_POLL_SECS} (default 600), then refuse with the numbers. Exit codes follow the
+# sysexits ruling: 0 fits, 75 device short, 69 Level Zero cannot open.
+BDF=$(basename "$(readlink -f /sys/class/drm/renderD128/device 2>/dev/null)" 2>/dev/null)
+: "${BDF:=unknown}"
+fdinfo_holders() {
+  BDF="$BDF" sudo -n bash -c '
+    for f in /proc/[0-9]*/fdinfo/*; do
+      grep -qs "drm-pdev:.*$BDF" "$f" || continue
+      pid=${f#/proc/}; pid=${pid%%/*}
+      printf "%s %s cgroup=%s %s\n" "$pid" "$(tr -d "\0" </proc/$pid/comm 2>/dev/null)" \
+        "$(awk -F/ "NR==1{print \$NF}" /proc/$pid/cgroup 2>/dev/null)" \
+        "$(grep -E "^drm-(client-id|total-vram0|resident-vram0)" "$f" 2>/dev/null | tr "\n" " ")"
+    done | sort -u -k4,4' 2>/dev/null
+}
+DARGS=("$SRC" "$OUT" --calib "$CALIB" --rows "$ROWS" --cols "$COLS" --bits "$BITS"
+       --head-bits "$HEAD_BITS" --seed "$SEED" --device-check)
+dc_out=$("$BIN" "${DARGS[@]}" 2>&1); dc_rc=$?
+log "device-check: $dc_out"
+if [ "$dc_rc" -eq 3 ]; then
+  free=$(sed -nE 's/^device: ([0-9]+) of .*/\1/p' <<<"$dc_out")
+  need=$(sed -nE 's/.*need ([0-9]+) .*/\1/p' <<<"$dc_out")
+  holders=$(fdinfo_holders)
+  if [ -n "$holders" ]; then
+    log "device-check: live DRM client(s) on $BDF:"
+    printf '%s\n' "$holders" | tee -a "$LOG"
+    log "device-check: refusing, nothing here kills a live holder; stop it or wait for it, then rerun (exit 75)"
+    exit 75
+  fi
+  log "device-check: no live DRM client accounts for the held bytes; waiting for kernel reclaim, poll 30s, cap ${DEVICE_POLL_SECS:-600}s"
+  waited=0; prev=""
+  while [ "$waited" -lt "${DEVICE_POLL_SECS:-600}" ]; do
+    sleep 30; waited=$((waited + 30))
+    dc_out=$("$BIN" "${DARGS[@]}" 2>&1); dc_rc=$?
+    free=$(sed -nE 's/^device: ([0-9]+) of .*/\1/p' <<<"$dc_out")
+    log "device-check: +${waited}s $dc_out"
+    [ "$dc_rc" -eq 0 ] && break
+    if [ "$free" = "$prev" ]; then
+      log "device-check: free $free flat since the last sample"
+    fi
+    prev=$free
+  done
+  if [ "$dc_rc" -ne 0 ]; then
+    log "device-check: still short after ${waited}s (free ${free:-?}, need ${need:-?}); refusing (exit 75) — see dmesg for xe reset or timeout lines"
+    exit 75
+  fi
+elif [ "$dc_rc" -ne 0 ]; then
+  log "device-check: the probe itself failed (rc=$dc_rc is not a verdict): $dc_out — Level Zero unavailable? (exit 69)"
+  exit 69
+fi
+
 # ------------------------------------------------------------------- (5 cont.)
 # The driver-side plan gate: one gate pass on layer 0 with the plan, before any
 # publish attempt. A driver refusal is final (exit 4); an abort follows the abort
@@ -279,6 +333,8 @@ fi
 
 # ----------------------------------------------------- the attempt loop (2),(3)
 attempt=1
+devtries=0
+DEVICE_TRIES="${DEVICE_TRIES:-8}"
 while [ "$attempt" -le "$ATTEMPTS" ]; do
   ARGS=("$SRC" "$OUT" --calib "$CALIB" --rows "$ROWS" --cols "$COLS"
         --bits "$BITS" --head-bits "$HEAD_BITS" --seed "$SEED")
@@ -331,6 +387,21 @@ while [ "$attempt" -le "$ATTEMPTS" ]; do
     } >"$DONE"
     log "success: $DONE written"
     exit 0
+  fi
+
+  # ------------------------------------------ device-short class (Main 2026-10-26, item 3)
+  # InsufficientDeviceMemory (exit 75, or the message on older builds) is transient, not a
+  # crash: back off, resume, and do NOT consume one of the $ATTEMPTS crash retries.
+  if [ "$rc" -eq 75 ] || printf '%s\n' "$last_line" | grep -q "xpu-eaq-quant: InsufficientDeviceMemory"; then
+    devtries=$((devtries + 1))
+    if [ "$devtries" -ge "$DEVICE_TRIES" ]; then
+      log "device still short after $devtries backoffs (exit 75): $last_line"
+      printf 'device-short: last exit %s at %s\n# %s\n' "$rc" "$(now)" "$last_line" >"$FAIL"
+      exit 75
+    fi
+    log "device short (transient class, backoff $devtries/$DEVICE_TRIES): waiting 60 s — no crash attempt consumed"
+    sleep 60
+    continue
   fi
 
   # Nonzero: is this the driver's own abort (bug) or a crash (resume-worthy)?

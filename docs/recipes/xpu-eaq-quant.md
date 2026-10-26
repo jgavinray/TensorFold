@@ -60,7 +60,17 @@ Up to five attempts, every line timestamped. A work directory that carries `prog
 a fresh one runs without `--resume` (the driver refuses that combination as a usage error, `--seed`
 providing the key). Exit codes: 0 success, 1 abort (failed tiles or Cholesky — a deterministic
 quantizer bug, never retried; the failed `H` sidecar is dumped for inspection), 2 attempts exhausted,
-3 the serving unit would not stop, 4 pre-flight or plan refusal.
+3 the serving unit would not stop, 4 pre-flight or plan refusal, 69 Level Zero cannot open,
+75 the device is short or the lease is busy.
+
+The device gate runs before the first attempt: `--device-check` prints the Level Zero free bytes
+against this run's estimate; when short, a root `fdinfo` scan names every DRM client on the card
+(`drm-client-id`, `drm-total-vram0`, `drm-resident-vram0` per pid). A live holder is a refusal
+(exit 75 — nothing here kills a live process); no accountable client means kernel reclaim is pending,
+so it polls in 30 s steps up to `DEVICE_POLL_SECS` (600 by default) and refuses with the numbers and
+a dmesg hint. A lease (`/tmp/xpu-eaq-quant.lease`, `O_CREAT` + `flock`, pid/start/work/need) keeps two
+runs from colliding. `InsufficientDeviceMemory` is treated as transient: 60 s backoff, up to
+`DEVICE_TRIES` (8) retries, without consuming the five crash attempts.
 
 Geometry: the encoder's strip loop runs at count=32 (measured 604.7 tiles/s on a real part, ~51 % of
 the free-running batched kernel); the LDLQ update kernel's cost is under the noise floor (≤1.3 %) and
