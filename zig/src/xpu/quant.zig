@@ -2131,7 +2131,10 @@ pub const Quantizer = struct {
     ///                       feedback-free block (the first processed, j descending): both
     ///                       sides weight space (dequantize reconstructs W; scoring it
     ///                       against the rotated code target instead is a domain mismatch
-    ///                       at ~sqrt(2)); RMS in [0.10, 0.16]; the ruling's per-column
+    ///                       at ~sqrt(2)); RMS in [0.10, 0.16] — [0.10, 0.20] for the
+    ///                       o_proj/out_proj head-strip family (g2-band ruling
+    ///                       2026-10-27: K-per-column 624 vs 80, observed family drift
+    ///                       0.1269..0.1852, ~3 sigma; hard RED above 0.20); the ruling's per-column
     ///                       [0.08, 0.20] count prints as a diagnostic, the gate runs on
     ///                       [0.04, 0.40] (a 16-row column estimate carries ~18 pct
     ///                       sampling noise); eta_sq/(K*N) in [0.0156, 0.026] (proxy);
@@ -2465,6 +2468,15 @@ pub const Quantizer = struct {
             if (ht_n != 0) ht_med = ht_err[ht_n / 2];
             const cnt_blk: f64 = @floatFromInt(16 * n_live);
             const j0_rms = @sqrt(blk_sq[j0] / cnt_blk);
+            // G2 head-strip family (self_attn.o_proj / linear_attn.out_proj): the fable
+            // ruling (eaq-review/g2-band-ruling-packet.md, 2026-10-27) lifts the block
+            // ceiling to 0.20 — K-per-column 624 vs 80 makes the max-scale order
+            // statistic lag the heavy-tailed error numerator; the 8-point series
+            // 0.1269..0.1852 is a smooth family offset, ~mean+3sigma at 0.202. Above
+            // 0.20 stays hard RED; the wide family keeps [0.10, 0.16] unchanged.
+            const head_strip = std.mem.endsWith(u8, pw.spec.base, "o_proj") or
+                std.mem.endsWith(u8, pw.spec.base, "out_proj");
+            const g2_hi: f64 = if (head_strip) 0.20 else 0.16;
             var col_out: usize = 0; // the ruling's [0.08,0.20] count: diagnostic only, printed
             var col_first: usize = 0;
             var col_bad: usize = 0; // the gate: a 16-row per-column RMS estimate carries ~18 pct sampling noise, so the ruling's tight band is unmeetable by sampling alone at the 0.16 block-RMS ceiling - gate wide
@@ -2496,8 +2508,8 @@ pub const Quantizer = struct {
             }
             var eta_txt: [40]u8 = undefined;
             const eta_str: []const u8 = if (eta_ratio) |r| std.fmt.bufPrint(&eta_txt, "{d:.6}", .{r}) catch "?" else "-";
-            std.debug.print("quant: T-LDLQ-5 {s}: G2 feedback-free block {d} (rows {d}..{d}): err RMS {d:.6} of scale (bounds [0.10,0.16]); corr(pack, source) {d:.4} weight space (gate 0.98 - 1/sqrt(1+0.16^2)=0.9874 is the Shannon ceiling at the band's upper edge); corr(pack, rotated target) {d:.4} cross-domain (informational, expected ~0); heavy tail top-{d} median err {d:.3} scale units on |source| rank (bound 2.0); per-column min {d:.4} max {d:.4}, outside [0.08,0.20]: {d} (first {d}); gated outside [0.04,0.40]: {d} (first {d}); eta_sq/(K*N) {s} (bounds [0.0156,0.026]); absolute RMS: src {e:.6}, decoded {e:.6}, block error {e:.6}\n", .{
-                pw.spec.base, j0, k - 16, k - 1, j0_rms, r_pack, r_rot, ht_src.len, ht_med, col_lo, col_hi, col_out, col_first, col_bad, col_badfirst,
+            std.debug.print("quant: T-LDLQ-5 {s}: G2 feedback-free block {d} (rows {d}..{d}): err RMS {d:.6} of scale (bounds [0.10,{d:.2}]); corr(pack, source) {d:.4} weight space (gate 0.98 - 1/sqrt(1+0.16^2)=0.9874 is the Shannon ceiling at the band's upper edge); corr(pack, rotated target) {d:.4} cross-domain (informational, expected ~0); heavy tail top-{d} median err {d:.3} scale units on |source| rank (bound 2.0); per-column min {d:.4} max {d:.4}, outside [0.08,0.20]: {d} (first {d}); gated outside [0.04,0.40]: {d} (first {d}); eta_sq/(K*N) {s} (bounds [0.0156,0.026]); absolute RMS: src {e:.6}, decoded {e:.6}, block error {e:.6}\n", .{
+                pw.spec.base, j0, k - 16, k - 1, j0_rms, g2_hi, r_pack, r_rot, ht_src.len, ht_med, col_lo, col_hi, col_out, col_first, col_bad, col_badfirst,
                 eta_str, // the eta plane is the encoder's own per-element energy
                 src_rms_abs, dec_rms_abs, err_abs_rms,
             });
@@ -2538,7 +2550,7 @@ pub const Quantizer = struct {
             // the bound |T|-3.775+1, unclamped at 2.0 (the ruling's 5.6-sigma clamp arithmetic).
             const eta_bad = if (eta_ratio) |r| !(r >= 0.0156 and r <= 0.026) else false;
             const red = na_all != 0 or
-                !(j0_rms >= 0.10 and j0_rms <= 0.16) or col_bad != 0 or eta_bad or
+                !(j0_rms >= 0.10 and j0_rms <= g2_hi) or col_bad != 0 or eta_bad or
                 r_pack < 0.98 or ht_med > 2.0 or
                 g3_uncl != 0 or g3_clmp != 0 or blk_clamp[j0] > @as(u32, @intFromFloat(2 * clamp_exp));
             if (red) {
@@ -2555,6 +2567,8 @@ pub const Quantizer = struct {
                 });
                 return error.ProbeFailed;
             }
+            if (head_strip and j0_rms > 0.18 and r_pack < 0.99) // joint amber, ruling 3: corr and G2 share the outlier-column symptom — both near ceiling at once is a review marker, not an independent pass
+                std.debug.print("quant: T-LDLQ-5 {s}: G2 JOINT AMBER: block RMS {d:.6} > 0.18 with corr {d:.4} < 0.99 — head-strip outliers, review at the pack self-check (g2-band ruling 2026-10-27)\n", .{ pw.spec.base, j0_rms, r_pack });
             std.debug.print("quant: T-LDLQ-5 {s}: GREEN\n", .{pw.spec.base});
         }
     }
@@ -2856,8 +2870,11 @@ pub const Quantizer = struct {
     /// it would publish) and persisted immediately only for a real run — the crash-restart
     /// contract the summary hands the operator.
     fn recordLayer(self: *Quantizer, i: usize, sha: [64]u8, identity_fallback: bool) !void {
+        // The entry lives for the process lifetime: prog.layers is re-serialized on every
+        // later commit, so the path must NOT be freed here (the original defer-free left
+        // entries 1..N dangling; the allocator recycled the chunks over tensor names and
+        // raw heap words, and the next commit's save wrote non-UTF-8 bytes into the JSON).
         const fp = try fragPathLayer(self.o.work, i);
-        defer alloc.free(fp);
         const prog = &(self.prog orelse return error.Usage);
         try prog.layers.append(alloc, .{ .i = i, .sha = sha, .frag = fp, .identity_fallback = identity_fallback });
         if (!self.o.dry_run) try prog.save(self.o.work);
