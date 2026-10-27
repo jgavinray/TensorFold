@@ -161,6 +161,10 @@ systemctl --user cat "$UNIT" >/dev/null 2>&1 || die "user unit $UNIT not found"
 mkdir -p "$WORK" "$DRY_WORK" "$OUT" || die "cannot create work dirs"
 
 log "==== run-quant-full start mode=$MODE plan=${PLAN:-none} pid=$$ attempts=$ATTEMPTS"
+# A previous attempt's failure marker is stale once a new run starts; leaving it
+# behind makes every later automation (and the hourly status) report a failure
+# that has already been superseded.
+rm -f "$FAIL"
 log "driver: $BIN"
 log "src=$SRC out=$OUT calib=$CALIB work=$WORK"
 
