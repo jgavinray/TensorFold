@@ -117,6 +117,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         m.addImport("xpu_qwen27_kernels", embedded);
         m.addImport("ze", ze_mod);
         m.addImport("core", core_mod);
+        // qwen27.zig's host-allocator gate (kl_track) rides into every test binary that
+        // imports qwen27.zig; tests never track, the same contract as the runner module.
+        m.addImport("kl_track", @import("xpu_kl.zig").klTrackModule(b, target, optimize, false));
         tests_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = t[0], .root_module = m }), .{}).step);
     }
 

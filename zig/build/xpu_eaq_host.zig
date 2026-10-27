@@ -55,6 +55,35 @@ pub fn halfstepTests(b: *std.Build, all: *std.Build.Step) void {
     step.dependOn(&host.step);
 }
 
+/// The step-5 bit allocator's host gate (eaq-halfstep-spec-fable.md section 3): the
+/// waterfill contract, floors, determinism, the Plan/plan_sha canonical identity and the
+/// real 27B 2.9/3.9 acceptance numbers, all inline in core/exl3_alloc.zig (which imports
+/// only std, so the module's own root is the test root, the exl3_encode pattern). Scalar
+/// only, no device and no model download.
+pub fn allocTests(b: *std.Build, all: *std.Build.Step) void {
+    const target = b.graph.host;
+    const step = b.step("test-exl3-alloc", "Host tests of the step-5 bit allocator (widths, waterfill, plan sha, the 2.9/3.9 acceptance numbers)");
+    all.dependOn(step);
+    const alloc_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/exl3_alloc.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    const host = b.addRunArtifact(b.addTest(.{ .root_module = alloc_mod }));
+    host.setCwd(b.path("."));
+    step.dependOn(&host.step);
+}
+
+/// The allocator CLI: `zig build eaq-alloc` installs tf-eaq-alloc, which emits the
+/// 2.9/3.9 plan files the driver's --plan takes (core/exl3_alloc_cli.zig).
+pub fn allocTool(b: *std.Build) void {
+    const target = b.graph.host;
+    const exe = b.addExecutable(.{ .name = "tf-eaq-alloc", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/exl3_alloc_cli.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    }) });
+    b.step("eaq-alloc", "Build tf-eaq-alloc: emit a ready-to-serve allocator plan for the 27B run")
+        .dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
+
 /// The repacker CLI: `zig build eaq-repack` installs `zig-out/bin/tf-eaq-repack`.
 pub fn repack(b: *std.Build) void {
     const target = b.graph.host;

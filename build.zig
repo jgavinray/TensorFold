@@ -89,6 +89,8 @@ pub fn build(b: *std.Build) void {
     @import("zig/build/xpu_eaq_host.zig").encodeTests(b, test_step);
     @import("zig/build/xpu_eaq_host.zig").ldlqTests(b, test_step);
     @import("zig/build/xpu_eaq_host.zig").halfstepTests(b, test_step);
+    @import("zig/build/xpu_eaq_host.zig").allocTests(b, test_step);
+    @import("zig/build/xpu_eaq_host.zig").allocTool(b);
     @import("zig/build/xpu_eaq_host.zig").tools(b);
     if (b.graph.host.result.os.tag == .macos) {
         const step5_mods = metalEngineModules(b, b.graph.host, .Debug, draft_ids);

@@ -6,18 +6,23 @@
 //!   T-HS-1  the oracle's lane-window test (exl3_format.zig:294-362) with the
 //!           odd-halves `continue` removed and a_v generalized per spec 1.2 — both the
 //!           floor form and the t1 av form — over every oracle tile (the fixture does
-//!           carry odd-halves records: halves 3, 5, 7) and over tiles generated from the
-//!           step-1 producer's packStates of random closed sequences at halves 3, 5, 7, 9.
+//!           carry odd-halves records: halves 3, 5, 7, and every even width 2..16) and
+//!           over tiles generated from the step-1 producer's packStates of random
+//!           closed sequences at every width 2..16, so the odd widths 9, 11, 13, 15
+//!           the fixture lacks are pinned too.
 //!   T-HS-2  the exl3_dequant128_c phase-A transcription against exl3_format.unpack:
-//!           bit-identical fp16 on every tile at halves 3, 5, 7, 9 and neighbours
-//!           2, 4, 6, 8 (oracle tiles where the fixture has them, producer tiles
-//!           otherwise, plus encodeTile-of-Gaussian tiles at the odd widths).
+//!           bit-identical fp16 on every tile at halves 2..16 (oracle tiles where the
+//!           fixture has them, producer tiles otherwise, plus encodeTile-of-Gaussian
+//!           tiles at every odd width).
 //!   T-HS-3  the exl3_decode2_h / exl3_decode2_t1_h transcriptions on a [256, 256] part
 //!           with random fp16 X: the extracted states equal exl3_format.tileStates
 //!           exactly (the real assertion), the t1 output equals the general kernel's at
 //!           T = 1 bit for bit, and the fp16 Y sits inside the max-ulp envelope of the
 //!           fp64 reference that the same run measures at halves 4 and 6 — asserted at
-//!           halves 3, 5, 7, 9.
+//!           the odd widths 3, 5, 7, 9, 11, 13, 15.
+//!   T-HS-6 host  the even-path identity (spec 1.2/section 6): at every even halves the
+//!           generalized offset equals the pre-step-5 (v + 1) * bits template bit for
+//!           bit, the host twin of the device golden half.
 //!
 //! Run: `zig build test-exl3-halfstep` (cwd the repo root for the oracle fixture).
 
@@ -138,9 +143,36 @@ test "T-HS-0: the unified E(p), b(p) and the a_v split hold at every halves 2..1
 }
 
 // ---------------------------------------------------------------------------
+// T-HS-6 host half: the even-path identity (spec 1.2, section 6). The template
+// before step 5 computed lo = (16*lane + 1) * bits - 16 and a_v = lo + v * bits;
+// the kernels now carry lb = 8*lane*halves - 16 and a_v = lb + (((v+1)*halves)>>1).
+// At even halves (bits = halves/2) those must agree at every position — the
+// claim that the shipped even path never moved, provable on any host. The device
+// half (golden Y/slab capture and replay, halfstep_test.zig) is the hyper03 gate
+// and the trap for a launch site still passing bits.
+
+test "T-HS-6 host: every even halves reduces bit-for-bit to the (v + 1) * bits template" {
+    for ([_]u32{ 2, 4, 6, 8, 10, 12, 14, 16 }) |halves| {
+        const bits = halves / 2;
+        try std.testing.expectEqual(@as(u32, 8) * bits, hs.ringWords(halves)); // nw = 4*halves = 8*bits
+        try std.testing.expectEqual(@as(u32, 256) * bits, hs.ringBits(halves)); // R = 128*halves = 256*bits
+        try std.testing.expectEqual(@as(u32, 16) * bits, @as(u32, halves) * 8); // tile stride in int16 words
+        for (0..16) |lane_u| {
+            const lane: i32 = @intCast(lane_u);
+            const b: i32 = @intCast(bits);
+            for (0..16) |v_u| {
+                const v: i32 = @intCast(v_u);
+                const legacy = (16 * lane + 1) * b - 16 + v * b;
+                try std.testing.expectEqual(legacy, hs.windowStart(halves, @intCast(lane_u), @intCast(v_u)));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T-HS-1: the oracle's lane-window test, generalized (the spec's removal of
 // `if (rec.halves % 2 != 0) continue`), plus the packStates-of-closed-sequence
-// sources at halves 3, 5, 7, 9 (the fixture has no halves-9 records).
+// sources at every width 2..16 (the fixture has no odd records beyond halves 7).
 
 fn checkTileWindows(ring: []const u32, halves: u32, want: *const [256]u32) !void {
     for (0..16) |lane| {
@@ -177,8 +209,9 @@ test "T-HS-1: both kernel window forms reproduce tileStates at every width, orac
     try forEachRecord(f, &oracle_tiles, checkRecordWindows);
     try std.testing.expect(oracle_tiles >= 162); // the exl3_format oracle run covers 162 tiles
 
-    // producer tiles: packStates of random closed sequences, halves 3, 5, 7, 9
-    for ([_]u32{ 3, 5, 7, 9 }) |halves| {
+    // producer tiles: packStates of random closed sequences, every halves 2..16
+    for (2..17) |hh| {
+        const halves: u32 = @intCast(hh);
         var prng = std.Random.DefaultPrng.init(0x4853 + halves);
         const tiles: usize = 8;
         const words = @as(usize, halves) * 8;
@@ -224,7 +257,7 @@ fn checkRecordDequant(ctx: *usize, rec: Fixture.Record) !void {
     ctx.* += 1;
 }
 
-test "T-HS-2: the dequant phase-A transcription is bit-identical to unpack at halves 2, 4, 6, 8 and 3, 5, 7, 9" {
+test "T-HS-2: the dequant phase-A transcription is bit-identical to unpack at every halves 2..16" {
     // oracle tiles at every width the fixture carries
     var f = try Fixture.load();
     defer f.deinit();
@@ -232,9 +265,10 @@ test "T-HS-2: the dequant phase-A transcription is bit-identical to unpack at ha
     try forEachRecord(f, &oracle_records, checkRecordDequant);
     try std.testing.expectEqual(@as(usize, 27), oracle_records);
 
-    // producer tiles at the whole suite of widths: closed-sequence packs and, at the
-    // odd widths, tiles through the step-1 encoder's encodeTile of Gaussian targets
-    for ([_]u32{ 2, 3, 4, 5, 6, 7, 8, 9 }) |halves| {
+    // producer tiles at the whole suite of widths 2..16: closed-sequence packs and,
+    // at every odd width, tiles through the step-1 encoder's encodeTile of Gaussians
+    for (2..17) |hh| {
+        const halves: u32 = @intCast(hh);
         const tiles_k: u32 = 2;
         const tiles_n: u32 = 3;
         const words = @as(usize, halves) * 8;
@@ -321,7 +355,7 @@ test "T-HS-3: the GEMV transcriptions reproduce tileStates and sit inside the ev
     std.debug.print("T-HS-3: even-half envelope {d} ulp; asserting odd widths within it\n", .{bound});
     try std.testing.expect(bound < 32); // a broken transcription or reference is not ulps away
 
-    for ([_]u32{ 3, 5, 7, 9 }) |halves| {
+    for ([_]u32{ 3, 5, 7, 9, 11, 13, 15 }) |halves| {
         var part = try Part3.init(0x9E37 + halves, halves);
         defer part.deinit();
         for (1..9) |rows_u| {
