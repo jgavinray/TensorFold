@@ -36,6 +36,7 @@ pub const Api = struct {
     zeEventPoolCreate: *const fn (H, *const EventPoolDesc, u32, ?[*]H, *H) callconv(.c) u32,
     zeEventCreate: *const fn (H, *const EventDesc, *H) callconv(.c) u32,
     zeEventHostSynchronize: *const fn (H, u64) callconv(.c) u32,
+    zeEventQueryStatus: *const fn (H) callconv(.c) u32, // the instrumented KL pass re-checks every host wait with this
     zeEventHostReset: *const fn (H) callconv(.c) u32,
     zeEventQueryKernelTimestamp: *const fn (H, *KernelTimestampResult) callconv(.c) u32,
     zeEventDestroy: *const fn (H) callconv(.c) u32,

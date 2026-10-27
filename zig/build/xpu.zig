@@ -125,6 +125,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     qwen27.addImport("xpu_qwen27_kernels", embedded);
     qwen27.addImport("ze", ze_mod);
     qwen27.addImport("core", core_mod);
+    qwen27.addImport("kl_track", @import("xpu_kl.zig").klTrackModule(b, target, optimize, false)); // qwen27.zig's host-allocator gate; serving never tracks
     // the runner's open rules (one runner at a time, every option back to the process's own), run on this host
     const host = b.graph.host.result;
     if (target.result.cpu.arch == host.cpu.arch and target.result.os.tag == host.os.tag) tests_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen27 })).step);

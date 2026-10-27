@@ -62,15 +62,24 @@ KERNEL(256) void eaq_copy16(global ushort *dst, global const ushort *src, unsign
 }
 // ---- probe-only A/B instrumentation (kl.zig's probeGemm; no serving path launches
 // these). The failure mode to isolate: eaq_gemm32 delivers exact zeros for most rows
-// of an m=1024 block. Every kernel below is eaq_gemm32's body verbatim plus the one
-// thing the probe needs; same sub-group geometry, same IO calls, same buffers.
-
+// of an m=1024 block. Every kernel below is eaq_gemm32's body plus the one thing the
+// probe needs; same sub-group geometry, same IO calls, same buffers.
+//
 // eaq_dump_areg / eaq_dump_breg: the same intel_sub_group_2d_block_read_16b_8r16x1c
 // (A) and intel_sub_group_2d_block_read_transform_16b_16r16x1c (B) calls, at the same
-// pitches/heights/origins, dumping each register's raw bits through plain per-lane
+// pitches/origins, dumping each register's raw bits through plain per-lane
 // stores at the sample k-indices KKA/KKB (nk entries; other kk values run the read but
 // are not dumped). A dump slot: ((((tileRow*16+sg)*4+i)*nk + x)*16 + lane)*8 + t ushort.
 // B dump slot: ((((tileCol*16+sg)*2+j)*nk + x)*16 + lane)*8 + t uint.
+// The A read is NOT verbatim gemm32: the m>128 isolation showed the 2d block read
+// misaddresses rows past the first tile row of its own launch (wrong y-origin), and
+// the shipped GEMM sidesteps exactly that — kl.zig's logitsBlock streams 128-row
+// chunks, each launched x=1 against an A base advanced to the chunk, at the chunk's
+// height. The dump copies that fixed IO pattern tile row by tile row: the read's
+// surface starts at its own tile row, its y never leaves that surface's first tile
+// row, and its height is the chunk's rows. Reading A the old launch-relative way
+// false-reported ~384/2048 A-register blocks non-exact while the fp64 oracle proved
+// the real GEMM's A reads exact.
 KERNEL(16 * 4 * 4) void eaq_dump_areg(global const half *A, global const half *B, global float *C,
                                        global ushort *DA, global uint *DB,
                                        int M, int NT, int K, int nk,
@@ -78,7 +87,11 @@ KERNEL(16 * 4 * 4) void eaq_dump_areg(global const half *A, global const half *B
   if (K % 16 != 0 || NT % 128 != 0) return; // workgroup-uniform trap
   const int sg = get_sub_group_id();
   const int ln = get_sub_group_local_id();
-  const int m0 = get_group_id(0) * 128 + (sg % 4) * 32;
+  const int mt0 = get_group_id(0) * 128; // this launch's tile row, as its own surface base
+  const int mh = min(128, max(0, M - mt0)); // the chunk height the shipped per-128-row launch carries
+  global const half *const At = A + (long)mt0 * K;
+  const int mrel = (sg % 4) * 32; // read y stays inside the chunk surface
+  const int m0 = mt0 + mrel; // the C store keeps gemm32's launch-relative coordinates
   const int n0 = get_group_id(1) * 128 + (sg / 4) * 32;
   float8 acc[4][2];
   __attribute__((opencl_unroll_hint))
@@ -92,7 +105,7 @@ KERNEL(16 * 4 * 4) void eaq_dump_areg(global const half *A, global const half *B
     short8 a[4];
     __attribute__((opencl_unroll_hint))
     for (int i = 0; i < 4; i++) {
-      intel_sub_group_2d_block_read_16b_8r16x1c((global void *)A, K * 2, M, K * 2, (int2)(kk * 16, m0 + 8 * i),
+      intel_sub_group_2d_block_read_16b_8r16x1c((global void *)At, K * 2, mh, K * 2, (int2)(kk * 16, mrel + 8 * i),
                                                 (private ushort *)&a[i]);
       if (slot_a >= 0) { // dump the register exactly as the mad would see it
         const ushort *p = (const ushort *)&a[i];

@@ -28,6 +28,7 @@ const q = @import("qwen27");
 const ze = q.ze;
 const kl_kernels = @import("eaq_kl_kernels");
 pub const stats = @import("kl_stats.zig");
+const kl_track = @import("kl_track"); // checked-allocator pass (zig/src/xpu/kl_track.zig); comptime no-op unless the build turns tracking on
 
 /// Source fingerprint of the gate itself (kl-order-ruling.md invariant 6, binary
 /// provenance): a 64-bit FNV-1a over the two sources that carry the statistic and the
@@ -345,7 +346,12 @@ pub const Head = struct {
     fn evWait(h: *Head, ev: ze.H) !void {
         const deadline = q.now() + 600; // seconds
         while (true) {
-            if (h.d.g.api.zeEventHostSynchronize(ev, 300_000_000_000) == 0) return;
+            if (h.d.g.api.zeEventHostSynchronize(ev, 300_000_000_000) == 0) {
+                if (kl_track.tracking and h.d.g.api.zeEventQueryStatus(ev) != 0) {
+                    kl_track.lie("zeEventHostSynchronize said done, zeEventQueryStatus says otherwise", @intFromPtr(ev));
+                }
+                return;
+            }
             if (q.now() > deadline) return error.DeviceLost;
         }
     }
@@ -769,6 +775,7 @@ fn abSampleCols(a: std.mem.Allocator, nt: usize) ![]usize {
 
 pub fn probeGemm(r: *q.Runner) !GemmAB {
     var ab = GemmAB{};
+    kl_track.phase("probeGemm"); // instrumented build: the battery's host blocks are tracked
     var head = try Head.init(r, 1024);
     defer head.deinit();
     const d = &r.d;
@@ -782,6 +789,7 @@ pub fn probeGemm(r: *q.Runner) !GemmAB {
     defer alloc.free(slab);
     try head.drainRunner(); // Head.init's slab dequant rode d.list on d.sync, the premature-sync path
     try head.download(std.mem.sliceAsBytes(slab), head.slab, K * nt * 2);
+    kl_track.verify("probeGemm:slab-downloaded");
 
     // -- 1) random integer A through the clean GEMM, full-precision oracle, both sizes
     const A = try abPattern(alloc, 1024, K, 0xEA0C_0DDE);
@@ -857,6 +865,7 @@ pub fn probeGemm(r: *q.Runner) !GemmAB {
     defer alloc.free(DB);
     try head.download(std.mem.sliceAsBytes(DA), da, da_n * 2);
     try head.download(std.mem.sliceAsBytes(DB), db, db_n * 4);
+    kl_track.verify("probeGemm:dumps-downloaded");
     // multiset check per (tileRow, sg, i, sample): the 128 dumped bits are the 8x16 block
     // of A at the read's exact origin — lane-layout agnostic, so the dump proves what the
     // hardware delivered regardless of how the matrix maps to lanes
@@ -1326,6 +1335,7 @@ fn argmaxMax(z: []const f32) struct { at: u32, max: f32 } {
 /// runner and the head are never built, and the identity run needs no card.
 pub fn run(req: Options) !Report {
     refuseStudyModes();
+    kl_track.phase("kl.run:begin");
     var o = req;
     if (req.dump_ref) |dr| { // ref production (the xpu-eaq-ref contract as a mode): the same serving path, logits streamed to disk
         if (req.ref != null or req.self_mode) return Error.MissingMode; // --dump-ref stands alone
@@ -1423,6 +1433,7 @@ pub fn run(req: Options) !Report {
         //    the last row's chunk keeps the runner's own logits for the spot check
         const r = try q.Runner.init(o.pack, o.context);
         rp = r;
+        kl_track.verify("after-runner-init");
         armed = true;
         armDrain(&r.d);
         defer if (rp) |rr| rr.deinit(); // registered the moment the runner exists
@@ -1433,9 +1444,12 @@ pub fn run(req: Options) !Report {
         const cap = try captureHidden(r, rows, seq_rows - 1);
         cap_fd = cap.fd;
         prompts_s = q.now() - t0;
+        kl_track.verify("after-captureHidden"); // the memfd pass just ran; every host block it owned is live or quarantined
+        kl_track.expect("captureHidden memfd", @intCast(cap.bytes)); // the rows-scaled region (419 MB at 20 rows)
         if (cap.bytes != @as(u64, positions) * q.D * 2) return Error.HiddenShort;
         runner_logits = try alloc.dupe(f32, try r.logits()); // the fp16 head GEMV's kept row, read before anything else touches the device
         std.debug.print("  prompts: {d:.1} s, hidden {d} B\n", .{ prompts_s, cap.bytes });
+        kl_track.expect("hbuf hidden rows slice", o.block * q.D * 2);
         hbuf = try alloc.alloc(u16, o.block * q.D);
     }
 
@@ -1457,6 +1471,7 @@ pub fn run(req: Options) !Report {
         rmap = m.p;
         rmap_len = o.block * q.VOCAB * @sizeOf(f32);
         rbuf = m.buf;
+        kl_track.expect("logits D2H block window", o.block * q.VOCAB * 4); // the m_blk×248320×4 B per-block downloads
     }
     defer if (rmap) |p| { _ = munmap(p, rmap_len); };
     var cbuf: []f32 = &.{};
@@ -1468,10 +1483,13 @@ pub fn run(req: Options) !Report {
     //    this ordering fixes: cbuf was sized here from hd, which step 2 only set below).
     if (!logits_mode) {
         const t1 = q.now();
+        kl_track.phase("head-init"); // the crash site: module load + keep-list appends ride the host block allocator next
+        kl_track.expect("head slab H2D", 2 * 5120 * q.VOCAB); // the 2.54 GB dequantized slab
         head_mem = try Head.init(rp.?, @intCast(o.block));
         hd = &head_mem;
         head_nt = head_mem.nt;
         dequant_s = q.now() - t1;
+        kl_track.verify("after-head-init");
     }
     if (logits_mode) {
         const m = try mapF32(o.block * q.VOCAB);
@@ -1525,6 +1543,7 @@ pub fn run(req: Options) !Report {
     for (0..nb) |bi| {
         const base = bi * o.block;
         const m = @min(o.block, positions - base);
+        kl_track.phase(std.fmt.allocPrint(alloc, "block {d}/{d}", .{ bi + 1, nb }) catch "block");
         if (!logits_mode) {
             const hb = std.mem.sliceAsBytes(hbuf[0 .. m * q.D]);
             preadAll(cap_fd, hb, @as(i64, @intCast(base * q.D * 2))) catch return Error.HiddenShort;
@@ -1547,6 +1566,7 @@ pub fn run(req: Options) !Report {
         } else {
             try hd.?.logitsBlock(std.mem.sliceAsBytes(hbuf[0 .. m * q.D]), @intCast(m), cbuf[0 .. m * head_nt], 0);
         }
+        kl_track.verify("after-gemm-download"); // logitsBlock's host staging + the 64 MiB copy slices just landed
         const t2 = q.now();
         var ctx = BlockCtx{
             .cand = cbuf, .ref = if (o.self_mode) cbuf else rbuf,
@@ -1557,6 +1577,7 @@ pub fn run(req: Options) !Report {
         };
         try parallelRows(&ctx, m, threads);
         stats_s += q.now() - t2;
+        kl_track.verify("after-stats");
         if (!logits_mode) for (0..m) |i| { // the guard's raw material, free off the stats pass
             const am = rows_stats[base + i].a_cand;
             const gop = try cand_amap.getOrPut(am);
@@ -1846,6 +1867,7 @@ pub fn run(req: Options) !Report {
     if (self_check) |sc| {
         if (!sc.pass) return Error.SelfCheck;
     }
+    kl_track.finish(); // instrumented build: final sweep + leak/instance audit before the teardown the segfault hunts
     return report;
 }
 
@@ -1853,6 +1875,14 @@ pub fn run(req: Options) !Report {
 /// MAP_POPULATE, self-touched before any syscall sees it (see the note above rbuf).
 fn mapF32(n: usize) !struct { p: *anyopaque, buf: []f32 } {
     const bytes = n * @sizeOf(f32);
+    if (kl_track.tracking) {
+        // the instrumented pass seals both ends with PROT_NONE guard pages: a pread or a
+        // memcpy that runs off this buffer faults at the offender instead of eating the
+        // neighbour (the streaming-mmap-vs-heap interplay under investigation)
+        const g = try kl_track.mapGuarded(bytes);
+        const gp: [*]f32 = @ptrCast(@alignCast(g.p));
+        return .{ .p = g.p, .buf = gp[0..n] };
+    }
     const p = mmap(null, bytes, PROT_RW, MAP_PRIVATE_ANON_POP, -1, 0);
     if (@intFromPtr(p) == @as(usize, @bitCast(@as(isize, -1)))) return error.OutOfMemory;
     const fp: [*]f32 = @ptrCast(@alignCast(p));
@@ -1860,7 +1890,6 @@ fn mapF32(n: usize) !struct { p: *anyopaque, buf: []f32 } {
     @memset(buf, 0);
     return .{ .p = p, .buf = buf };
 }
-
 /// The provenance flag (kl-order-ruling.md invariant 6, pack manifest or stock-layout
 /// flag): an EAQ pack carries eaq_manifest.json (the runner's dispatch key), a stock
 /// EXL3 pack does not; the diagnostic mode has no pack at all.

@@ -14,8 +14,37 @@ fn userOption(b: *std.Build, name: []const u8, default: []const u8) []const u8 {
     }
     return default;
 }
+/// The checked-allocator module (zig/src/xpu/kl_track.zig), wired with the kl_build
+/// options import it needs. Every qwen27-module creator must supply it as the
+/// "kl_track" import (qwen27.zig's host allocator is gated on @import("kl_track")
+/// .tracking); non-KL builds (serving, quant, ref) pass tracking=false and get a
+/// module whose every entry point is comptime-unused — q.alloc stays c_allocator.
+pub fn klTrackModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, tracking: bool) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption(bool, "tracking", tracking);
+    const m = b.createModule(.{
+        .root_source_file = b.path("zig/src/xpu/kl_track.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    m.addOptions("kl_build", opts);
+    return m;
+}
 
 pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    // one knob of its own: the KL gate alone can be built in another optimize mode —
+    // the allocator-instance instrumentation pass runs on a debug xpu-eaq-kl (safety
+    // checks on, kl_track.zig) without touching any other target's mode. Artifacts go
+    // to a -p prefix (e.g. /tmp/klgatebin, /tmp/klgatebin-dbg), never zig-out/bin.
+    const kl_opt = b.option(std.builtin.OptimizeMode, "kl-opt", "optimize mode for xpu-eaq-kl alone (default: the build's -Doptimize)") orelse optimize;
+    // the allocator-instance pass (ticket 2): -Dkl-track=true, or TF_KL_ALLOC_TRACK=1
+    // in the build environment, compiles kl_track.zig into the exe root; the flag
+    // reaches it through the kl_build options module below. Unset, every tracker
+    // entry point is comptime-unused and q.alloc stays the plain c_allocator.
+    const alloc_track = b.option(bool, "kl-track", "instrument xpu-eaq-kl's host allocator (kl_track.zig): redzones, free-poison quarantine, backtraces") orelse
+        (b.graph.environ_map.get("TF_KL_ALLOC_TRACK") != null);
+    const track_mod = klTrackModule(b, target, kl_opt, alloc_track);
     // xpu.zig's steps() already declared these options; re-declaring panics the
     // configurer, so read the user-set values straight off the map and keep the
     // same defaults (bmg / ocloc / ngen) as zig/build/xpu.zig does.
@@ -104,13 +133,20 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const eaq_kl align(8) = @embedFile("eaq_kl.bin").*;
         \\
     ) });
-    const ze_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/ze.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    const core_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    const qwen27 = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const ze_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/ze.zig"), .target = target, .optimize = kl_opt, .link_libc = true });
+    const core_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = kl_opt, .link_libc = true });
+    const qwen27 = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27.zig"), .target = target, .optimize = kl_opt, .link_libc = true });
     qwen27.addImport("xpu_qwen27_kernels", embedded);
     qwen27.addImport("ze", ze_mod);
     qwen27.addImport("core", core_mod);
-    const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/kl_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    qwen27.addImport("kl_track", track_mod);
+    const module = b.createModule(.{
+        .root_source_file = b.path("zig/src/xpu/kl_main.zig"),
+        .target = target,
+        .optimize = kl_opt,
+        .link_libc = true,
+    });
+    module.addImport("kl_track", track_mod);
     module.addImport("xpu_qwen27_kernels", embedded); // the runner's images (kl.zig only needs its own, qwen27.zig needs all)
     module.addImport("eaq_kl_kernels", kl_kernels);
     module.addImport("ze", ze_mod);

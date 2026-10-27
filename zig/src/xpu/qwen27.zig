@@ -45,7 +45,13 @@ pub const no_q8 = fwd.no_q8;
 pub const Mode = fwd.Mode;
 pub const Capture = fwd.Capture;
 
-pub const alloc = std.heap.c_allocator;
+/// The host allocator for the runner and the KL gate. With the kl_track build
+/// option off — every shipped build, and every creator except zig/build/xpu_kl.zig
+/// which passes tracking=false — this is exactly the c_allocator it always was.
+/// The KL allocator-instance pass (the 20-row --self heap-corruption investigation)
+/// builds it as the checked, poison-quarantining, backtrace-tracked allocator in
+/// kl_track.zig; see that file for what the pass reports.
+pub const alloc: std.mem.Allocator = if (@import("kl_track").tracking) @import("kl_track").allocator else std.heap.c_allocator;
 
 // Qwen3.8-27B shape (checked against config.json at load).
 pub const D = 5120;

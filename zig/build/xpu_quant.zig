@@ -107,6 +107,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     qwen27.addImport("xpu_qwen27_kernels", embedded);
     qwen27.addImport("ze", ze_mod);
     qwen27.addImport("core", core_mod);
+    qwen27.addImport("kl_track", @import("xpu_kl.zig").klTrackModule(b, target, optimize, false)); // qwen27.zig's host-allocator gate; quant never tracks
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/quant_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addImport("xpu_qwen27_kernels", embedded); // the runner's images (quant.zig's kernel table loads them all)
     module.addImport("ze", ze_mod);
