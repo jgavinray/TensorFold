@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.2
 
+- The XPU quantizer grades the o_proj/out_proj head-strip family on its own probe band ([0.10, 0.20], hard red above 0.20, joint amber at corr < 0.99 with block RMS > 0.18) while wide parts keep [0.10, 0.16], and a resumed run no longer corrupts its progress file: each layer record owns its fragment path, so a multi-layer progress file parses and every recorded fragment re-hashes before it is skipped.
+
 - Two host tools carry the mixed half-step pack (T-HS-10): `zig build eaq-mixed-plan` installs tf-eaq-mixed-plan, which turns an allocator plan into the explicit-width plan the driver consumes (--plan) — per-part halves, the K*N-weighted target, the declared-sha gate on the base plan and a planFromJson round-trip self-check; `zig build eaq-frag-merge` installs tf-eaq-frag-merge, which merges per-layer trellis fragments (first --frag-dir hit wins, size-checked shadows) over a full-width dense source through the writer (shards 8, allow_odd_bits) and proves the pack with openPack, the Table and the admission histogram, refusing unless the halves-5 count is 26.
 
 - Chat prompts keep request text out of the added vocabulary: a control-token spelling in a message, tool definition, tool result, reasoning field or decision label is encoded as ordinary text, while chat templates still see the real text. A request whose text would still encode to an added-token id is refused instead, explicit `--vision` refuses to start when an image marker is not an added token, and LFM2's automatic image input turns off with a warning rather than failing the load (#1117). Thanks to @Acermax.

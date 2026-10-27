@@ -76,6 +76,13 @@ Geometry: the encoder's strip loop runs at count=32 (measured 604.7 tiles/s on a
 the free-running batched kernel); the LDLQ update kernel's cost is under the noise floor (≤1.3 %) and
 needs no tuning.
 
+The probe's G2 block band is width-dependent by design: the o_proj/out_proj head-strip family is a
+16-row-per-column strip whose error runs systematically higher than the wide parts (family mean
+0.151, sigma 0.017 across the measured series), so it is graded on [0.10, 0.20] with a hard red
+above 0.20 and a joint amber at corr < 0.99 with block RMS > 0.18, while wide parts keep
+[0.10, 0.16] and their per-column band. A joint amber is not a stop: it flags the family for the
+pack's self-check (ruling 2026-10-27).
+
 Plan mode:
 
 ```sh
