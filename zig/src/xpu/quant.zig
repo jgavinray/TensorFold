@@ -866,6 +866,7 @@ const ProbeJob = struct {
     p_wc: []u32 = &.{},
     p_clamp: []u32 = &.{},
     p_col: []f64 = &.{},
+    p_col_all: []f64 = &.{}, // whole-column ratio energy over ALL rows (g2-colfloor ruling 2026-10-27)
     hist: [31]u64 = @splat(0),
     g3_uncl: usize = 0,
     g3_clmp: usize = 0,
@@ -937,6 +938,7 @@ const ProbeJob = struct {
                     }
                     j.ht_min = m;
                 }
+                j.p_col_all[cc] += ef * ef; // the shipped-bytes column gate reads this, not the 16-row window (g2-colfloor ruling)
                 if (jb == j.j0) {
                     j.p_col[cc] += ef * ef;
                     j.hist[@min(@as(usize, @intFromFloat(@floor(ef * 10))), j.hist.len - 1)] += 1; // scale units, the ruling's 0.1-bin table
@@ -983,6 +985,7 @@ const ProbeCtx = struct {
     p_wc: []u32 = &.{},
     p_clamp: []u32 = &.{},
     p_col: []f64 = &.{},
+    p_col_all: []f64 = &.{},
     kblks: usize = 0,
 
     fn entry(ctx: *const anyopaque, b0: usize, b1: usize, idx: usize) void {
@@ -995,6 +998,7 @@ const ProbeCtx = struct {
         j.p_wc = c.p_wc[idx * c.kblks ..][0..c.kblks];
         j.p_clamp = c.p_clamp[idx * c.kblks ..][0..c.kblks];
         j.p_col = c.p_col[idx * c.base.n ..][0..c.base.n];
+        j.p_col_all = c.p_col_all[idx * c.base.n ..][0..c.base.n];
         j.run(b0 * 16, b1 * 16);
     }
 };
@@ -2135,9 +2139,13 @@ pub const Quantizer = struct {
     ///                       o_proj/out_proj head-strip family (g2-band ruling
     ///                       2026-10-27: K-per-column 624 vs 80, observed family drift
     ///                       0.1269..0.1852, ~3 sigma; hard RED above 0.20); the ruling's per-column
-    ///                       [0.08, 0.20] count prints as a diagnostic, the gate runs on
-    ///                       [0.04, 0.40] (a 16-row column estimate carries ~18 pct
-    ///                       sampling noise); eta_sq/(K*N) in [0.0156, 0.026] (proxy);
+    ///                       [0.08, 0.20] count prints as a diagnostic; the column RED
+    ///                       reads WHOLE-COLUMN ratios (all k rows of the file-decoded
+    ///                       pack) with floor 0.06 — the 16-row window is diagnostic on
+    ///                       the low side (nu = 16 noise puts a healthy column's window
+    ///                       at ~5e-6 per column below 0.04, ~1 false gate per 11 parts;
+    ///                       g2-colfloor ruling 2026-10-27) and stays RED above 0.40;
+    ///                       eta_sq/(K*N) in [0.0156, 0.026] (proxy);
     ///                       absolute src/decoded/error RMS printed beside the ratios;
     ///   G3                  same block: unclamped elements |E| <= 2.0 (the ruling's own
     ///                       5.6-sigma-clamped-to-3.77 arithmetic leaves ~1.9 units);
@@ -2350,6 +2358,9 @@ pub const Quantizer = struct {
             const col_sq = try alloc.alloc(f64, n); // the feedback-free block's per-column sums
             defer alloc.free(col_sq);
             @memset(col_sq, 0);
+            const col_all_sq = try alloc.alloc(f64, n); // whole-column sums, all k rows of each live column
+            defer alloc.free(col_all_sq);
+            @memset(col_all_sq, 0);
             var hist: [31]u64 = @splat(0);
             var g3_uncl: usize = 0; // unclamped |E| over 2.0 (the Viterbi bound, with the closure allowance)
             var g3_clmp: usize = 0; // clamped |E| over |T| - 3.775 + 1 (the clamp recovery bound, rotated domain)
@@ -2392,12 +2403,15 @@ pub const Quantizer = struct {
             @memset(p_wc, 0);
             @memset(p_clamp, 0);
             @memset(p_col, 0);
+            const p_col_all = try alloc.alloc(f64, split.njobs * n);
+            defer alloc.free(p_col_all);
+            @memset(p_col_all, 0);
             const pjobs = try alloc.alloc(ProbeJob, split.njobs);
             defer alloc.free(pjobs);
             const pctx = ProbeCtx{
                 .base = .{ .tt = tt, .out64 = out64, .zc = zc, .bytes = t.bytes, .svh = pw.svh, .k = k, .n = n, .n0 = 0, .j0 = j0 }, // n0 here indexes the part's OWN tensor (the source-bf16 read); the slab reads keep pw.spec.n0
                 .jobs = pjobs,
-                .p_sq = p_sq, .p_worst = p_worst, .p_wr = p_wr, .p_wc = p_wc, .p_clamp = p_clamp, .p_col = p_col,
+                .p_sq = p_sq, .p_worst = p_worst, .p_wr = p_wr, .p_wc = p_wc, .p_clamp = p_clamp, .p_col = p_col, .p_col_all = p_col_all,
                 .kblks = kblks,
             };
             chunkRun(&pctx, kblks, split, ProbeCtx.entry);
@@ -2411,7 +2425,10 @@ pub const Quantizer = struct {
                         blk_wc[b] = jm.p_wc[b];
                     }
                 }
-                for (0..n) |cc| col_sq[cc] += jm.p_col[cc];
+                for (0..n) |cc| {
+                    col_sq[cc] += jm.p_col[cc];
+                    col_all_sq[cc] += jm.p_col_all[cc];
+                }
                 for (0..hist.len) |bi| hist[bi] += jm.hist[bi];
                 g3_uncl += jm.g3_uncl;
                 g3_clmp += jm.g3_clmp;
@@ -2483,6 +2500,10 @@ pub const Quantizer = struct {
             var col_badfirst: usize = 0;
             var col_lo: f64 = std.math.inf(f64);
             var col_hi: f64 = 0;
+            var col_all_lo: f64 = std.math.inf(f64);
+            var col_ship_bad: usize = 0; // whole-column ratio under the 0.06 collapse floor
+            var col_ship_first: usize = 0;
+            const krows: f64 = @floatFromInt(k);
             for (0..n) |cc| {
                 if (zc[cc]) continue;
                 const cr = @sqrt(col_sq[cc] / 16);
@@ -2492,9 +2513,15 @@ pub const Quantizer = struct {
                     if (col_out == 0) col_first = cc;
                     col_out += 1;
                 }
-                if (cr < 0.04 or cr > 0.40) {
+                if (cr > 0.40) { // high side only: the nu = 16 upper tail at 0.40 against a 0.135 population is ~1e-17 per column - safe as RED
                     if (col_bad == 0) col_badfirst = cc;
                     col_bad += 1;
+                }
+                const cr_all = @sqrt(col_all_sq[cc] / krows);
+                col_all_lo = @min(col_all_lo, cr_all);
+                if (cr_all < 0.06) { // the collapse floor: healthy whole-column minima measure 0.156 (54 parts); a zero-error column reads ~0
+                    if (col_ship_bad == 0) col_ship_first = cc;
+                    col_ship_bad += 1;
                 }
             }
             const nelems: f64 = @floatFromInt(k * n);
@@ -2508,8 +2535,8 @@ pub const Quantizer = struct {
             }
             var eta_txt: [40]u8 = undefined;
             const eta_str: []const u8 = if (eta_ratio) |r| std.fmt.bufPrint(&eta_txt, "{d:.6}", .{r}) catch "?" else "-";
-            std.debug.print("quant: T-LDLQ-5 {s}: G2 feedback-free block {d} (rows {d}..{d}): err RMS {d:.6} of scale (bounds [0.10,{d:.2}]); corr(pack, source) {d:.4} weight space (gate 0.98 - 1/sqrt(1+0.16^2)=0.9874 is the Shannon ceiling at the band's upper edge); corr(pack, rotated target) {d:.4} cross-domain (informational, expected ~0); heavy tail top-{d} median err {d:.3} scale units on |source| rank (bound 2.0); per-column min {d:.4} max {d:.4}, outside [0.08,0.20]: {d} (first {d}); gated outside [0.04,0.40]: {d} (first {d}); eta_sq/(K*N) {s} (bounds [0.0156,0.026]); absolute RMS: src {e:.6}, decoded {e:.6}, block error {e:.6}\n", .{
-                pw.spec.base, j0, k - 16, k - 1, j0_rms, g2_hi, r_pack, r_rot, ht_src.len, ht_med, col_lo, col_hi, col_out, col_first, col_bad, col_badfirst,
+            std.debug.print("quant: T-LDLQ-5 {s}: G2 feedback-free block {d} (rows {d}..{d}): err RMS {d:.6} of scale (bounds [0.10,{d:.2}]); corr(pack, source) {d:.4} weight space (gate 0.98 - 1/sqrt(1+0.16^2)=0.9874 is the Shannon ceiling at the band's upper edge); corr(pack, rotated target) {d:.4} cross-domain (informational, expected ~0); heavy tail top-{d} median err {d:.3} scale units on |source| rank (bound 2.0); per-column window min {d:.4} max {d:.4}, outside [0.08,0.20]: {d} (first {d}); window-gated >0.40: {d} (first {d}); whole-col min {d:.4} gated <0.06: {d} (first {d}); eta_sq/(K*N) {s} (bounds [0.0156,0.026]); absolute RMS: src {e:.6}, decoded {e:.6}, block error {e:.6}\n", .{
+                pw.spec.base, j0, k - 16, k - 1, j0_rms, g2_hi, r_pack, r_rot, ht_src.len, ht_med, col_lo, col_hi, col_out, col_first, col_bad, col_badfirst, col_all_lo, col_ship_bad, col_ship_first,
                 eta_str, // the eta plane is the encoder's own per-element energy
                 src_rms_abs, dec_rms_abs, err_abs_rms,
             });
@@ -2550,7 +2577,7 @@ pub const Quantizer = struct {
             // the bound |T|-3.775+1, unclamped at 2.0 (the ruling's 5.6-sigma clamp arithmetic).
             const eta_bad = if (eta_ratio) |r| !(r >= 0.0156 and r <= 0.026) else false;
             const red = na_all != 0 or
-                !(j0_rms >= 0.10 and j0_rms <= g2_hi) or col_bad != 0 or eta_bad or
+                !(j0_rms >= 0.10 and j0_rms <= g2_hi) or col_bad != 0 or col_ship_bad != 0 or eta_bad or
                 r_pack < 0.98 or ht_med > 2.0 or
                 g3_uncl != 0 or g3_clmp != 0 or blk_clamp[j0] > @as(u32, @intFromFloat(2 * clamp_exp));
             if (red) {
@@ -2561,8 +2588,8 @@ pub const Quantizer = struct {
                     dcol = wa_c;
                 }
                 try self.dumpWorstElement(site, sp, &pw, su, drow, dcol, @floatCast(src_rms_abs)); // the red trail (Main 2026-10-25); green parts never reach it
-                std.debug.print("quant: T-LDLQ-5 {s}: RED (G1 encoder-decode {d}, slab {d} informational, G2 block RMS {d:.6}, corr {d:.4}, tail med {d:.3}, columns gated {d} (diagnostic {d}), eta {s}, G3 {d}+{d}, clamps {d}/{d:.1})\n", .{
-                    pw.spec.base, na_all, nb_all, j0_rms, r_pack, ht_med, col_bad, col_out, eta_str,
+                std.debug.print("quant: T-LDLQ-5 {s}: RED (G1 encoder-decode {d}, slab {d} informational, G2 block RMS {d:.6}, corr {d:.4}, tail med {d:.3}, window-gated {d} (diagnostic {d}), whole-col min {d:.4} gated {d}, eta {s}, G3 {d}+{d}, clamps {d}/{d:.1})\n", .{
+                    pw.spec.base, na_all, nb_all, j0_rms, r_pack, ht_med, col_bad, col_out, col_all_lo, col_ship_bad, eta_str,
                     g3_uncl, g3_clmp, blk_clamp[j0], clamp_exp,
                 });
                 return error.ProbeFailed;
