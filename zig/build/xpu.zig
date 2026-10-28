@@ -101,6 +101,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     });
     module.addImport("core", core_mod);
     module.addImport("ze", ze_mod);
+    // qwen27.zig's host-allocator gate (kl_track) rides into every module that
+    // imports qwen27.zig; the runner serves, it never tracks.
+    module.addImport("kl_track", @import("xpu_kl.zig").klTrackModule(b, target, optimize, false));
     const exe = b.addExecutable(.{ .name = "xpu-qwen27", .root_module = module });
     const install = b.addInstallArtifact(exe, .{});
     b.step("xpu-qwen27", "Build the Qwen3.8-27B XPU forward runner (needs ocloc, a C++17 compiler and nGEN headers)").dependOn(&install.step);
