@@ -33,6 +33,8 @@ const usage =
     \\                           parts [{base, halves}], plan_sha); default: uniform --bits
     \\  --device-check             probe the card (Level Zero free bytes vs this run's
     \\                             estimate): exit 0 fits, 3 short — the run script's pre-flight
+    \\  --verify-pack              audit OUT with the reader (openEaq + loadExl3, host-only):
+    \\                             exit 0 clean, 4 refused — the tamper-refusal probe
     \\  --dry-run                run the gates, write no pack, record no progress
     \\
 ;
@@ -67,6 +69,8 @@ pub fn main(init: std.process.Init) !void {
             o.dry_run = true;
         } else if (std.mem.eql(u8, a, "--device-check")) {
             o.device_check = true;
+        } else if (std.mem.eql(u8, a, "--verify-pack")) {
+            o.verify_pack = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -110,6 +114,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (o.device_check) {
         std.process.exit(quant.deviceCheck(o) catch 3);
+    }
+    if (o.verify_pack) {
+        std.process.exit(quant.verifyPack(o) catch 4);
     }
     quant.run(o) catch |e| {
         std.debug.print("xpu-eaq-quant: {s}\n", .{@errorName(e)});

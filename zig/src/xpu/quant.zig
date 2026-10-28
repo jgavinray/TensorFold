@@ -125,6 +125,7 @@ pub const Options = struct {
     resume_run: bool = false,
     dry_run: bool = false,
     device_check: bool = false, // the card probe mode (Main 2026-10-26, the device-memory gate)
+    verify_pack: bool = false, // the host-only pack audit (the reader's verdict, no card)
     plan_path: []const u8 = "", // the allocator's plan JSON (--plan); empty synthesizes the degenerate uniform plan
 };
 
@@ -2886,8 +2887,11 @@ pub const Quantizer = struct {
         };
         const parts = try alloc.dupe(PartRecord, self.records.items);
         for (parts) |*r| {
-            const tn = try fmtStr("{s}.trellis", .{r.prefix});
-            defer alloc.free(tn);
+            // Fragments follow the PACK naming (stock names, no language_model hop —
+            // quant.zig packName, load.zig:428/441); the record prefix is the SOURCE
+            // plan name, so map before the lookup (publish failed on this 2026-10-28:
+            // "layers.0...in_proj_qkv has no .trellis tensor in any fragment").
+            const tn = try fmtStr("{s}.trellis", .{try packName(r.prefix)});
             hit: {
                 for (frags) |ck| for (ck.tensors.items) |t| if (std.mem.eql(u8, t.name, tn)) {
                     const hx = sha256Hex(t.bytes);
@@ -3147,6 +3151,19 @@ pub fn deviceCheck(o: Options) !u8 {
         std.debug.print("device: the memory probe failed; need {d} (+1 GiB) — cannot confirm the card fits\n", .{need});
         return 3;
     }
+}
+
+/// Host-only pack audit: the reader's own openEaq (config's eaq block, the manifest
+/// against the marker's hash, every shard's size and sha256, the Table) plus the full
+/// loadExl3 admission — the publish verdict re-runnable against any directory, which is
+/// the tamper-refusal probe. Exit 0 clean, 4 refused; the device is never opened.
+pub fn verifyPack(o: Options) !u8 {
+    var rd: Checkpoint = .{};
+    try rd.openEaq(o.out);
+    _ = try load.admitExl3(&rd);
+    rd.deinit();
+    std.debug.print("quant: verify-pack {s} clean\n", .{o.out});
+    return 0;
 }
 
 /// Takes the card lease: O_CREAT + flock(LOCK_EX|LOCK_NB), then writes pid, start time,
