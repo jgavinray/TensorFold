@@ -107,6 +107,7 @@ KERNEL(16 * 4 * 4) void eaq_dump_areg(global const half *A, global const half *B
     for (int i = 0; i < 4; i++) {
       intel_sub_group_2d_block_read_16b_8r16x1c((global void *)At, K * 2, mh, K * 2, (int2)(kk * 16, mrel + 8 * i),
                                                 (private ushort *)&a[i]);
+      __asm__ __volatile__("" : "+r"(*(uint *)&a[i]) : : "memory"); // force the read to reissue per kk
       if (slot_a >= 0) { // dump the register exactly as the mad would see it
         const ushort *p = (const ushort *)&a[i];
         long o = ((((long)get_group_id(0) * 16 + sg) * 4 + i) * nk + slot_a) * 128 + ln * 8;
@@ -183,5 +184,42 @@ KERNEL(16 * 4 * 4) void eaq_ab_store16(global const half *A, global const half *
       intel_sub_group_2d_block_write_16b_8r16x1c(C, NT * 2, M, NT * 2, (int2)(n0 + 16 * j, m0 + 8 * i),
                                                  (private ushort *)&h);
     }
+  }
+}
+
+// eaq_dump_ab: the register dump without the GEMM loop — one launch per sampled kk, so the
+// read's register can never be reused across kk (the stale-register class of bug that made
+// the A dump report 384/2048 bad blocks in eaq_dump_areg). Same geometry, same slot layout;
+// the host launches it once per sample and checks the multiset per slot.
+KERNEL(16 * 4 * 4) void eaq_dump_ab(global const half *A, global const half *B,
+                                    global ushort *DA, global uint *DB,
+                                    int M, int NT, int K, int kk0, int slot, int nk) {
+  if (K % 16 != 0 || NT % 128 != 0) return; // workgroup-uniform trap
+  const int sg = get_sub_group_id();
+  const int ln = get_sub_group_local_id();
+  const int mt0 = get_group_id(0) * 128;
+  const int mh = min(128, max(0, M - mt0));
+  global const half *const At = A + (long)mt0 * K;
+  const int mrel = (sg % 4) * 32;
+  const int n0 = get_group_id(1) * 128 + (sg / 4) * 32;
+  __attribute__((opencl_unroll_hint))
+  for (int i = 0; i < 4; i++) {
+    short8 a;
+    intel_sub_group_2d_block_read_16b_8r16x1c((global void *)At, K * 2, mh, K * 2, (int2)(kk0 * 16, mrel + 8 * i),
+                                              (private ushort *)&a);
+    const ushort *p = (const ushort *)&a;
+    long o = ((((long)get_group_id(0) * 16 + sg) * 4 + i) * nk + slot) * 128 + ln * 8;
+    __attribute__((opencl_unroll_hint))
+    for (int t = 0; t < 8; t++) DA[o + t] = p[t];
+  }
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 2; j++) {
+    uint8 bb;
+    intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)B, NT * 2, K, NT * 2,
+                                                         (int2)(n0 + 16 * j, kk0 * 16), (private uint *)&bb);
+    const uint *p = (const uint *)&bb;
+    long o = ((((long)get_group_id(1) * 16 + sg) * 2 + j) * nk + slot) * 128 + ln * 8;
+    __attribute__((opencl_unroll_hint))
+    for (int t = 0; t < 8; t++) DB[o + t] = p[t];
   }
 }

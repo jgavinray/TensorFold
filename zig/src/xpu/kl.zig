@@ -1004,12 +1004,22 @@ pub fn probeGemm(r: *q.Runner) !GemmAB {
     defer d.g.free(da);
     const db = try d.alloc_(db_n * 4);
     defer d.g.free(db);
-    const dumpk = try d.kernel(try d.g.module(&kl_kernels.eaq_kl), "eaq_dump_areg", 256);
+    const gemmk = try d.kernel(try d.g.module(&kl_kernels.eaq_kl), "eaq_dump_areg", 256);
+    const dumpk = try d.kernel(try d.g.module(&kl_kernels.eaq_kl), "eaq_dump_ab", 256);
     const st16k = try d.kernel(try d.g.module(&kl_kernels.eaq_kl), "eaq_ab_store16", 256);
-    try head.launchProbe(dumpk, 8, @intCast(nt / 128), .{
+    try head.launchProbe(gemmk, 8, @intCast(nt / 128), .{
         head.a, head.slab, head.c, da, db,
         @as(i32, 1024), @as(i32, @intCast(nt)), @as(i32, @intCast(K)), @as(i32, @intCast(nk)), kkk, kkk,
     });
+    // per-sample dump launches: one read per kk per launch, so the register can never be
+    // reused across kk (the stale-register class of bug that broke the in-loop dumps)
+    for (0..nk) |x| {
+        try head.launchProbe(dumpk, 8, @intCast(nt / 128), .{
+            head.a, head.slab, da, db,
+            @as(i32, 1024), @as(i32, @intCast(nt)), @as(i32, @intCast(K)),
+            @as(i32, kks[x]), @as(i32, @intCast(x)), @as(i32, @intCast(nk)),
+        });
+    }
     const DA = try alloc.alloc(u16, da_n);
     defer alloc.free(DA);
     const DB = try alloc.alloc(u32, db_n);
