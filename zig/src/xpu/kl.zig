@@ -196,6 +196,7 @@ pub const Head = struct {
 
     pub fn init(r: *q.Runner, block: u32) !Head {
         const d = &r.d;
+        if (kl_track.tracking) headCheck("head-init-entry", r);
         const hx = r.model.head.exl3 orelse return Error.NoTrellisHead;
         const K = r.model.head.k;
         const nt = hx.nt;
@@ -1326,6 +1327,25 @@ fn argmaxMax(z: []const f32) struct { at: u32, max: f32 } {
     return .{ .at = at, .max = mx };
 }
 
+/// The head-projection snapshot for the tracking builds (kl.zig heap-corruption ticket):
+/// what Head.init is about to read, printed at the phase boundaries of the prompts window.
+/// The first checkpoint that prints a poison (0xaa) or small-int exl3 names the window the
+/// write landed in; a checkpoint that dies printing *exl3 proves the pointer field itself
+/// is already garbage at that point.
+fn headCheck(where: []const u8, r: *q.Runner) void {
+    const pj = &r.model.head;
+    const hxp: usize = if (pj.exl3) |p| @intFromPtr(p) else 0;
+    std.debug.print("  kl_track: headcheck[{s}] r=0x{x} head.n={d} head.k={d} head.gs={d} head.w=0x{x} exl3=0x{x}\n", .{
+        where, @intFromPtr(r), pj.n, pj.k, pj.gs, @intFromPtr(pj.w), hxp,
+    });
+    if (pj.exl3) |hx| {
+        std.debug.print("    headcheck[{s}] *exl3 nt={d} parts=0x{x}[{d}] part0.tr=0x{x} n={d} n0={d} halves={d} dense={}\n", .{
+            where, hx.nt, @intFromPtr(hx.parts.ptr), hx.parts.len, @intFromPtr(hx.parts[0].tr),
+            hx.parts[0].n, hx.parts[0].n0, hx.parts[0].halves, hx.parts[0].dense,
+        });
+    }
+}
+
 /// The whole gate run. Prints a progress line per block plus the invariant lines,
 /// writes --report (kl.json), --dump-logits, --dump-kl and --dump-hist when asked,
 /// and returns the report. In --self mode and in the ref-vs-ref identity run the
@@ -1406,8 +1426,9 @@ pub fn run(req: Options) !Report {
     // per-position argmaxes and max logits come from the block loop's cbuf for free.
     var cand_amap = std.AutoHashMap(u32, u32).init(alloc); // argmax -> count
     defer cand_amap.deinit();
-    var cand_maxes = try alloc.alloc(f32, positions); // the max logit of every position
+    var cand_maxes = try alloc.alloc(f32, positions); // the max logit of every natural position
     defer alloc.free(cand_maxes);
+    var nat_n: usize = 0; // natural positions fed to the guard below
 
     const threads = @min(if (o.threads != 0) o.threads else std.Thread.getCpuCount() catch 1, @max(1, @divTrunc(positions, 8)));
     std.debug.print("xpu-eaq-kl: pack {s}\n  prompts {s} sha256 {s}\n  {d} rows x {d} = {d} positions, ref {s}, block {d}, {d} threads\n", .{
@@ -1433,11 +1454,16 @@ pub fn run(req: Options) !Report {
         //    the last row's chunk keeps the runner's own logits for the spot check
         const r = try q.Runner.init(o.pack, o.context);
         rp = r;
+        if (kl_track.tracking) headCheck("after-runner-init", r);
         kl_track.verify("after-runner-init");
         armed = true;
         armDrain(&r.d);
-        defer if (rp) |rr| rr.deinit(); // registered the moment the runner exists
-        defer if (armed) disarmDrain(); // disarms ahead of the runner's settle, as the old order did
+        // The runner must outlive this block: Head.init (and everything after it) still rides
+        // the live device. A defer here ran Runner.deinit the moment the block closed — the
+        // head then read the freed (poisoned/munmapped) runner and the allocator died at the
+        // first keep-list malloc — so the block only unwinds on its own error exits; the
+        // success-path teardown belongs to run()'s scope, below the block.
+        errdefer if (rp) |rr| { disarmDrain(); armed = false; rr.deinit(); };
         const rows = try alloc.alloc([]const u32, seq_rows);
         for (0..seq_rows) |i| rows[i] = @alignCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(ids[i * o.cols ..][0 .. o.cols])));
         const t0 = q.now();
@@ -1445,6 +1471,7 @@ pub fn run(req: Options) !Report {
         cap_fd = cap.fd;
         prompts_s = q.now() - t0;
         kl_track.verify("after-captureHidden"); // the memfd pass just ran; every host block it owned is live or quarantined
+        if (kl_track.tracking) headCheck("after-captureHidden", r);
         kl_track.expect("captureHidden memfd", @intCast(cap.bytes)); // the rows-scaled region (419 MB at 20 rows)
         if (cap.bytes != @as(u64, positions) * q.D * 2) return Error.HiddenShort;
         runner_logits = try alloc.dupe(f32, try r.logits()); // the fp16 head GEMV's kept row, read before anything else touches the device
@@ -1452,6 +1479,12 @@ pub fn run(req: Options) !Report {
         kl_track.expect("hbuf hidden rows slice", o.block * q.D * 2);
         hbuf = try alloc.alloc(u16, o.block * q.D);
     }
+
+    // run-scope runner cleanup (registered after the block that produces it, executed before
+    // the hd/hbuf/cap defers below in reverse order): hd.deinit, disarmDrain, rr.deinit —
+    // disarm lands before the runner's settle exactly as the old in-block order did.
+    defer if (rp) |rr| rr.deinit();
+    defer if (armed) disarmDrain();
 
     defer if (hd) |h| h.deinit();
 
@@ -1483,6 +1516,8 @@ pub fn run(req: Options) !Report {
     //    this ordering fixes: cbuf was sized here from hd, which step 2 only set below).
     if (!logits_mode) {
         const t1 = q.now();
+        kl_track.verify("before-head-init"); // the r.logits() D2H + dupe window just ran; its freed blocks are the last suspects before the crash site
+        if (kl_track.tracking) headCheck("before-head-init", rp.?);
         kl_track.phase("head-init"); // the crash site: module load + keep-list appends ride the host block allocator next
         kl_track.expect("head slab H2D", 2 * 5120 * q.VOCAB); // the 2.54 GB dequantized slab
         head_mem = try Head.init(rp.?, @intCast(o.block));
@@ -1579,10 +1614,12 @@ pub fn run(req: Options) !Report {
         stats_s += q.now() - t2;
         kl_track.verify("after-stats");
         if (!logits_mode) for (0..m) |i| { // the guard's raw material, free off the stats pass
+            if (random_row[(base + i) / o.cols]) continue; // natural rows only: the random rows are OOD (their argmax mode — whitespace 0.50 — is expected model behavior on junk input), and the sidecar that admitted this very corpus reports the ruling's 0.0479 mode over the natural rows alone; counting the random rows into the <10% band fails the reference itself, hence every candidate
             const am = rows_stats[base + i].a_cand;
             const gop = try cand_amap.getOrPut(am);
             if (!gop.found_existing) gop.value_ptr.* = 1 else gop.value_ptr.* += 1;
-            cand_maxes[base + i] = cbuf[i * ctx.nt + am];
+            cand_maxes[nat_n] = cbuf[i * ctx.nt + am];
+            nat_n += 1;
         };
         if (dump_fd >= 0) for (0..m) |i| {
             const b = std.mem.sliceAsBytes(cbuf[i * ctx.nt ..][0 .. ctx.vocab]);
@@ -1616,21 +1653,26 @@ pub fn run(req: Options) !Report {
         std.debug.print("  block {d}/{d}: gemm {d:.1} s, stats {d:.1} s\n", .{ bi + 1, nb, if (hd) |h| h.gemm_s else @as(f64, 0), stats_s });
     }
 
-    if (!logits_mode) { // the degeneracy guard, fail closed before any aggregate or file
+    if (!logits_mode) { // the degeneracy guard — the ruling's bands over the natural rows (their population), fail closed before any aggregate or file
+        if (nat_n == 0) { // every row random: nothing to test against — fail closed the same way
+            std.debug.print("xpu-eaq-kl: no natural positions for the degeneracy guard — failing closed\n", .{});
+            return Error.CandidateDegenerate;
+        }
         var mode_n: u32 = 0;
         var it = cand_amap.valueIterator();
         while (it.next()) |v| mode_n = @max(mode_n, v.*);
         const distinct = cand_amap.count();
-        const sorted = try alloc.dupe(f32, cand_maxes);
+        const sorted = try alloc.dupe(f32, cand_maxes[0..nat_n]);
         defer alloc.free(sorted);
         std.mem.sort(f32, sorted, {}, std.sort.asc(f32));
         const med_max = sorted[@divFloor(sorted.len, 2)];
-        const pf: f64 = @floatFromInt(positions);
-        std.debug.print("  candidate degeneracy: distinct argmax {d}/{d} ({d:.3}), argmax mode share {d:.3}, median max-logit {d:.3}\n", .{
-            distinct, positions, @as(f64, @floatFromInt(distinct)) / pf, @as(f64, @floatFromInt(mode_n)) / pf, med_max });
-        const min_distinct: usize = @min(2000, @divFloor(positions, 8)); // the full-dump 2000 band, scaled for canaries
+        const pf: f64 = @floatFromInt(nat_n);
+        std.debug.print("  candidate degeneracy (natural, n={d}): distinct argmax {d} ({d:.3}), argmax mode share {d:.3}, median max-logit {d:.3}\n", .{
+            nat_n, distinct, @as(f64, @floatFromInt(distinct)) / pf, @as(f64, @floatFromInt(mode_n)) / pf, med_max,
+        });
+        const min_distinct: usize = @min(2000, @divFloor(nat_n, 8)); // the full-dump 2000 band, scaled for canaries
         if (@as(f64, @floatFromInt(mode_n)) > 0.10 * pf or distinct < min_distinct or med_max < 10.0) {
-            std.debug.print("xpu-eaq-kl: the candidate is degenerate (bands: argmax mode <10%, distinct >= {d}, median max-logit >= 10) — failing closed\n", .{min_distinct});
+            std.debug.print("xpu-eaq-kl: the candidate is degenerate (natural-row bands: argmax mode <10%, distinct >= {d}, median max-logit >= 10) — failing closed\n", .{min_distinct});
             return Error.CandidateDegenerate;
         }
     }

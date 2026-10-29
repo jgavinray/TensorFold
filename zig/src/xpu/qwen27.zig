@@ -363,6 +363,7 @@ pub const Runner = struct {
 
     /// Gives back the card's memory, the shards' mappings and the host buffers; `r` is gone after it.
     pub fn deinit(r: *Runner) void {
+        if (!live) return; // idempotent: the KL gate schedules this from both the prompts block (errdefer) and run()'s scope (defer)
         r.d.deinit();
         prof.on = false;
         live = false;

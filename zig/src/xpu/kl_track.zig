@@ -50,8 +50,8 @@ const poison: u8 = 0xAA;
 const magic: u64 = 0x5A17_AC1E_9D3F_0C71;
 const frames_max: usize = 12;
 const slots_max: usize = 65536; // live-block registry (freed blocks leave it immediately)
-const quarantine_max: usize = 32768; // freed blocks kept mapped (bounded in count and bytes)
-const quarantine_bytes_max: usize = 6 << 30;
+const quarantine_max: usize = 262144; // freed blocks kept mapped (bounded in count and bytes)
+const quarantine_bytes_max: usize = 64 << 30; // the runner's reset fills alone quarantine ~30 GB per 20-row pass; munmap-on-capacity would hand the freed VA back to the very allocator whose late DMA we are hunting
 const report_max: usize = 10; // offenders printed per verify pass
 const redwords: u32 = 16; // 64B head + 64B tail
 
@@ -143,6 +143,21 @@ const PROT_RW: c_int = 0x1 | 0x2;
 const MAP_PRIVATE_ANON: c_int = 0x02 | 0x20;
 const O_RDONLY: c_int = 0;
 
+/// The last-frees ring (the runner-block stray-free hunt): verify prints every free that
+/// happened since its previous call, newest first — the free whose caller is not the block's
+/// owner is the bug, and free-ret names it (addr2line the exe+0x).
+const FreeRec = struct {
+    ptr: usize = 0,
+    size: usize = 0,
+    alloc_ret: usize = 0,
+    free_ret: usize = 0,
+    phase: []const u8 = "",
+};
+const free_ring: usize = 4096;
+var free_log: [free_ring]FreeRec = undefined;
+var free_w: usize = 0;
+var free_seen: usize = 0;
+
 fn puts(s: []const u8) void {
     _ = write(2, s.ptr, s.len);
 }
@@ -219,17 +234,37 @@ fn hdrOf(user: *anyopaque) *Header {
     return @ptrFromInt(@intFromPtr(user) - @sizeOf(Header) - redwords * 4);
 }
 
-inline fn redHeadMut(h: *const Header) [*]u32 {
+// The redzones are byte-addressed: a block's tail redzone sits at header + header + 64 + size,
+// which is 4-byte aligned only when size is — an [*]u32 there is a Debug-mode alignment panic
+// (the first ones fired on the manifest's 8,950-byte read). Words are compared four bytes at a
+// time against the red pattern's host-byte-order image, so the check is identical, unaligned-safe.
+const redbytes: [4]u8 = @bitCast(@as(u32, red));
+inline fn redHeadMut(h: *const Header) [*]u8 {
     return @ptrFromInt(@intFromPtr(h) + @sizeOf(Header));
 }
-inline fn redTailMut(h: *const Header) [*]u32 {
+inline fn redTailMut(h: *const Header) [*]u8 {
     return @ptrFromInt(@intFromPtr(h) + @sizeOf(Header) + h.redz * 4 + h.size);
 }
-inline fn redHead(h: *const Header) [*]const u32 {
+inline fn redHead(h: *const Header) [*]const u8 {
     return redHeadMut(h);
 }
-inline fn redTail(h: *const Header) [*]const u32 {
+inline fn redTail(h: *const Header) [*]const u8 {
     return redTailMut(h);
+}
+inline fn redWordOk(p: [*]const u8) bool {
+    return p[0] == redbytes[0] and p[1] == redbytes[1] and p[2] == redbytes[2] and p[3] == redbytes[3];
+}
+/// The first broken redword's index in a redwords-long run, null when intact.
+fn firstBrokenRed(p: [*]const u8) ?u32 {
+    var i: u32 = 0;
+    while (i < redwords) : (i += 1) {
+        if (!redWordOk(p + @as(usize, i) * 4)) return i;
+    }
+    return null;
+}
+fn fillRed(p: [*]u8) void {
+    var i: usize = 0;
+    while (i < redwords * 4) : (i += 4) @memcpy((p + i)[0..4], &redbytes);
 }
 
 fn banner() void {
@@ -289,10 +324,8 @@ fn allocImpl(_: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?
         .magic = magic, .size = @intCast(len), .redz = redwords, .map_len = total,
         .slot = std.math.maxInt(u32), .ret_addr = ret_addr, .freed = false, .pad = 0, .quar_next = null,
     };
-    const rh = redHeadMut(h);
-    for (0..h.redz) |i| rh[i] = red;
-    const rt = redTailMut(h);
-    for (0..h.redz) |i| rt[i] = red;
+    fillRed(redHeadMut(h));
+    fillRed(redTailMut(h));
     const user: [*]u8 = @ptrFromInt(base + payload_off);
     @memset(user[0..len], poison); // alloc poison-fills too: an unread-then-read byte tells
     mutex.lock();
@@ -325,7 +358,7 @@ fn remapImpl(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, 
 }
 
 fn freeImpl(_: *anyopaque, memory: []const u8, alignment: Alignment, ret_addr: usize) void {
-    _ = .{ &alignment, &ret_addr };
+    _ = &alignment;
     if (memory.len == 0) return;
     const user: [*]u8 = @constCast(memory.ptr);
     const h = hdrOf(@ptrCast(user));
@@ -334,14 +367,7 @@ fn freeImpl(_: *anyopaque, memory: []const u8, alignment: Alignment, ret_addr: u
         return;
     }
     var broke: ?usize = null;
-    for (0..h.redz) |i| if (redHead(h)[i] != red) {
-        broke = i;
-        break;
-    };
-    if (broke == null) for (0..h.redz) |i| if (redTail(h)[i] != red) {
-        broke = 1000 + i;
-        break;
-    };
+    if (firstBrokenRed(redHead(h))) |i| broke = i else if (firstBrokenRed(redTail(h))) |i| broke = 1000 + i;
     if (broke != null) report(@intFromPtr(user), "free with redzones already written — the corruption predates this free", null, h, broke);
     mutex.lock();
     defer mutex.unlock();
@@ -365,6 +391,13 @@ fn freeImpl(_: *anyopaque, memory: []const u8, alignment: Alignment, ret_addr: u
         quar_head = h;
         quar_blocks += 1;
         quar_bytes += h.size;
+        if (free_w - free_seen < free_log.len) { // ring of the last frees; verify prints the new ones
+            free_log[free_w % free_log.len] = .{
+                .ptr = @intFromPtr(user), .size = h.size, .alloc_ret = h.ret_addr,
+                .free_ret = ret_addr, .phase = phase_label,
+            };
+        }
+        free_w += 1;
         return;
     }
     capacity_warned = true;
@@ -393,14 +426,7 @@ fn sweepBlock(h: *const Header, rec_in: ?*const Rec, printed: *usize) bool {
         return true;
     }
     var broke: ?usize = null;
-    for (0..h.redz) |i| if (redHead(h)[i] != red) {
-        broke = i;
-        break;
-    };
-    if (broke == null) for (0..h.redz) |i| if (redTail(h)[i] != red) {
-        broke = 1000 + i;
-        break;
-    };
+    if (firstBrokenRed(redHead(h))) |i| broke = i else if (firstBrokenRed(redTail(h))) |i| broke = 1000 + i;
     if (broke != null) {
         if (printed.* < report_max) {
             const base_addr = @intFromPtr(h) + @sizeOf(Header) + redwords * 4;
@@ -445,6 +471,23 @@ pub fn verify(label: []const u8) void {
     var it = quar_head;
     while (it) |h| : (it = h.quar_next) {
         if (sweepBlock(h, null, &printed)) bad += 1;
+    }
+    if (free_w > free_seen) { // name every free since the last verify — the stray one is in here
+        var start = free_seen;
+        if (free_w - start > free_log.len) start = free_w - free_log.len;
+        var shown: usize = 0;
+        var i = free_w;
+        while (i > start and shown < 32) : (i -= 1) {
+            const fr = &free_log[(i - 1) % free_log.len];
+            var an: [64]u8 = undefined;
+            var fnm: [64]u8 = undefined;
+            log("    kl_track: free [{s}] {d}B at 0x{x} alloc {s} freed by {s}\n", .{
+                fr.phase, fr.size, fr.ptr, frameName(fr.alloc_ret, &an), frameName(fr.free_ret, &fnm),
+            });
+            shown += 1;
+        }
+        if (free_w - start > shown) log("    kl_track: ({d} older frees elided)\n", .{free_w - start - shown});
+        free_seen = free_w;
     }
     var s1: [24]u8 = undefined;
     var s2: [24]u8 = undefined;
