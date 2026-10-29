@@ -129,6 +129,7 @@ pub const Error = error{
     HeadWidth,
     DenseHeadPart,
     BadHeadShape,
+    HeadFormat, // the GPTQ-head candidate path knows only the affine 4/64 head load.zig's loadGptq builds; any other layout is refused, never reinterpreted
     MissingMode,
     StudyMode,
     RefTooSmall,
@@ -197,25 +198,40 @@ pub const Head = struct {
     pub fn init(r: *q.Runner, block: u32) !Head {
         const d = &r.d;
         if (kl_track.tracking) headCheck("head-init-entry", r);
-        const hx = r.model.head.exl3 orelse return Error.NoTrellisHead;
-        const K = r.model.head.k;
-        const nt = hx.nt;
-        if (K % 128 != 0 or nt % 128 != 0 or block == 0 or block % 128 != 0) return Error.BadHeadShape;
+        const pj = &r.model.head;
+        // the gate's head paths: an EXL3/EAQ pack's trellis head, or the GPTQ pack's
+        // lm_head — affine 4/64, quantized at load by load.zig's loadGptq (q.GS == 128
+        // is the GPTQ dispatch, set by the loader before the model exists). Any other
+        // head format is refused by name; there is no silent fallback.
+        const hx: @TypeOf(pj.exl3) = if (pj.exl3) |t| t else if (q.GS == 128) null else return Error.NoTrellisHead;
+        const K = pj.k;
+        var nt: u32 = undefined;
         var sumn: u32 = 0;
-        var n0: u32 = 0;
-        for (hx.parts) |p| {
-            if (p.dense) return Error.DenseHeadPart;
-            if (p.n0 != n0) return Error.HeadWidth; // fused stacking: the reference's columns must be contiguous from 0
-            sumn += p.n;
-            n0 += p.n;
+        var info: HeadInfo = undefined;
+        if (hx) |t| {
+            nt = t.nt;
+            if (K % 128 != 0 or nt % 128 != 0 or block == 0 or block % 128 != 0) return Error.BadHeadShape;
+            var n0: u32 = 0;
+            for (t.parts) |p| {
+                if (p.dense) return Error.DenseHeadPart;
+                if (p.n0 != n0) return Error.HeadWidth; // fused stacking: the reference's columns must be contiguous from 0
+                sumn += p.n;
+                n0 += p.n;
+            }
+            if (sumn != q.VOCAB) return Error.HeadWidth; // the reference logits are [positions][VOCAB]
+            var parts = try alloc.alloc(PartInfo, t.parts.len); // var: 0.17 const propagation makes const bindings read-only
+            for (t.parts, 0..) |p, j| parts[j] = .{ .n = p.n, .n0 = p.n0, .halves = p.halves };
+            info = .{ .k = K, .nt = nt, .parts = parts };
+        } else {
+            // the GPTQ head: one affine 4/64 part (projectionQuantized), columns
+            // contiguous 0..VOCAB at pitch n; the dense-slab placeholder never serves
+            if (pj.dense16 != null or pj.gs != 64) return Error.HeadFormat;
+            nt = pj.n;
+            if (K % 128 != 0 or nt % 128 != 0 or block == 0 or block % 128 != 0) return Error.BadHeadShape;
+            sumn = pj.n;
+            if (sumn != q.VOCAB) return Error.HeadWidth; // the reference logits are [positions][VOCAB]
+            info = .{ .k = K, .nt = nt, .parts = &.{} };
         }
-        if (sumn != q.VOCAB) return Error.HeadWidth; // the reference logits are [positions][VOCAB]
-        var parts = try alloc.alloc(PartInfo, hx.parts.len); // var: 0.17 const propagation makes const bindings read-only
-        for (hx.parts, 0..) |p, j| parts[j] = .{ .n = p.n, .n0 = p.n0, .halves = p.halves };
-        const info = HeadInfo{
-            .k = K, .nt = nt,
-            .parts = parts,
-        };
         // the gate owns its command path: GEMM launches ride a private compute list,
         // the logits downloads a private copy-group list, and completion is taken from
         // host-visible events — not the runner's list (whose appends after the first
@@ -225,7 +241,7 @@ pub const Head = struct {
         const dl = d.g.immediate(1, 0) catch gl; // group 1 is the copy engine on the B70
         const stage = @as([*]u8, @ptrCast(try d.g.hostAlloc(256 << 20)));
         const evs = try d.g.events(7);
-        const self = Head{
+        var self = Head{
             .d = d, .k = K, .nt = nt, .vocab = sumn, .info = info,
             .slab = try d.alloc_(@as(usize, K) * nt * 2),
             .gemm = try d.kernel(try d.g.module(&kl_kernels.eaq_kl), "eaq_gemm32", 256),
@@ -242,14 +258,18 @@ pub const Head = struct {
             d.g.free(self.c);
             d.g.free(self.a_stage);
         }
-        try d.fill(self.slab, @as(u16, 0), @as(usize, K) * nt * 2); // the pad columns decode as zero once, as Acts.init does
-        for (hx.parts) |p| { // the serving dequant: rotations and entry scales baked in (forward_exl3.gemmRows's wide launch, n0 the column base)
-            try d.launch(d.k.exl3_dequant128_c, .{ .x = @intCast(K / 128), .y = (p.n + 127) / 128 }, .{
-                p.tr,                  p.suh,   p.svh,   self.slab,       @as(i32, @intCast(K)),
-                @as(i32, @intCast(p.n)), @as(i32, @intCast(nt)), @as(i32, @intCast(p.halves)), @as(i32, @intCast(p.n0)),
-            });
+        if (hx) |t| {
+            try d.fill(self.slab, @as(u16, 0), @as(usize, K) * nt * 2); // the pad columns decode as zero once, as Acts.init does
+            for (t.parts) |p| { // the serving dequant: rotations and entry scales baked in (forward_exl3.gemmRows's wide launch, n0 the column base)
+                try d.launch(d.k.exl3_dequant128_c, .{ .x = @intCast(K / 128), .y = (p.n + 127) / 128 }, .{
+                    p.tr,                  p.suh,   p.svh,   self.slab,       @as(i32, @intCast(K)),
+                    @as(i32, @intCast(p.n)), @as(i32, @intCast(nt)), @as(i32, @intCast(p.halves)), @as(i32, @intCast(p.n0)),
+                });
+            }
+            try d.sync();
+        } else { // the GPTQ pack's affine 4/64 head, dequantized through core/quant and uploaded on the gate's own event-signaled path
+            try fillSlabGptq(&self, pj.*);
         }
-        try d.sync();
         return self;
     }
 
@@ -447,6 +467,136 @@ pub const Head = struct {
         try h.evWait(h.ev[4]);
     }
 };
+
+/// The GPTQ pack's lm_head (load.zig's loadGptq head: projectionQuantized quantized the
+/// F16 lm_head.weight into the GEMM layout as MLX affine 4/64 at load, and forward.zig's
+/// dec_wide64 branch serves it) dequantized into the fp16 [K][NT] slab the gate's GEMM
+/// reads. The words, scales and biases come off the very device buffers the serving GEMV
+/// reads, and the gather is the exact inverse of glue_quant.cl repack's nibble interleave
+/// and the BG bias x GS/ASC scale — the same `.fmt = .dev` route the fidelity oracle
+/// reads the device head through (fp64_ref.zig:137-166) — while the arithmetic itself is
+/// core/quant's mlx.dequant (the shared affine dequantization, torch's fp32: product
+/// rounded, then sum), so candidate and reference differ only in the pack's weights.
+/// Threads the columns host-side; the finished slab rides up the gate's own
+/// event-signaled upload path. The fp32 GEMM and the statistic downstream are identical
+/// to the trellis candidates'.
+const GptqHead = struct {
+    words: []const u8, // u32 [K/8][NT], the Proj's w as the device holds it
+    sc: []const u8, // f16 [K/64][NT], the Proj's s (the true scale)
+    bg: []const u8, // f16 [K/64][NT], the Proj's bg (bias x GS/ASC, glue_quant.cl repack)
+    slab: []u16, // [K][NT], filled
+    k: usize,
+    nt: usize,
+    err: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// One column strip [at, to) of the GPTQ head dequant.
+const GptqStrip = struct { g: *GptqHead, at: usize, to: usize };
+
+fn gptqColStrip(s: *GptqStrip) void {
+    const core = @import("core");
+    const qmlx = core.quant.mlx;
+    const QTensor = core.quant.Tensor;
+    const j = s.g;
+    const kw = j.k / 8;
+    const groups = j.k / 64;
+    const words = alloc.alloc(u32, kw) catch {
+        j.err.store(true, .monotonic);
+        return;
+    };
+    defer alloc.free(words);
+    const tables = alloc.alloc(f32, 2 * groups) catch {
+        j.err.store(true, .monotonic);
+        return;
+    };
+    defer alloc.free(tables);
+    const cs = tables[0..groups];
+    const cb = tables[groups..];
+    const scratch = alloc.alloc(u8, j.k * 4 + 4096) catch {
+        j.err.store(true, .monotonic);
+        return;
+    };
+    defer alloc.free(scratch);
+    const wb = std.mem.sliceAsBytes(words);
+    const sb = std.mem.sliceAsBytes(cs);
+    const bb = std.mem.sliceAsBytes(cb);
+    const tensor = struct {
+        fn t(dt: core.quant.DType, cols: usize, bytes: []const u8) QTensor {
+            return .{ .dtype = dt, .rank = 2, .shape = .{ 1, cols, 1, 1, 1 }, .bytes = bytes };
+        }
+    }.t;
+    var n: usize = s.at;
+    while (n < s.to) : (n += 1) {
+        for (0..kw) |wi| { // repack's nibble interleave undone, the .dev gather of fp64_ref.zig:143-151
+            const o = std.mem.readInt(u32, j.words[4 * (wi * j.nt + n) ..][0..4], .little);
+            var m: u32 = 0;
+            for (0..4) |i| {
+                const sh: u5 = @intCast(4 * i);
+                m |= ((o >> sh) & 0xF) << (2 * sh);
+                m |= ((o >> (sh + 16)) & 0xF) << (2 * sh + 4);
+            }
+            words[wi] = m;
+        }
+        for (0..groups) |g| {
+            const s16: u16 = @bitCast(std.mem.readInt(u16, j.sc[2 * (g * j.nt + n) ..][0..2], .little));
+            const b16: u16 = @bitCast(std.mem.readInt(u16, j.bg[2 * (g * j.nt + n) ..][0..2], .little));
+            cs[g] = @floatCast(@as(f16, @bitCast(s16)));
+            cb[g] = @as(f32, @floatCast(@as(f16, @bitCast(b16)))) * 256.0 / 64.0; // BG stored as bias x GS/ASC (ASC 256, GS 64 — glue_quant.cl repack)
+        }
+        var fba = std.heap.FixedBufferAllocator.init(scratch);
+        const w32 = qmlx.dequant(fba.allocator(), tensor(.i32, kw, wb), tensor(.f32, groups, sb), tensor(.f32, groups, bb), 64) catch {
+            j.err.store(true, .monotonic);
+            return;
+        };
+        for (w32, 0..) |v, kk| j.slab[kk * j.nt + n] = @bitCast(@as(f16, @floatCast(v)));
+    }
+}
+
+/// Head.init's affine branch: w/s/bg off the device, every column through the shared
+/// dequantization, the [K][NT] slab up the gate's own upload path.
+fn fillSlabGptq(h: *Head, pj: q.Proj) !void {
+    const K: usize = h.k;
+    const nt: usize = h.nt;
+    if (K % 64 != 0) return Error.HeadFormat; // the gather assumes the affine 4/64 groups
+    try h.drainRunner(); // the weights are never written after load, but the runner list must be truly drained before our copies ride the gate's
+    const t0 = q.now();
+    const words = try alloc.alloc(u8, (K / 8) * nt * 4); // the repacked words: 636 MB at K 5120, NT 248320
+    defer alloc.free(words);
+    const scs = try alloc.alloc(u8, (K / 64) * nt * 2);
+    defer alloc.free(scs);
+    const bgs = try alloc.alloc(u8, (K / 64) * nt * 2);
+    defer alloc.free(bgs);
+    try h.download(words, pj.w, words.len); // the very buffers the serving GEMV reads (forward.zig gemmRows, the gs == 64 branch)
+    try h.download(scs, pj.s, scs.len);
+    try h.download(bgs, pj.bg, bgs.len);
+    const t1 = q.now();
+    const slab = try alloc.alloc(u16, K * nt); // exact VOCAB pitch: full coverage, no pad columns to leave zeroed
+    defer alloc.free(slab);
+    var job = GptqHead{ .words = words, .sc = scs, .bg = bgs, .slab = slab, .k = K, .nt = nt };
+    const threads = @min(std.Thread.getCpuCount() catch 4, 64);
+    const workers = @min(threads, @max(1, @divTrunc(nt, 1024)));
+    const per = (nt + workers - 1) / workers;
+    var strips: [256]GptqStrip = undefined;
+    var tls: [256]?std.Thread = @splat(null);
+    var spawned: usize = 0;
+    var at: usize = 0;
+    while (at < nt) : (spawned += 1) {
+        const to = @min(nt, at + per);
+        strips[spawned] = .{ .g = &job, .at = at, .to = to };
+        tls[spawned] = std.Thread.spawn(.{}, gptqColStrip, .{&strips[spawned]}) catch null;
+        at = to;
+    }
+    for (tls[0..spawned]) |th| if (th) |t| t.join();
+    for (tls[0..spawned], 0..) |th, i| if (th == null) gptqColStrip(&strips[i]); // a spawn refusal ran nothing: the same math inline
+    if (job.err.load(.monotonic)) {
+        std.debug.print("xpu-eaq-kl: the GPTQ head does not match the affine 4/64 layout load.zig builds — refusing\n", .{});
+        return Error.HeadFormat;
+    }
+    const t2 = q.now();
+    try h.upload(h.slab, std.mem.sliceAsBytes(slab));
+    const t3 = q.now();
+    std.debug.print("  head: GPTQ affine 4/64, {d} x {d} — download {d:.1} s, host dequant {d:.1} s ({d} threads), upload {d:.1} s\n", .{ nt, K, t1 - t0, t2 - t1, workers, t3 - t2 });
+}
 
 /// Arm the process on the drain hook (the driver's not-yet-drained reports on the gate's
 /// long commands); disarm restores the runner's own loss handler.
@@ -1933,8 +2083,9 @@ fn mapF32(n: usize) !struct { p: *anyopaque, buf: []f32 } {
     return .{ .p = p, .buf = buf };
 }
 /// The provenance flag (kl-order-ruling.md invariant 6, pack manifest or stock-layout
-/// flag): an EAQ pack carries eaq_manifest.json (the runner's dispatch key), a stock
-/// EXL3 pack does not; the diagnostic mode has no pack at all.
+/// flag): an EAQ pack carries eaq_manifest.json (the runner's dispatch key), a GPTQ pack
+/// names its quant method in config.json, a stock EXL3 pack is neither; the diagnostic
+/// mode has no pack at all.
 fn layoutTag(pack_dir: []const u8, logits_mode: bool) ![]const u8 {
     if (logits_mode) return "logits-file";
     if (pack_dir.len == 0) return "none";
@@ -1946,9 +2097,22 @@ fn layoutTag(pack_dir: []const u8, logits_mode: bool) ![]const u8 {
         } else |_| {
             return "eaq-manifest";
         }
-    } else |_| {
-        return "stock-exl3";
-    }
+    } else |_| {}
+    // the GPTQ pack carries no manifest either and is no stock EXL3 pack: its config.json
+    // names the quant method (the stock packs name exl3 and hold no gptq marker), and a
+    // GPTQ run must not report under the stock tag
+    const cpath = try std.fmt.allocPrint(alloc, "{s}/config.json", .{pack_dir});
+    if (openFd(cpath, 0)) |fd| {
+        defer _ = close(fd);
+        var cbuf: [32768]u8 = undefined;
+        var got: isize = -1;
+        var tries: u32 = 0;
+        while (got < 0 and tries < 64) : (tries += 1) got = pread(fd, &cbuf, cbuf.len, 0);
+        if (got > 0 and std.mem.indexOf(u8, cbuf[0..@intCast(got)], "\"gptq\"") != null) {
+            return std.fmt.allocPrint(alloc, "gptq-g128", .{});
+        }
+    } else |_| {}
+    return "stock-exl3";
 }
 
 fn histCountsLine(a: std.mem.Allocator, counts: []const u64) ![]u8 {

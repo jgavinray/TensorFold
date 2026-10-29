@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.2
 
+- The KL gate scores a GPTQ pack's lm_head: when the candidate pack is the GPTQ dispatch, its head's affine 4/64 words, scales and biases come off the device — the very buffers the serving GEMV reads — and ride the fidelity oracle's `.dev` route through core/quant's mlx.dequant into the gate's fp16 [K][NT] slab, so the candidate runs the same fp32 eaq_gemm32 head GEMM and the full report as the trellis candidates. Any other head format is refused by name (NoTrellisHead, HeadFormat), never silently reinterpreted; the report's layout tag names a GPTQ pack `gptq-g128` from its config.json quant method.
+
 - The XPU quantizer grades the o_proj/out_proj head-strip family on its own probe band ([0.10, 0.20], hard red above 0.20, joint amber at corr < 0.99 with block RMS > 0.18) while wide parts keep [0.10, 0.16], and a resumed run no longer corrupts its progress file: each layer record owns its fragment path, so a multi-layer progress file parses and every recorded fragment re-hashes before it is skipped.
 
 - Two host tools carry the mixed half-step pack (T-HS-10): `zig build eaq-mixed-plan` installs tf-eaq-mixed-plan, which turns an allocator plan into the explicit-width plan the driver consumes (--plan) — per-part halves, the K*N-weighted target, the declared-sha gate on the base plan and a planFromJson round-trip self-check; `zig build eaq-frag-merge` installs tf-eaq-frag-merge, which merges per-layer trellis fragments (first --frag-dir hit wins, size-checked shadows) over a full-width dense source through the writer (shards 8, allow_odd_bits) and proves the pack with openPack, the Table and the admission histogram, refusing unless the halves-5 count is 26.
