@@ -199,11 +199,12 @@ pub const Head = struct {
         const d = &r.d;
         if (kl_track.tracking) headCheck("head-init-entry", r);
         const pj = &r.model.head;
-        // the gate's head paths: an EXL3/EAQ pack's trellis head, or the GPTQ pack's
-        // lm_head — affine 4/64, quantized at load by load.zig's loadGptq (q.GS == 128
-        // is the GPTQ dispatch, set by the loader before the model exists). Any other
-        // head format is refused by name; there is no silent fallback.
-        const hx: @TypeOf(pj.exl3) = if (pj.exl3) |t| t else if (q.GS == 128) null else return Error.NoTrellisHead;
+        // the gate's head paths: an EXL3/EAQ pack's trellis head, or a pack whose lm_head
+        // the loader quantized to affine 4/64 — the GPTQ pack's projectionQuantized, the
+        // MLX pack's repacked affine head, and an EXL3 pack's dense head (also quantized
+        // at load). q.GS == 128 marks the GPTQ dispatch. Any other head format is refused
+        // by name; there is no silent fallback.
+        const hx: @TypeOf(pj.exl3) = if (pj.exl3) |t| t else if (pj.dense16 == null and pj.gs == 64) null else return Error.NoTrellisHead;
         const K = pj.k;
         var nt: u32 = undefined;
         var sumn: u32 = 0;
@@ -2120,6 +2121,11 @@ fn layoutTag(pack_dir: []const u8, logits_mode: bool) ![]const u8 {
         while (got < 0 and tries < 64) : (tries += 1) got = pread(fd, &cbuf, cbuf.len, 0);
         if (got > 0 and std.mem.indexOf(u8, cbuf[0..@intCast(got)], "\"gptq\"") != null) {
             return std.fmt.allocPrint(alloc, "gptq-g128", .{});
+        }
+        // an MLX pack names its affine quantization in config.json; the stock EXL3 packs
+        // name exl3 and carry no affine marker, so this check must come before the stock tag
+        if (got > 0 and std.mem.indexOf(u8, cbuf[0..@intCast(got)], "\"affine\"") != null) {
+            return std.fmt.allocPrint(alloc, "mlx-q4g64", .{});
         }
     } else |_| {}
     return "stock-exl3";
