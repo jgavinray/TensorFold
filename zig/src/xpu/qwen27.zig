@@ -263,7 +263,7 @@ pub const Runner = struct {
         r.* = .{ .d = .{ .g = try ze.Gpu.open(0xe223), .list = undefined, .k = undefined }, .model = undefined, .acts = undefined, .context = context, .ckpt = ckpt };
         const d = &r.d;
         errdefer d.g.close();
-        d.list = try d.g.immediate(0, 0);
+        d.list = try d.g.immediateAsync(0, 0);
         const mg = try d.g.module(&kb.glue);
         const md = try d.g.module(&kb.decode);
         const mx = try d.g.module(&kb.exl3);
