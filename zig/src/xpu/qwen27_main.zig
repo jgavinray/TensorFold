@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
     if (std.c.getenv("XPU_EXL3_PROBE") != null) {
+        try exl3SliceProbe(r);
         try exl3Probe(r);
         try exl3PromptProbe(r);
     }
@@ -448,6 +449,101 @@ fn multiTest(r: *q.Runner, prompt: []const u32, n: u32) !void {
             best = @min(best, q.now() - t0);
         }
         std.debug.print("multi rounds: {d:2} slots {d:6.2} ms a round, {d:6.1} tok/s together\n", .{ m, best * 1e3, @as(f64, @floatFromInt(m)) / best });
+    }
+}
+
+/// K-slice occupancy sweep on the shipped decode GEMV (exl3_h.cl, 256-GRF) and the
+/// frozen small-GRF fp32 twin, on the real slot shapes: ms and GB/s against workgroup
+/// count. The serving path pins kslices = 1; this measures what slicing would buy.
+fn exl3SliceProbe(r: *q.Runner) !void {
+    const d = &r.d;
+    const a = &r.acts;
+    const slots = [_]struct { name: []const u8, w: q.Proj }{
+        .{ .name = "gu", .w = r.model.layers[0].gu },
+        .{ .name = "down", .w = r.model.layers[0].down },
+        .{ .name = "mixer_in", .w = r.model.layers[0].mixer_in },
+        .{ .name = "mixer_out", .w = r.model.layers[0].mixer_out },
+        .{ .name = "head", .w = r.model.head },
+    };
+    std.debug.print("slice probe: shipped GRF image (exl3_decode2_t1_h) and frozen small-GRF fp32 twin\n", .{});
+    for (slots) |s| {
+        const hx = s.w.exl3 orelse continue;
+        for (hx.parts, 0..) |p, pi| {
+            if (p.dense) continue;
+            const K: u32 = s.w.k;
+            const N: u32 = p.n;
+            const halves: u32 = p.halves;
+            const gx: u32 = N / 16;
+            const bytes: usize = @as(usize, K / 16) * (N / 16) * 16 * halves * 2;
+            const ymax: u32 = if (gx >= 4096) 1 else 32; // a saturated launch needs no slices, and Y grows with them
+            const tr = try d.alloc_(bytes);
+            const yh = try d.alloc_(@as(usize, ymax) * N * 2);
+            const yf = try d.alloc_(@as(usize, ymax) * N * 4);
+            const host = try alloc.alloc(u8, bytes);
+            defer alloc.free(host);
+            var prng = std.Random.DefaultPrng.init(@as(u64, halves));
+            prng.random().bytes(host);
+            try d.copyIn(tr, host);
+            std.debug.print("  {s} part {d}: K {d} N {d} halves {d} gx {d} bytes {d}\n", .{ s.name, pi, K, N, halves, gx, bytes });
+            for ([_]u32{ 1, 2, 4, 8, 16, 32 }) |ks| {
+                if (ks > ymax) continue;
+                var best: f64 = 1e9;
+                for (0..30) |it| {
+                    const t0 = q.now();
+                    try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = ks }, .{ tr, a.h, yh, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, 1), @as(i32, @intCast(halves)), @as(i32, @intCast(ks)), @as(i32, @intCast(N)) });
+                    try d.sync();
+                    if (it > 5) best = @min(best, q.now() - t0);
+                }
+                std.debug.print("    GRF halves {d} kslices {d:2} WGs {d:6}: {d:6.3} ms {d:5.0} GB/s\n", .{ halves, ks, gx * ks, best * 1e3, @as(f64, @floatFromInt(bytes)) / best / 1e9 });
+                if (halves % 2 == 0) {
+                    const bits = halves / 2;
+                    var best32: f64 = 1e9;
+                    for (0..30) |it| {
+                        const t0 = q.now();
+                        try d.launch(d.k.exl3_decode2_t1, .{ .x = gx, .y = ks }, .{ tr, a.h, yf, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, 1), @as(i32, @intCast(bits)), @as(i32, @intCast(ks)) });
+                        try d.sync();
+                        if (it > 5) best32 = @min(best32, q.now() - t0);
+                    }
+                    std.debug.print("    fp32 halves {d} kslices {d:2} WGs {d:6}: {d:6.3} ms {d:5.0} GB/s\n", .{ halves, ks, gx * ks, best32 * 1e3, @as(f64, @floatFromInt(bytes)) / best32 / 1e9 });
+                }
+            }
+            if (ymax > 1) {
+                // direct gate for the new kernel: the unsliced t1 output against the
+                // fixed-order sum of the slice partials, same trellis, same X.
+                const ks: u32 = @min(ymax, 8);
+                try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = 1 }, .{ tr, a.h, yh, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, 1), @as(i32, @intCast(halves)), @as(i32, 1), @as(i32, @intCast(N)) });
+                try d.sync();
+                try d.launch(d.k.exl3_decode2_t1_slice_h, .{ .x = gx, .y = ks }, .{ tr, a.h, yf, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, 1), @as(i32, @intCast(halves)), @as(i32, @intCast(ks)), @as(i32, @intCast(N)) });
+                try d.sync();
+                const one = try d.g.hostAlloc(@as(usize, N) * 2);
+                defer d.g.free(one);
+                const parts = try d.g.hostAlloc(@as(usize, ks) * N * 4);
+                defer d.g.free(parts);
+                try q.copy(d, one, yh, @as(usize, N) * 2);
+                try q.copy(d, parts, yf, @as(usize, ks) * N * 4);
+                try d.sync();
+                const oh: [*]const f16 = @ptrCast(@alignCast(one));
+                const pf: [*]const f32 = @ptrCast(@alignCast(parts));
+                var mism: usize = 0;
+                var worst: u32 = 0;
+                for (0..N) |i| {
+                    var sum: f32 = 0;
+                    for (0..ks) |k| sum += pf[k * N + i];
+                    const h: f16 = @floatCast(sum);
+                    const a16: u16 = @bitCast(oh[i]);
+                    const b16: u16 = @bitCast(h);
+                    if (a16 != b16) {
+                        mism += 1;
+                        const dulp: u32 = @intCast(@abs(@as(i32, a16) - @as(i32, b16)));
+                        worst = @max(worst, dulp);
+                    }
+                }
+                std.debug.print("    slice-vs-unsliced ks {d}: {d}/{d} differ, max ulp {d}\n", .{ ks, mism, N, worst });
+            }
+            d.g.free(tr);
+            d.g.free(yh);
+            d.g.free(yf);
+        }
     }
 }
 
