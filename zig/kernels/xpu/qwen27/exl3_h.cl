@@ -39,6 +39,17 @@ KERNEL(16) void exl3_decode2_h(global const ushort *TR, global const half *X, gl
   const int lb = 8 * lane * halves - 16;               // the lane's first needed bit, may be negative
   for (int kt = kt0; kt < kt_end; kt++) {
     global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 8 * halves);
+    // the lane's eight activation rows for every token, loaded once per tile as two
+    // half4 vectors per token; the v loop's rows are rb+0..3 and rb+8..11, so the
+    // per-row X loads inside the v loop (128 a tile) collapse to 2T vector loads.
+    const int rb = (lane & 1) ? 4 : 0;
+    half4 xa[8], xb[8];
+    __attribute__((opencl_unroll_hint))
+    for (int t = 0; t < 8; t++) {
+      if (t >= T) continue;
+      xa[t] = vload4(0, X + (long)t * K + kt * 16 + rb);
+      xb[t] = vload4(0, X + (long)t * K + kt * 16 + rb + 8);
+    }
     __attribute__((opencl_unroll_hint))
     for (int v = 0; v < 16; v++) {
       const int a_v = lb + (((v + 1) * halves) >> 1);  // the window's start bit, unwrapped: E(16*lane + v) - 16
@@ -60,11 +71,13 @@ KERNEL(16) void exl3_decode2_h(global const ushort *TR, global const half *X, gl
       // them. Switch if the fidelity gates demand format weights.
       const float wgt = (float)(1024u + (bs & 0xFFFFu) + (bs >> 16)) * (float)as_half((ushort)0x1EEE) + (float)as_half((ushort)0xC931);
       const int p = 16 * lane + v;
-      const int l = p >> 3, j = p & 7, row = 2 * (l & 3) + (j & 1) + 8 * ((j >> 1) & 1);
+      const int j = p & 7;
+      const int d = 2 * (v >> 3) + (v & 1) + 8 * ((v >> 1) & 1);
+      const int xoff = d < 4 ? d : d - 4;
       __attribute__((opencl_unroll_hint))
       for (int t = 0; t < 8; t++) {
         if (t >= T) continue;
-        const float xv = X[(long)t * K + kt * 16 + row];
+        const float xv = d < 4 ? (float)xa[t][xoff] : (float)xb[t][xoff];
         if (j >> 2) {
           if (v & 1) acc1b[t] += xv * wgt; else acc1[t] += xv * wgt;
         } else {
