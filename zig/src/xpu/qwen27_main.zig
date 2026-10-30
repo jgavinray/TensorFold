@@ -509,8 +509,11 @@ fn exl3SliceProbe(r: *q.Runner) !void {
             }
             if (ymax > 1) {
                 // direct gate for the new kernel: the unsliced t1 output against the
-                // fixed-order sum of the slice partials, same trellis, same X.
-                const ks: u32 = @min(ymax, 8);
+                // fixed-order sum of the slice partials, same trellis, same X. The
+                // slice count mirrors forward_exl3.sliceCount so the production ks
+                // (16 on the N<=5120 slots) is the one gated, not just ks 8.
+                const prod: u32 = if (gx <= 320) 16 else if (gx < 4096) 8 else 1;
+                const ks: u32 = @min(ymax, prod);
                 try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = 1 }, .{ tr, a.h, yh, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, 1), @as(i32, @intCast(halves)), @as(i32, 1), @as(i32, @intCast(N)) });
                 try d.sync();
                 try d.launch(d.k.exl3_decode2_t1_slice_h, .{ .x = gx, .y = ks }, .{ tr, a.h, yf, @as(i32, @intCast(K)), @as(i32, @intCast(N)), @as(i32, 1), @as(i32, @intCast(halves)), @as(i32, @intCast(ks)), @as(i32, @intCast(N)) });
