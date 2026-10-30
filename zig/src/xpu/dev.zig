@@ -168,6 +168,8 @@ pub const Dev = struct {
         exl3_dequant128_c: ze.H,
         exl3_xform_h: ze.H,
         exl3_yscale_h: ze.H,
+        exl3_decode2_t1_slice_h: ze.H,
+        exl3_yscale_sum_h: ze.H,
         rot_heads: ze.H,
         attn_prompt: ze.H,
         attn_prompt8: ze.H,

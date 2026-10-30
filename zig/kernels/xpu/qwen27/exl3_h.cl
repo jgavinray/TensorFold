@@ -319,3 +319,74 @@ KERNEL(16) void exl3_yscale_h(global half *Y, global const half *SVH, int N, int
     Y[(long)row * NT + n] = convert_half_rte(v[j] * 0.08838834764831845f * (float)SVH[n]);
   }
 }
+
+// fp32-partial twin of exl3_decode2_t1_h (same window extraction, mul1 decode and
+// per-slice accumulation): Y is float [kslices][NT], row ks per slice, so the caller
+// folds the slices in fixed order before the rotation and scale. Splitting K across
+// workgroups is what lifts the small-N slots out of their latency-bound 21-35 GB/s;
+// the fp32 partials keep the sum deterministic and close to the single-slice rounding.
+KERNEL(16) void exl3_decode2_t1_slice_h(global const ushort *TR, global const half *X, global float *Y, int K, int N, int T, int halves,
+                                        int kslices, int NT) {
+  if (T != 1 || halves < 2 || halves > 16 || K % 16 != 0 || kslices < 1) return; // workgroup-uniform arg trap
+  const int nt = get_group_id(0), ks = get_group_id(1), lane = get_sub_group_local_id();
+  const int per = K / 16 / kslices, kt0 = ks * per, R = 128 * halves, nw = 4 * halves;
+  const int kt_end = ks == kslices - 1 ? K / 16 : kt0 + per;
+  float acc0 = 0.0f, acc1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
+  const int lb = 8 * lane * halves - 16;
+  for (int kt = kt0; kt < kt_end; kt++) {
+    global const uint *tw = (global const uint *)(TR + ((long)kt * (N / 16) + nt) * 8 * halves);
+    __attribute__((opencl_unroll_hint))
+    for (int v = 0; v < 16; v++) {
+      const int a_v = lb + (((v + 1) * halves) >> 1);
+      const int av = a_v + R;
+      const int w0i = av >> 5;
+      const int uu = w0i >= nw ? w0i - nw : w0i;
+      const uint w0 = tw[uu], w1 = tw[uu + 1 == nw ? 0 : uu + 1];
+      const int s = av & 31;
+      const uint w32 = s ? (w0 << s | w1 >> (32 - s)) : w0;
+      const uint state = w32 >> 16;
+      const uint xx = state * 0x83DCD12Du;
+      const uint bs = (xx & 0x00FF00FFu) + ((xx >> 8) & 0x00FF00FFu);
+      const float wgt = (float)(1024u + (bs & 0xFFFFu) + (bs >> 16)) * (float)as_half((ushort)0x1EEE) + (float)as_half((ushort)0xC931);
+      const int p = 16 * lane + v;
+      const int l = p >> 3, j = p & 7, row = 2 * (l & 3) + (j & 1) + 8 * ((j >> 1) & 1);
+      const float xv = (float)X[kt * 16 + row];
+      if (j >> 2) {
+        if (v & 1) b1 += xv * wgt; else acc1 += xv * wgt;
+      } else {
+        if (v & 1) b0 += xv * wgt; else acc0 += xv * wgt;
+      }
+    }
+  }
+  const float a0 = acc0 + b0 + sub_group_shuffle_xor(acc0 + b0, 1);
+  const float a1 = acc1 + b1 + sub_group_shuffle_xor(acc1 + b1, 1);
+  if ((lane & 1) == 0) {
+    const long base = (long)ks * NT + nt * 16 + lane / 2;
+    Y[base] = a0;
+    Y[base + 8] = a1;
+  }
+}
+
+// The slice sum and the part's exit: fixed-order fp32 sum over YF's kslices rows,
+// rounded to fp16 as the single-slice kernel does, then H_N and svh. The rounding point
+// is the shipped kernel's (Z lands in fp16 before the rotation); only the fp32
+// summation association differs from the one-slice kernel.
+KERNEL(16) void exl3_yscale_sum_h(global const float *YF, global half *Y, global const half *SVH, int N, int NT, int M, int KS) {
+  if (N % 128 != 0 || NT % 128 != 0 || M < 1 || KS < 1) return; // workgroup-uniform arg trap
+  const int nb = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
+  const int n0 = nb * 128;
+  float v[8];
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 8; j++) {
+    const int n = n0 + lane * 8 + j;
+    float s = 0.0f;
+    for (int ks = 0; ks < KS; ks++) s += YF[(long)(ks * M + row) * NT + n];
+    v[j] = (float)convert_half_rte(s);
+  }
+  rot128_lane(v, lane);
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 8; j++) {
+    const int n = n0 + lane * 8 + j;
+    Y[(long)row * NT + n] = convert_half_rte(v[j] * 0.08838834764831845f * (float)SVH[n]);
+  }
+}

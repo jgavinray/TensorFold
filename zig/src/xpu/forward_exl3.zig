@@ -124,6 +124,8 @@ pub fn gemmRows(d: *dev.Dev, hx: *const exl3_model.Exl3, wscr: ?*anyopaque, h: *
 pub fn exl3ResetXscr() void {
     xscr = null;
     xscr_elts = 0;
+    yscr = null;
+    yscr_elts = 0;
 }
 
 /// The fp16-output trellis GEMVs across the fused slot's column ranges, with the format's
@@ -158,21 +160,37 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
         if (tr) trLaunch(call, slot, "xform", @intCast(pi), nparts, "exl3_xform_h", gxk, m, K, NT,
             N, @intCast(p.n0), sumn, mi, halves, h, p.suh, xt, null);
         try d.launch(d.k.exl3_xform_h, .{ .x = gxk, .y = m }, .{ h, p.suh, xt, K, mi });
-        // (b) the raw trellis words against the transformed row; kslices = 1 (the layout
-        // note above), the whole K range in one slice.
+        // (b) the raw trellis words against the transformed row. The small-N parts are
+        // latency-bound at one slice (a few hundred workgroups); K-slicing lifts them to
+        // the measured plateau (slice probe, 2026-10-30: down 86 -> 197 GB/s at 16
+        // slices, mixer_out 126 -> 267 at 16, mixer_in 144 -> 268 at 8, gu 112 -> 171 at
+        // 8). Slices land in fp32 partial rows and are folded in fixed order by the
+        // yscale sum; the rounding point is the single-slice kernel's (fp16 Z before the
+        // rotation), so only the fp32 summation association moves.
+        var yf: ?*anyopaque = null;
+        var ksl: u32 = 1;
         if (m == 1) {
-            if (tr) trLaunch(call, slot, "gemv1", @intCast(pi), nparts, "exl3_decode2_t1_h", gx, 1,
-                K, NT, N, @intCast(p.n0), sumn, 1, halves, p.tr, xt, y, null);
-            // exl3_h.cl ships compiled at the 256-register GRF (build/xpu.zig): this
-            // GEMV's small-N parts (a few hundred one-sub-group workgroups a launch,
-            // each walking the whole K serially) are latency-bound on the trellis loads
-            // and the bigger register file doubles the compiler's load hoisting — the
-            // decode GEMV measured 259.6 → 184.2 ms a token, 37.6 → 52.9 GB/s (the
-            // per-slot breakdown and why the wide parts keep it are at the kernel,
-            // exl3_h.cl's exl3_decode2_t1_h). Same source either width: bit-identical
-            // sums, gate-verified (--bench tokens, the seam at 0/248320, halfstep T-HS-5).
-            try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = 1 },
-                .{ p.tr, xt, y, K, N, @as(i32, 1), halves, @as(i32, 1), NT });
+            ksl = sliceCount(gx);
+            if (ksl == 1) {
+                if (tr) trLaunch(call, slot, "gemv1", @intCast(pi), nparts, "exl3_decode2_t1_h", gx, 1,
+                    K, NT, N, @intCast(p.n0), sumn, 1, halves, p.tr, xt, y, null);
+                // exl3_h.cl ships compiled at the 256-register GRF (build/xpu.zig): this
+                // GEMV's small-N parts (a few hundred one-sub-group workgroups a launch,
+                // each walking the whole K serially) are latency-bound on the trellis loads
+                // and the bigger register file doubles the compiler's load hoisting — the
+                // decode GEMV measured 259.6 → 184.2 ms a token, 37.6 → 52.9 GB/s (the
+                // per-slot breakdown and why the wide parts keep it are at the kernel,
+                // exl3_h.cl's exl3_decode2_t1_h). Same source either width: bit-identical
+                // sums, gate-verified (--bench tokens, the seam at 0/248320, halfstep T-HS-5).
+                try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = 1 },
+                    .{ p.tr, xt, y, K, N, @as(i32, 1), halves, @as(i32, 1), NT });
+            } else {
+                yf = try yscratch(d, @as(usize, ksl) * @as(usize, @intCast(NT)));
+                if (tr) trLaunch(call, slot, "gemv1s", @intCast(pi), nparts, "exl3_decode2_t1_slice_h", gx, ksl,
+                    K, NT, N, @intCast(p.n0), sumn, 1, halves, p.tr, xt, yf, null);
+                try d.launch(d.k.exl3_decode2_t1_slice_h, .{ .x = gx, .y = ksl },
+                    .{ p.tr, xt, yf.?, K, N, @as(i32, 1), halves, @as(i32, @intCast(ksl)), NT });
+            }
         } else {
             // rows 2..16: the kernels hold eight rows a launch — the same kernel at row
             // offsets 0 and 8 when m > 8, X advanced by 8 rows of K halves and Y by 8 rows
@@ -193,11 +211,18 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
             }
         }
         // (c) the part's exit: H_N along its own columns (the admitted parts have N a
-        // multiple of 128, so no block straddles), then svh
+        // multiple of 128, so no block straddles), then svh. A sliced GEMV folds its
+        // fp32 partials here in fixed slice order; the unsliced path reads Y as before.
         const gxn: u32 = @intCast(p.n / 128);
-        if (tr) trLaunch(call, slot, "yscale", @intCast(pi), nparts, "exl3_yscale_h", gxn, m, K, NT,
-            N, @intCast(p.n0), sumn, mi, halves, y, p.svh, null, null);
-        try d.launch(d.k.exl3_yscale_h, .{ .x = gxn, .y = m }, .{ y, p.svh, N, NT, mi });
+        if (yf) |yfp| {
+            if (tr) trLaunch(call, slot, "ysums", @intCast(pi), nparts, "exl3_yscale_sum_h", gxn, m, K, NT,
+                N, @intCast(p.n0), sumn, mi, halves, yfp, p.svh, null, null);
+            try d.launch(d.k.exl3_yscale_sum_h, .{ .x = gxn, .y = m }, .{ yfp, y, p.svh, N, NT, mi, @as(i32, @intCast(ksl)) });
+        } else {
+            if (tr) trLaunch(call, slot, "yscale", @intCast(pi), nparts, "exl3_yscale_h", gxn, m, K, NT,
+                N, @intCast(p.n0), sumn, mi, halves, y, p.svh, null, null);
+            try d.launch(d.k.exl3_yscale_h, .{ .x = gxn, .y = m }, .{ y, p.svh, N, NT, mi });
+        }
     }
 }
 
@@ -214,4 +239,33 @@ fn xscratch(d: *dev.Dev, rows: u32, K: i32) !*anyopaque {
         xscr_elts = n;
     }
     return xscr.?;
+}
+
+/// Slices per launch at the measured optima (slice probe, 2026-10-30): N <= 5120
+/// (down, mixer_out, qkv-sized parts) 16 slices (197/267 GB/s), the 8-32k-column slots
+/// (gu, mixer_in) 8 (171/271/268), and a launch already at 4096+ workgroups (the head)
+/// stays one. The rule is a fit to the five probed shapes, not a general model; re-measure
+/// if a slot's shape changes.
+fn sliceCount(gx: u32) u32 {
+    if (gx == 0) return 1;
+    if (gx <= 320) return 16;
+    if (gx < 4096) return 8;
+    return 1;
+}
+
+/// The slice GEMV's fp32 partial staging, [kslices][NT] floats: grow-only, like xscr.
+/// Allocate before freeing: a failed allocation leaves the previous buffer valid. Under
+/// an async launch list (F4) the free must wait for the previous sum to drain, or the
+/// buffer must never shrink — today the list is synchronous, so the ordering is safe.
+var yscr: ?*anyopaque = null;
+var yscr_elts: usize = 0;
+
+fn yscratch(d: *dev.Dev, elts: usize) !*anyopaque {
+    if (elts > yscr_elts) {
+        const fresh = try d.alloc_(elts * 4);
+        if (yscr) |old| d.g.free(old);
+        yscr = fresh;
+        yscr_elts = elts;
+    }
+    return yscr.?;
 }

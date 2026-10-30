@@ -507,6 +507,8 @@ pub fn initKernelTable(d: *Dev) !void {
         .exl3_dequant128_c = try d.kernel(mxh, "exl3_dequant128_c", 256),
         .exl3_xform_h = try d.kernel(mxh, "exl3_xform_h", 16),
         .exl3_yscale_h = try d.kernel(mxh, "exl3_yscale_h", 16),
+        .exl3_decode2_t1_slice_h = try d.kernel(mxh, "exl3_decode2_t1_slice_h", 16),
+        .exl3_yscale_sum_h = try d.kernel(mxh, "exl3_yscale_sum_h", 16),
         .rot_heads = try d.kernel(mg, "rot_heads", 16),
         .attn_prompt = try d.kernel(md, "attn_prompt", 128),
         .attn_prompt8 = try d.kernel(md, "attn_prompt8", 128),
