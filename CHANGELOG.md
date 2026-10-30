@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.2
 
+- The reference dumper builds again at HEAD: xpu-eaq-ref's root module now imports the shared kl_track instance (kl.zig imports it; the module was never declared for the ref root — the same class as the runner-step fix).
+
 - The KL probe's register dumps are per-sample: a separate `eaq_dump_ab` kernel reads one sampled kk per launch, so the compiler cannot reuse a register across kk. The in-loop dumps reported the A register 1664/2048 exact, and an asm barrier fixed the A while breaking the B (62080/248320) — any register-pressure change flipped which read was reused. Now A 2048/2048 and B 248320/248320 are exact on the EAQ 3.0 pack, with every product gate green (fp64 oracle m1024/m128, the GEMM, store16, raw x=8, k-select).
 
 - The KL gate scores a GPTQ pack's lm_head: when the candidate pack is the GPTQ dispatch, its head's affine 4/64 words, scales and biases come off the device — the very buffers the serving GEMV reads — and ride the fidelity oracle's `.dev` route through core/quant's mlx.dequant into the gate's fp16 [K][NT] slab, so the candidate runs the same fp32 eaq_gemm32 head GEMM and the full report as the trellis candidates. Any other head format is refused by name (NoTrellisHead, HeadFormat), never silently reinterpreted; the report's layout tag names a GPTQ pack `gptq-g128` from its config.json quant method.

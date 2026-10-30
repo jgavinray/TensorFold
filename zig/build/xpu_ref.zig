@@ -106,13 +106,15 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     qwen27.addImport("xpu_qwen27_kernels", embedded);
     qwen27.addImport("ze", ze_mod);
     qwen27.addImport("core", core_mod);
-    qwen27.addImport("kl_track", @import("xpu_kl.zig").klTrackModule(b, target, optimize, false)); // qwen27.zig's host-allocator gate; ref never tracks
+    const track_mod = @import("xpu_kl.zig").klTrackModule(b, target, optimize, false); // one shared instance: files must belong to only one module; ref never tracks
+    qwen27.addImport("kl_track", track_mod); // qwen27.zig's host-allocator gate
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/ref_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addImport("xpu_qwen27_kernels", embedded); // quant.zig's initKernelTable loads them all
     module.addImport("eaq_kl_kernels", kl_kernels); // kl.Head's fp32 GEMM image
     module.addImport("ze", ze_mod);
     module.addImport("core", core_mod);
     module.addImport("qwen27", qwen27);
+    module.addImport("kl_track", track_mod); // ref_main includes kl.zig, which imports kl_track
     const eaq_write = b.createModule(.{ .root_source_file = b.path("zig/src/core/eaq_write.zig"), .target = target, .optimize = optimize, .link_libc = true });
     eaq_write.addImport("core", core_mod); // the repack CLI's pattern; quant.zig's import is module-named
     module.addImport("eaq_write", eaq_write);
