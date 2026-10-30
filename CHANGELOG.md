@@ -4,7 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.2
 
-- The decode GEMV splits K across slices at the measured per-shape optima (16 slices for N <= 5120, 8 for the wider slots, one for the head): the latency-bound small slots run 86-144 -> 197-268 GB/s, the EAQ 3.0 pack decodes 5.7 -> 8.0 tok/s and the stock 2.0 pack 6.2 -> 9.3, with tokens identical, the seam at 0/248320, halfstep green and the eval64 KL unchanged (0.106478). The fp32 slice partials are folded in fixed order by exl3_yscale_sum_h at the shipped fp16 rounding point; the probe gates the slice sum against the unsliced kernel (max 11 fp16 ulp on the pre-rotation Z, KL-inert).
+- The decode GEMV splits K across slices at the measured per-shape optima (16 slices for N <= 5120, 8 for the wider slots, one for the head): the latency-bound small slots run 42-100 -> 86-126 GB/s, the EAQ 3.0 pack decodes 5.7 -> 8.0 tok/s and the stock 2.0 pack 6.2 -> 9.3, with tokens identical, the seam at 0/248320, halfstep green and the eval64 KL unchanged (0.106478). The fp32 slice partials are folded in fixed order by exl3_yscale_sum_h at the shipped fp16 rounding point; the probe gates the slice sum against the unsliced kernel (max 11 fp16 ulp on the pre-rotation Z, KL-inert).
 
 - The EXL3 probe sweeps the decode GEMV's K-slice occupancy on the real slot shapes and both register images, and gates the slice sum against the unsliced output on the same trellis.
 

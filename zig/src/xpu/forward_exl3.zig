@@ -162,9 +162,9 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
         try d.launch(d.k.exl3_xform_h, .{ .x = gxk, .y = m }, .{ h, p.suh, xt, K, mi });
         // (b) the raw trellis words against the transformed row. The small-N parts are
         // latency-bound at one slice (a few hundred workgroups); K-slicing lifts them to
-        // the measured plateau (slice probe, 2026-10-30: down 86 -> 197 GB/s at 16
-        // slices, mixer_out 126 -> 267 at 16, mixer_in 144 -> 268 at 8, gu 112 -> 171 at
-        // 8). Slices land in fp32 partial rows and are folded in fixed order by the
+        // the measured plateau (slice probe, 2026-10-30, real byte count: down 42 -> 97
+        // GB/s at 16 slices, mixer_out 59 -> 125 at 16, mixer_in 68 -> 126 at 8, gu 55 ->
+        // 89 at 8). Slices land in fp32 partial rows and are folded in fixed order by the
         // yscale sum; the rounding point is the single-slice kernel's (fp16 Z before the
         // rotation), so only the fp32 summation association moves.
         var yf: ?*anyopaque = null;
@@ -241,11 +241,11 @@ fn xscratch(d: *dev.Dev, rows: u32, K: i32) !*anyopaque {
     return xscr.?;
 }
 
-/// Slices per launch at the measured optima (slice probe, 2026-10-30): N <= 5120
-/// (down, mixer_out, qkv-sized parts) 16 slices (197/267 GB/s), the 8-32k-column slots
-/// (gu, mixer_in) 8 (171/271/268), and a launch already at 4096+ workgroups (the head)
-/// stays one. The rule is a fit to the five probed shapes, not a general model; re-measure
-/// if a slot's shape changes.
+/// Slices per launch at the measured optima (slice probe, 2026-10-30, real byte count):
+/// N <= 5120 (down, mixer_out, qkv-sized parts) 16 slices (97/125 GB/s), the
+/// 8-32k-column slots (gu, mixer_in) 8 (89/126), and a launch already at 4096+
+/// workgroups (the head) stays one. The rule is a fit to the five probed shapes, not a
+/// general model; re-measure if a slot's shape changes.
 fn sliceCount(gx: u32) u32 {
     if (gx == 0) return 1;
     if (gx <= 320) return 16;

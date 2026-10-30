@@ -474,7 +474,7 @@ fn exl3SliceProbe(r: *q.Runner) !void {
             const N: u32 = p.n;
             const halves: u32 = p.halves;
             const gx: u32 = N / 16;
-            const bytes: usize = @as(usize, K / 16) * (N / 16) * 16 * halves * 2;
+            const bytes: usize = @as(usize, K / 16) * (N / 16) * 16 * halves;
             const ymax: u32 = if (gx >= 4096) 1 else 32; // a saturated launch needs no slices, and Y grows with them
             const tr = try d.alloc_(bytes);
             const yh = try d.alloc_(@as(usize, ymax) * N * 2);
