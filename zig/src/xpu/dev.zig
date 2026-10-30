@@ -169,6 +169,9 @@ pub const Dev = struct {
         exl3_xform_h: ze.H,
         exl3_yscale_h: ze.H,
         exl3_decode2_t1_slice_h: ze.H,
+        exl3_xform_fused: ze.H,
+        exl3_decode2_t1_slice_fused: ze.H,
+        exl3_yscale_sum_fused: ze.H,
         exl3_yscale_sum_h: ze.H,
         rot_heads: ze.H,
         attn_prompt: ze.H,
@@ -365,8 +368,8 @@ pub const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [64]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [64]f64 = @splat(0),
+    names: [96]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [96]f64 = @splat(0),
 };
 
 pub fn profReport(label: []const u8) void {

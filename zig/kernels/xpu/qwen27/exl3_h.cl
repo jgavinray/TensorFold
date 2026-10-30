@@ -403,3 +403,119 @@ KERNEL(16) void exl3_yscale_sum_h(global const float *YF, global half *Y, global
     Y[(long)row * NT + n] = convert_half_rte(v[j] * 0.08838834764831845f * (float)SVH[n]);
   }
 }
+
+// ---- per-slot fused launches (F4): one launch spans the parts of a fused projection.
+// The part table is the kernel's arguments (PartDesc by value, the host fills the device
+// pointers); each workgroup reads its part's descriptor and runs the same per-part math
+// as exl3_xform_h / exl3_decode2_t1_slice_h / exl3_yscale_sum_h, so the outputs are
+// bit-identical and the existing gates certify the fused path.
+typedef struct {
+  int n;       // the part's N (its fused-projection column count)
+  int halves;  // the part's width
+  int ksl;     // the part's K slices
+  int pad;
+  ulong tr;    // the part's trellis
+  ulong suh;   // the part's suh
+  ulong svh;   // the part's svh
+  ulong xt;    // the part's transformed activation buffer
+  ulong yf;    // the part's fp32 slice partials
+  ulong y;     // the part's fp16 output, advanced to its column base
+} PartDesc;
+
+KERNEL(16) void exl3_xform_fused(global const half *X, PartDesc P0, PartDesc P1, PartDesc P2, PartDesc P3, int K, int M) {
+  if (K % 128 != 0 || M < 1) return; // workgroup-uniform arg trap
+  const int part = get_group_id(2);
+  PartDesc P;
+  if (part == 0) P = P0; else if (part == 1) P = P1; else if (part == 2) P = P2; else P = P3;
+  const int kb = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
+  global const half *SUH = (global const half *)P.suh;
+  global half *XT = (global half *)P.xt;
+  const int k0 = kb * 128;
+  float v[8];
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 8; j++) {
+    const int k = k0 + lane * 8 + j;
+    v[j] = (float)X[(long)row * K + k] * (float)SUH[k];
+  }
+  rot128_lane(v, lane);
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 8; j++)
+    XT[(long)row * K + k0 + lane * 8 + j] = convert_half_rte(v[j] * 0.08838834764831845f);
+}
+
+KERNEL(16) void exl3_decode2_t1_slice_fused(PartDesc P0, PartDesc P1, PartDesc P2, PartDesc P3, int K, int NT) {
+  const int part = get_group_id(2);
+  PartDesc P;
+  if (part == 0) P = P0; else if (part == 1) P = P1; else if (part == 2) P = P2; else P = P3;
+  const int n = P.n, halves = P.halves, kslices = P.ksl;
+  if (halves < 2 || halves > 16 || K % 16 != 0 || kslices < 1) return; // workgroup-uniform arg trap
+  const int nt = get_group_id(0), ks = get_group_id(1), lane = get_sub_group_local_id();
+  if (nt >= n / 16 || ks >= kslices) return;
+  global const ushort *TR = (global const ushort *)P.tr;
+  global const half *X = (global const half *)P.xt;
+  global float *Y = (global float *)P.yf;
+  const int per = K / 16 / kslices, kt0 = ks * per, R = 128 * halves, nw = 4 * halves;
+  const int kt_end = ks == kslices - 1 ? K / 16 : kt0 + per;
+  float acc0 = 0.0f, acc1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
+  const int lb = 8 * lane * halves - 16;
+  for (int kt = kt0; kt < kt_end; kt++) {
+    global const uint *tw = (global const uint *)(TR + ((long)kt * (n / 16) + nt) * 8 * halves);
+    __attribute__((opencl_unroll_hint))
+    for (int v = 0; v < 16; v++) {
+      const int a_v = lb + (((v + 1) * halves) >> 1);
+      const int av = a_v + R;
+      const int w0i = av >> 5;
+      const int uu = w0i >= nw ? w0i - nw : w0i;
+      const uint w0 = tw[uu], w1 = tw[uu + 1 == nw ? 0 : uu + 1];
+      const int s = av & 31;
+      const uint w32 = s ? (w0 << s | w1 >> (32 - s)) : w0;
+      const uint state = w32 >> 16;
+      const uint xx = state * 0x83DCD12Du;
+      const uint bs = (xx & 0x00FF00FFu) + ((xx >> 8) & 0x00FF00FFu);
+      const float wgt = (float)(1024u + (bs & 0xFFFFu) + (bs >> 16)) * (float)as_half((ushort)0x1EEE) + (float)as_half((ushort)0xC931);
+      const int p = 16 * lane + v;
+      const int l = p >> 3, j = p & 7, row = 2 * (l & 3) + (j & 1) + 8 * ((j >> 1) & 1);
+      const float xv = (float)X[kt * 16 + row];
+      if (j >> 2) {
+        if (v & 1) b1 += xv * wgt; else acc1 += xv * wgt;
+      } else {
+        if (v & 1) b0 += xv * wgt; else acc0 += xv * wgt;
+      }
+    }
+  }
+  const float a0 = acc0 + b0 + sub_group_shuffle_xor(acc0 + b0, 1);
+  const float a1 = acc1 + b1 + sub_group_shuffle_xor(acc1 + b1, 1);
+  if ((lane & 1) == 0) {
+    const long base = (long)ks * NT + nt * 16 + lane / 2;
+    Y[base] = a0;
+    Y[base + 8] = a1;
+  }
+}
+
+KERNEL(16) void exl3_yscale_sum_fused(PartDesc P0, PartDesc P1, PartDesc P2, PartDesc P3, int NT, int M) {
+  const int part = get_group_id(2);
+  PartDesc P;
+  if (part == 0) P = P0; else if (part == 1) P = P1; else if (part == 2) P = P2; else P = P3;
+  const int n = P.n, KS = P.ksl;
+  if (n % 128 != 0 || NT % 128 != 0 || M < 1 || KS < 1) return; // workgroup-uniform arg trap
+  const int nb = get_group_id(0), row = get_group_id(1), lane = get_sub_group_local_id();
+  if (nb >= n / 128) return;
+  global const float *YF = (global const float *)P.yf;
+  global const half *SVH = (global const half *)P.svh;
+  global half *Y = (global half *)P.y;
+  const int n0 = nb * 128;
+  float v[8];
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 8; j++) {
+    const int nn = n0 + lane * 8 + j;
+    float s = 0.0f;
+    for (int ks = 0; ks < KS; ks++) s += YF[(long)(ks * M + row) * NT + nn];
+    v[j] = (float)convert_half_rte(s);
+  }
+  rot128_lane(v, lane);
+  __attribute__((opencl_unroll_hint))
+  for (int j = 0; j < 8; j++) {
+    const int nn = n0 + lane * 8 + j;
+    Y[(long)row * NT + nn] = convert_half_rte(v[j] * 0.08838834764831845f * (float)SVH[nn]);
+  }
+}

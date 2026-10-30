@@ -17,6 +17,22 @@ const load = @import("load.zig");
 const exl3_model = @import("exl3_model.zig");
 const off = dev.off;
 
+/// The fused per-slot launch's part descriptor: the kernel-side PartDesc (exl3_h.cl) with
+/// the device pointers as integers, passed by value as a kernel argument. The layout must
+/// stay 64 bytes: 4 ints then 6 u64s.
+const PartDesc = extern struct {
+    n: i32,
+    halves: i32,
+    ksl: i32,
+    pad: i32,
+    tr: u64,
+    suh: u64,
+    svh: u64,
+    xt: u64,
+    yf: u64,
+    y: u64,
+};
+
 // ---- XPU_EXL3_TRACE: the fault-localizing trace. dev.launch prints every queued command
 // and drains the command list after it (dev.zig), so the last line before a device-lost is
 // the command that caused it; the EXL3 launches prepend this line with the args that
@@ -151,6 +167,49 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
     const xt = try xscratch(d, m, K);
     const gxk: u32 = @intCast(@divExact(K, 128)); // the xform's k blocks; K % 128 == 0 (the loader admits it)
     const mi: i32 = @intCast(m);
+    if (m == 1 and nparts <= 4) {
+        // F4: one launch per slot for xform, GEMV and yscale. The parts' descriptors are
+        // the kernels' arguments (PartDesc by value); the grid's z spans the parts and
+        // the out-of-range workgroups return, so the fused launches do the same per-part
+        // work as the per-part path. Bit-identical output; the bench tokens certify it.
+        var ksl_max: u32 = 1;
+        var gx_max: u32 = 0;
+        var gxn_max: u32 = 0;
+        for (hx.parts) |p| {
+            const gx: u32 = @intCast(p.n / 16);
+            ksl_max = @max(ksl_max, sliceCount(gx));
+            gx_max = @max(gx_max, gx);
+            gxn_max = @max(gxn_max, @as(u32, @intCast(p.n / 128)));
+        }
+        const xtf = try xscratch(d, nparts * m, K);
+        const yff = try yscratch(d, @as(usize, nparts) * @as(usize, ksl_max) * @as(usize, @intCast(NT)));
+        var descs: [4]PartDesc = @splat(@as(PartDesc, .{ .n = 0, .halves = 0, .ksl = 0, .pad = 0, .tr = 0, .suh = 0, .svh = 0, .xt = 0, .yf = 0, .y = 0 }));
+        for (hx.parts, 0..) |p, pi| {
+            descs[pi] = .{
+                .n = @intCast(p.n),
+                .halves = @intCast(p.halves),
+                .ksl = @intCast(sliceCount(@intCast(p.n / 16))),
+                .pad = 0,
+                .tr = @intFromPtr(p.tr),
+                .suh = @intFromPtr(p.suh),
+                .svh = @intFromPtr(p.svh),
+                .xt = @intFromPtr(xtf) + @as(usize, pi) * @as(usize, m) * @as(usize, @intCast(K)) * 2,
+                .yf = @intFromPtr(yff) + @as(usize, pi) * @as(usize, ksl_max) * @as(usize, @intCast(NT)) * 4,
+                .y = @intFromPtr(out) + @as(usize, p.n0) * 2,
+            };
+        }
+        const p0 = hx.parts[0];
+        if (tr) trLaunch(call, slot, "xformf", 0, nparts, "exl3_xform_fused", gxk, m, K, NT,
+            @intCast(p0.n), @intCast(p0.n0), sumn, mi, @intCast(p0.halves), h, xtf, null, null);
+        try d.launch(d.k.exl3_xform_fused, .{ .x = gxk, .y = m, .z = nparts }, .{ h, descs[0], descs[1], descs[2], descs[3], K, mi });
+        if (tr) trLaunch(call, slot, "gemv1f", 0, nparts, "exl3_decode2_t1_slice_fused", gx_max, ksl_max, K, NT,
+            @intCast(p0.n), @intCast(p0.n0), sumn, 1, @intCast(p0.halves), p0.tr, xtf, yff, null);
+        try d.launch(d.k.exl3_decode2_t1_slice_fused, .{ .x = gx_max, .y = ksl_max, .z = nparts }, .{ descs[0], descs[1], descs[2], descs[3], K, NT });
+        if (tr) trLaunch(call, slot, "ysumsf", 0, nparts, "exl3_yscale_sum_fused", gxn_max, m, K, NT,
+            @intCast(p0.n), @intCast(p0.n0), sumn, mi, @intCast(p0.halves), yff, null, null, null);
+        try d.launch(d.k.exl3_yscale_sum_fused, .{ .x = gxn_max, .y = m, .z = nparts }, .{ descs[0], descs[1], descs[2], descs[3], NT, mi });
+        return;
+    }
     for (hx.parts, 0..) |p, pi| {
         const N: i32 = @intCast(p.n);
         const halves: i32 = @intCast(p.halves); // the part's own width, 2..16 (step 5: odd halves are mul1's half steps)
@@ -234,7 +293,10 @@ var xscr_elts: usize = 0;
 fn xscratch(d: *dev.Dev, rows: u32, K: i32) !*anyopaque {
     const n = @as(usize, rows) * @as(usize, @intCast(K));
     if (n > xscr_elts) {
-        if (xscr) |old| d.g.free(old);
+        if (xscr) |old| {
+            try d.sync(); // the async list may still read the old staging buffer
+            d.g.free(old);
+        }
         xscr = try d.alloc_(n * 2);
         xscr_elts = n;
     }
@@ -254,16 +316,18 @@ fn sliceCount(gx: u32) u32 {
 }
 
 /// The slice GEMV's fp32 partial staging, [kslices][NT] floats: grow-only, like xscr.
-/// Allocate before freeing: a failed allocation leaves the previous buffer valid. Under
-/// an async launch list (F4) the free must wait for the previous sum to drain, or the
-/// buffer must never shrink — today the list is synchronous, so the ordering is safe.
+/// Allocate before freeing: a failed allocation leaves the previous buffer valid. The
+/// list is async, so a grow drains the queue before freeing the old buffer.
 var yscr: ?*anyopaque = null;
 var yscr_elts: usize = 0;
 
 fn yscratch(d: *dev.Dev, elts: usize) !*anyopaque {
     if (elts > yscr_elts) {
         const fresh = try d.alloc_(elts * 4);
-        if (yscr) |old| d.g.free(old);
+        if (yscr) |old| {
+            try d.sync(); // the async list may still read the old partial buffer
+            d.g.free(old);
+        }
         yscr = fresh;
         yscr_elts = elts;
     }
