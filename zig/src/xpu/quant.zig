@@ -186,7 +186,7 @@ fn mkdirp(path: []const u8) !void {
 fn writeFile(path: []const u8, bytes: []const u8) !void {
     const sent = try dupeSentinel(path);
     defer alloc.free(sent);
-    const fd = open(sent.ptr, @as(c_int, 65 | 8), @as(c_int, 0o644)); // O_CREAT | O_WRONLY | O_TRUNC
+    const fd = open(sent.ptr, @as(c_int, 65 | 512), @as(c_int, 0o644)); // O_CREAT | O_WRONLY | O_TRUNC
     if (fd < 0) {
         std.debug.print("quant: create {s}: errno {d}\n", .{ path, __errno_location()[0] });
         return error.FileNotFound;
