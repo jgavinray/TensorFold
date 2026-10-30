@@ -134,6 +134,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const frag_exe = b.addExecutable(.{ .name = "xpu-fragcheck", .root_module = frag_mod });
     const frag_install = b.addInstallArtifact(frag_exe, .{});
     b.step("xpu-fragcheck", "Host-only fragment verifier: decode a written pack file's own bytes through the exl3 oracle and score them against the source (no device needed)").dependOn(&frag_install.step);
+    const rescore_mod = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/g2rescore.zig"), .target = target, .optimize = optimize, .link_libc = true }); // host-only final-rule G2 re-score of a published pack (no device)
+    rescore_mod.addImport("xpu_qwen27_kernels", embedded);
+    rescore_mod.addImport("ze", ze_mod);
+    rescore_mod.addImport("core", core_mod);
+    rescore_mod.addImport("qwen27", qwen27);
+    const rescore_exe = b.addExecutable(.{ .name = "xpu-eaq-rescore-g2", .root_module = rescore_mod });
+    const rescore_install = b.addInstallArtifact(rescore_exe, .{});
+    b.step("xpu-eaq-rescore-g2", "Host-only G2 re-score: re-decode every pack trellis part through the exl3 host oracle, apply the final part-relative rule, and write the per-part/per-layer verdict JSON against the quant-time records (no device needed)").dependOn(&rescore_install.step);
     const install = b.addInstallArtifact(exe, .{});
     b.step("xpu-eaq-quant", "Build the fresh-quant driver (bf16 source -> EAQ pack: capture, H, LDL, LDLQ, fragments, §Q3 report; needs ocloc, a C++17 compiler and nGEN headers)").dependOn(&install.step);
 }

@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.1.2
 
+- `zig build xpu-eaq-rescore-g2` installs the host-only final-rule G2 re-score of a published pack: every trellis part (400 body + the head) re-decodes its own shipped bytes through the exl3 host oracle in 128-row strips, scores against the dense source exactly as the T-LDLQ-5 probe's ProbeJob.run does, and re-runs the binding part-relative rule (g2-downband ruling, quant.zig probeSlot) — j0 block RMS, whole-part RMS, ratio, rank-from-top — writing a per-part/per-layer JSON with the quant-time record from the run log (its value, verdict and gate-version stamp), the recomputed quantities and the flip list. The head, which publish never probed, gets its first G2 verdict. No device is opened: the card stays free.
+
 - The reference dumper builds again at HEAD: xpu-eaq-ref's root module now imports the shared kl_track instance (kl.zig imports it; the module was never declared for the ref root — the same class as the runner-step fix).
 
 - The KL probe's register dumps are per-sample: a separate `eaq_dump_ab` kernel reads one sampled kk per launch, so the compiler cannot reuse a register across kk. The in-loop dumps reported the A register 1664/2048 exact, and an asm barrier fixed the A while breaking the B (62080/248320) — any register-pressure change flipped which read was reused. Now A 2048/2048 and B 248320/248320 are exact on the EAQ 3.0 pack, with every product gate green (fp64 oracle m1024/m128, the GEMM, store16, raw x=8, k-select).
