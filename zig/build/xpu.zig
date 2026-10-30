@@ -29,13 +29,23 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
-        // the EXL3 kernels stream memory: the 256-GRF flag would only halve their occupancy
-        const exl3_family = std.mem.endsWith(u8, k[1], "exl3.cl") or std.mem.endsWith(u8, k[1], "exl3_h.cl") or std.mem.endsWith(u8, k[1], "exl3_enc.cl") or std.mem.endsWith(u8, k[1], "calib.cl") or std.mem.endsWith(u8, k[1], "ldlq.cl");
-        const base_opts = if (exl3_family) opts[0 .. opts.len - " -cl-intel-256-GRF-per-thread".len] else opts; // drop only the GRF flag, keep anything else opts gains
-        const inc = if (exl3_family) "" else " -I zig/kernels/xpu/qwen27";
+        // Most of the EXL3 files stream memory: the 256-GRF flag would only halve
+        // their occupancy, so they compile without it. exl3_h.cl is the exception and
+        // keeps the flag: its T == 1 decode GEMV is latency-bound on the trellis loads
+        // and the doubled register file doubles the per-thread load hoisting (−29% GEMV;
+        // written up at the kernel, exl3_h.cl's exl3_decode2_t1_h). The small-GRF build
+        // of the same sources is NOT kept alongside as a twin: measured on the B70, the
+        // GRF GEMV runs 16% slower whenever its small-GRF sibling image is loaded into
+        // the same context (641.9 vs 552.6 ms for the --bench=64 4 GEMV), so the file
+        // ships as one image at the big register file — and the serving path runs one
+        // register-file configuration per token, which also beat shape-selective
+        // alternation between two images (5.7 vs 5.1 tok/s steady).
+        const strip_grf = std.mem.endsWith(u8, k[1], "exl3.cl") or std.mem.endsWith(u8, k[1], "exl3_enc.cl") or std.mem.endsWith(u8, k[1], "calib.cl") or std.mem.endsWith(u8, k[1], "ldlq.cl");
+        const base_opts = if (strip_grf) opts[0 .. opts.len - " -cl-intel-256-GRF-per-thread".len] else opts; // drop only the GRF flag, keep anything else opts gains
+        const inc = if (strip_grf or std.mem.endsWith(u8, k[1], "exl3_h.cl")) "" else " -I zig/kernels/xpu/qwen27";
         c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s}{s}", .{ base_opts, k[2], inc }), "-output_no_suffix", "-output", k[0], "-out_dir" });
         c.setCwd(b.path("."));
-        if (!exl3_family) { // the exl3 files include nothing; skip the extra rebuild triggers
+        if (inc.len > 0) { // the exl3 files include nothing; skip the extra rebuild triggers
             for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
         }
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));

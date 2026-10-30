@@ -141,6 +141,24 @@ KERNEL(16) void exl3_decode2_t1_h(global const ushort *TR, global const half *X,
   }
 }
 
+// The whole file compiles with -cl-intel-256-GRF-per-thread (zig/build/xpu.zig) —
+// this GEMV is why. The small-N parts (down at 320 one-sub-group workgroups a launch,
+// qkv and mixer_out at 320-ish, mixer_in at 520 — each walking the whole K serially)
+// run this shape latency-bound: measured 21–35 GB/s against gu's 73 at 1088
+// workgroups and the head's 159 at 15520, with a FLAT per-tile cost — throughput is
+// in-flight-load coverage per resident thread, not bytes or ALU. The doubled register
+// file lets the compiler hoist more of the per-tile window loads per thread: the small
+// slots ~2x (a token: down 97.3 → 51.5 ms, mixer_in 43.5 → 25.3, qkv 21.5 → 11.9,
+// mixer_out 34.5 → 18.4); the wide parts pay the halved EU residency (gu +22%, head
+// +45%) and the token still nets out. The small-GRF build of this source must NOT be
+// loaded alongside the GRF one: the GEMV runs 16% slower with its sibling image
+// resident in the context (641.9 vs 552.6 ms for the --bench=64 4 GEMV, B70), and
+// shape-selective dispatch across the two images (small parts GRF, wide parts not)
+// measured worse still — 5.1 vs 5.7 tok/s steady. One image, one register file per
+// token. The decode GEMV as shipped: 259.6 → 184.2 ms a token, 37.6 → 52.9 GB/s,
+// --bench=64 4 at 0.829 → 0.585 s a slot; bit-identical to the small-GRF build
+// (--bench tokens and the seam unchanged, halfstep T-HS-5 runs this image).
+
 // ---- EXL3 prompt path, fused variant: exact dequant of one [128,128] weight block into
 // the part's column range of the shared fp16 scratch ----
 // exl3_dequant128 (exl3.cl:213) verbatim except the trailing n0, the workgroup-uniform

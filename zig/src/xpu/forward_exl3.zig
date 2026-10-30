@@ -163,6 +163,14 @@ fn gemvs(d: *dev.Dev, hx: *const exl3_model.Exl3, h: *anyopaque, out: *anyopaque
         if (m == 1) {
             if (tr) trLaunch(call, slot, "gemv1", @intCast(pi), nparts, "exl3_decode2_t1_h", gx, 1,
                 K, NT, N, @intCast(p.n0), sumn, 1, halves, p.tr, xt, y, null);
+            // exl3_h.cl ships compiled at the 256-register GRF (build/xpu.zig): this
+            // GEMV's small-N parts (a few hundred one-sub-group workgroups a launch,
+            // each walking the whole K serially) are latency-bound on the trellis loads
+            // and the bigger register file doubles the compiler's load hoisting — the
+            // decode GEMV measured 259.6 → 184.2 ms a token, 37.6 → 52.9 GB/s (the
+            // per-slot breakdown and why the wide parts keep it are at the kernel,
+            // exl3_h.cl's exl3_decode2_t1_h). Same source either width: bit-identical
+            // sums, gate-verified (--bench tokens, the seam at 0/248320, halfstep T-HS-5).
             try d.launch(d.k.exl3_decode2_t1_h, .{ .x = gx, .y = 1 },
                 .{ p.tr, xt, y, K, N, @as(i32, 1), halves, @as(i32, 1), NT });
         } else {
