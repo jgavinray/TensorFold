@@ -458,8 +458,13 @@ KERNEL(16) void exl3_decode2_t1_slice_fused(PartDesc P0, PartDesc P1, PartDesc P
   const int kt_end = ks == kslices - 1 ? K / 16 : kt0 + per;
   float acc0 = 0.0f, acc1 = 0.0f, b0 = 0.0f, b1 = 0.0f;
   const int lb = 8 * lane * halves - 16;
+  const int xab = (lane & 1) * 4; // this lane's two activation half4s: rows xab..+3 and xab+8..+11
   for (int kt = kt0; kt < kt_end; kt++) {
     global const uint *tw = (global const uint *)(TR + ((long)kt * (n / 16) + nt) * 8 * halves);
+    const half4 xa4 = vload4(0, X + kt * 16 + xab);
+    const half4 xb4 = vload4(0, X + kt * 16 + xab + 8);
+    const float xa[4] = {xa4.x, xa4.y, xa4.z, xa4.w};
+    const float xb[4] = {xb4.x, xb4.y, xb4.z, xb4.w};
     __attribute__((opencl_unroll_hint))
     for (int v = 0; v < 16; v++) {
       const int a_v = lb + (((v + 1) * halves) >> 1);
@@ -473,9 +478,9 @@ KERNEL(16) void exl3_decode2_t1_slice_fused(PartDesc P0, PartDesc P1, PartDesc P
       const uint xx = state * 0x83DCD12Du;
       const uint bs = (xx & 0x00FF00FFu) + ((xx >> 8) & 0x00FF00FFu);
       const float wgt = (float)(1024u + (bs & 0xFFFFu) + (bs >> 16)) * (float)as_half((ushort)0x1EEE) + (float)as_half((ushort)0xC931);
-      const int p = 16 * lane + v;
-      const int l = p >> 3, j = p & 7, row = 2 * (l & 3) + (j & 1) + 8 * ((j >> 1) & 1);
-      const float xv = (float)X[kt * 16 + row];
+      const int j = v & 7;
+      const float xv = ((v >> 1) & 1) ? xb[(v & 1) + ((v >> 3) << 1)]
+                                      : xa[(v & 1) + ((v >> 3) << 1)];
       if (j >> 2) {
         if (v & 1) b1 += xv * wgt; else acc1 += xv * wgt;
       } else {
